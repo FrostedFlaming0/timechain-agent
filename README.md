@@ -58,10 +58,8 @@ See `ARCHITECTURE.md` for a detailed walkthrough of each component.
 ## Quick start
 
 ```bash
-pip install cryptography numpy scikit-learn anthropic sentence-transformers
-# Optional, for file ingestion (per file type):
-pip install pypdf python-docx openpyxl python-pptx Pillow chardet
-export ANTHROPIC_API_KEY=sk-ant-...    # or use OpenAI / Gemini / Ollama
+pip install -r requirements.txt
+export ANTHROPIC_API_KEY=sk-ant-...
 python run.py
 ```
 
