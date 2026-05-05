@@ -86,7 +86,7 @@ python view_chain.py --verify
 
 ## Web UI
 
-The optional `webapp.py` server provides a browser-based chat
+The optional `timechain_web/webapp.py` server provides a browser-based chat
 interface as an alternative to the REPL. It wraps the same agent stack —
 same chain, same signing key, same configuration — and adds streaming
 responses, drag-and-drop file ingestion, an image renderer for ingested
