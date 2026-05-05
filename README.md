@@ -84,6 +84,71 @@ python view_chain.py --type reflection
 python view_chain.py --verify
 ```
 
+## Web UI
+
+The optional `webapp.py` server provides a browser-based chat
+interface as an alternative to the REPL. It wraps the same agent stack —
+same chain, same signing key, same configuration — and adds streaming
+responses, drag-and-drop file ingestion, an image renderer for ingested
+files, and a sidebar showing recent reflections and revisions.
+
+Install the extra dependencies:
+
+```bash
+pip install fastapi uvicorn sse-starlette python-multipart
+```
+
+Run it:
+
+```bash
+python timechain_web/webapp.py
+```
+
+Then open `http://127.0.0.1:8765` in your browser.
+
+The web UI uses the same configuration as `run.py` (it imports
+`DATA_DIR`, `LLM_PROVIDER`, `SYSTEM_PROMPT`, etc. directly from that
+module). To change the model, system prompt, or founding commitments,
+edit `run.py` — both interfaces pick up the change.
+
+All slash commands from the REPL work the same way:
+
+- `/verify` `/length` `/seal` `/sysprompt`
+- `/reflect`
+- `/revise N <text>`
+- `/file <path>`
+
+Drag and drop a file anywhere on the page to ingest it without needing
+`/file`. Images are rendered inline in chat; PDFs and other documents
+appear as metadata cards. The chain record is identical to what `/file`
+produces — same content-addressed blob, same provenance.
+
+A few things worth knowing:
+
+- The server binds to `127.0.0.1` only. The operator signing key lives
+  in this process; don't expose it on a network. If you want to use the
+  UI from another device, an SSH tunnel is the right answer rather than
+  adding auth to the app.
+- Only one browser tab is "active" at a time. Opening a second tab takes
+  over the session — the first tab's next action will fail with a 409.
+  This protects the chain's single-writer guarantee. Concurrent requests
+  to the same chain are also serialized internally regardless of session
+  state.
+- Streaming responses require an LLM client that exposes a `.stream()`
+  method yielding text chunks. The clients in `llm_clients.py` are
+  synchronous by default, so out of the box the UI emits each response
+  as a single block. To get true token-by-token streaming, add a
+  `stream()` method to your client of choice — Anthropic, OpenAI, and
+  Gemini SDKs all support streaming natively.
+- The web server doesn't append records that the REPL wouldn't append.
+  Same record types, same retrieval, same reflection cadence
+  (`AUTO_REFLECT_EVERY` from `run.py`). It's an I/O layer, not a
+  different agent.
+
+You can run `run.py` and `webapp.py` against the same chain at different
+times, but not simultaneously — both want exclusive access to the SQLite
+database and the signing key. Pick one interface per session.
+
 ## Tests
 
 Run the full test suite with pytest:
