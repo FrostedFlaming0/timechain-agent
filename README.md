@@ -52,6 +52,11 @@ remembered exchange happened, and when there's been a long gap between sessions.
   `blobs/`; extracted text plus metadata go on the chain. Multimodal LLMs
   receive image/PDF bytes natively when those records are in retrieval
   context.
+- **Web UI (optional)** — webapp.py runs a local FastAPI server with a
+  single-page browser frontend. Streaming responses, drag-and-drop file
+  ingestion, inline image rendering, and a sidebar showing recent
+  reflections and revisions. Same agent, same chain, just a different
+  I/O layer.
 
 See `ARCHITECTURE.md` for a detailed walkthrough of each component.
 
@@ -134,12 +139,11 @@ A few things worth knowing:
   This protects the chain's single-writer guarantee. Concurrent requests
   to the same chain are also serialized internally regardless of session
   state.
-- Streaming responses require an LLM client that exposes a `.stream()`
-  method yielding text chunks. The clients in `llm_clients.py` are
-  synchronous by default, so out of the box the UI emits each response
-  as a single block. To get true token-by-token streaming, add a
-  `stream()` method to your client of choice — Anthropic, OpenAI, and
-  Gemini SDKs all support streaming natively.
+- Responses stream token-by-token via Server-Sent Events. All four
+  providers in llm_clients.py (Claude, OpenAI, Gemini, Ollama) expose
+  a .stream() method; the UI uses it automatically. Custom clients
+  without a .stream() method fall back to non-streaming gracefully —
+  the response just appears all at once instead of progressively.
 - The web server doesn't append records that the REPL wouldn't append.
   Same record types, same retrieval, same reflection cadence
   (`AUTO_REFLECT_EVERY` from `run.py`). It's an I/O layer, not a
