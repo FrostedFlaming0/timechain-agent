@@ -20,5 +20,11 @@ python-pptx>=0.6
 Pillow>=10.0
 chardet>=5.0
 
+# Optional — web UI (timechain_web/webapp.py)
+# fastapi>=0.115
+# uvicorn>=0.30
+# sse-starlette>=2.0
+# python-multipart>=0.0.9
+
 # Optional — testing
 pytest>=7.0
