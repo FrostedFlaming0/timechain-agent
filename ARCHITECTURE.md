@@ -30,6 +30,10 @@ Think of this as a four-layer system:
   file_ingest.py    INGEST — read documents/images/spreadsheets/code
                     files into chain records + content-addressed blobs
 
+  timechain_web/    OPTIONAL UI — FastAPI server + browser frontend
+    webapp.py       Same agent, same chain, alternate I/O layer
+    static/index.html
+
   test_timechain.py    TESTS — pytest suite covering all layers
   run_tests.py         standalone runner for environments without pytest
   view_chain.py        CLI inspector for chain contents
@@ -170,7 +174,10 @@ Helper functions `_humanize_delta` and `_format_absolute_time` handle time forma
 
 **Key components:**
 
-Four builder functions, all returning the same callable shape `(prompt, system=None) -> str`:
+Four builder functions, all returning a callable with shape
+`(prompt, system=None, attachments=None) -> str`. Each callable also
+exposes `.stream(prompt, system=None, attachments=None)` — a generator
+yielding text chunks, used by the web UI for streaming responses.
 - `make_claude_client(model, max_tokens, temperature, timeout_s)` — Anthropic Claude. Default: `claude-opus-4-7`.
 - `make_openai_client(model, ...)` — OpenAI. Default: `gpt-5.5`.
 - `make_gemini_client(model, ...)` — Google Gemini. Default: `gemini-3.1-pro`.
@@ -185,7 +192,7 @@ Each builder:
 
 `_retry_with_backoff` is the shared retry helper.
 
-**When you'd touch this file:** when you want to add a new provider, change default model versions as new ones release, adjust retry behavior, or expose more provider-specific options (streaming, tool use, structured output). Each builder is independent — changing one doesn't affect the others.
+**When you'd touch this file:** when you want to add a new provider, change default model versions as new ones release, adjust retry behavior, or expose more provider-specific options (tool use, structured output, multimodal beyond images and PDFs). Each builder is independent — changing one doesn't affect the others.
 
 ---
 
@@ -219,6 +226,32 @@ For each file: bytes are stored under `<DATA_DIR>/blobs/<sha256>` (content-addre
 
 ---
 
+## timechain_web/ — Optional browser UI
+
+**Responsibility:** provide a browser-based chat interface as an alternative to the REPL. Same agent stack, same chain, same configuration — just a different I/O layer.
+
+**Knows about:** FastAPI, Server-Sent Events, the same agent/chain/retriever that `run.py` uses (imported directly from `run.py` to share configuration).
+**Does not know about:** anything `run.py` doesn't already know about. It's strictly an interface layer.
+
+**Key components:**
+
+`webapp.py` is a FastAPI server that:
+- Boots the same Agent / Chain / Retriever stack as `run.py`, reusing `DATA_DIR`, `SYSTEM_PROMPT`, `FOUNDING_COMMITMENTS`, etc. directly.
+- Exposes endpoints for chain inspection (`/api/chain/status`, `/api/chain/recent`, `/api/chain/verify`), file upload (`/api/upload`), slash commands (`/api/command`), and chat turns (`/api/turn`, `/api/turn/stream`).
+- Streams responses via Server-Sent Events when the LLM client supports it (all four built-in providers do, via `llm.stream()`).
+- Serves blob bytes by sha256 (`/blobs/<sha>`) so ingested images render inline in chat. Cross-checks the chain to refuse arbitrary file reads.
+- Holds a single-session lock — only one browser tab is "active" at a time, protecting the chain's single-writer guarantee. All requests that touch the chain serialize through an asyncio lock regardless of session.
+
+`static/index.html` is a single-file frontend (vanilla JS, no build step). A typing indicator shows during the latency before tokens arrive; drag-and-drop ingestion works anywhere on the page; a sidebar surfaces recent reflections and revisions.
+
+**What this layer does NOT add to the chain:**
+
+The web UI never appends record types the REPL wouldn't append. Same observations, same responses, same reflections. If you can't tell from inspecting the chain whether a session was REPL or web, that's by design.
+
+**When you'd touch these files:** to change UI behavior (frontend), to add or modify endpoints (backend), or to expose new features. The underlying agent contract is shared with `run.py` and shouldn't be modified here — changes to how turns work belong in `agent.py`.
+
+---
+
 ## run.py — Configuration and entry point
 
 **Responsibility:** wire everything together, manage the persistent storage location, define identity (founding commitments) and behavior (system prompt), run the REPL.
@@ -249,6 +282,7 @@ Slash commands:
 - `/sysprompt` — show all system prompt versions logged on chain.
 - `/reflect` — manually trigger a reflection.
 - `/revise N <text>` — append a correction to record N.
+- `/file <path>` — ingest a file into the chain (document, image, etc.).
 
 **When you'd touch this file:** all the time. This is your knob panel. Change `LLM_PROVIDER` to swap models. Change `SYSTEM_PROMPT` to adjust personality (auto-logged to chain). Change `SEMANTIC_K` and `RECENT_N` to tune retrieval. Change `FOUNDING_COMMITMENTS` *only on first run* — they're sealed at genesis and can't be changed without starting a new chain.
 
@@ -258,9 +292,9 @@ Slash commands:
 
 ```
 You type: "What did I tell you about apples?"
-           │
+           │  (in either run.py REPL or the web UI — same flow below)
            ▼
-       run.py REPL
+       run.py REPL  -or-  webapp.py /api/turn
            │ calls agent.turn(user_input)
            ▼
        agent.py
@@ -324,6 +358,8 @@ Every turn writes two records: one for what you said, one for what the agent sai
 | How the agent reflects | `agent.py` — `reflect` method and reflection prompt |
 | Adding a new LLM provider | `llm_clients.py` — add a new `make_X_client()` |
 | Adding a new file type | `file_ingest.py` — add to `*_EXTS` set and add an `_extract_*` function |
+| Web UI behavior or appearance | `timechain_web/webapp.py` (server) and `timechain_web/static/index.html` (frontend) |
+| Streaming responses to the browser | `llm_clients.py` — each client's `.stream()` method |
 | Adding tests | `test_timechain.py` — pytest classes by concern |
 
 ---
