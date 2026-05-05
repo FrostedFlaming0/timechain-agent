@@ -23,6 +23,7 @@ For a quick orientation:
 | Ingestion | `file_ingest.py` | file readers, blob store |
 | LLM clients | `llm_clients.py` | provider adapters |
 | Entry point | `run.py` | configuration, REPL |
+| Web UI | `timechain_web/webapp.py` + `static/index.html` | FastAPI server, SSE streaming, frontend |
 
 ## Setup
 
@@ -222,7 +223,7 @@ ideas do.
 
 The README is honest that this is a prototype. The temptation with a
 project like this is to grow it into a framework — to add plugins, config
-files, a web UI, a service mode. We're trying to resist that. The value of
+files, a service mode. We're trying to resist that. The value of
 this codebase is that you can read it end-to-end in an afternoon and
 understand exactly what it does. Contributions that preserve that property
 get reviewed faster than ones that don't.
