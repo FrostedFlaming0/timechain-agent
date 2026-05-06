@@ -89,6 +89,62 @@ python view_chain.py --type reflection
 python view_chain.py --verify
 ```
 
+## Switching LLM providers
+
+The default is Claude. To switch to OpenAI, Gemini, or a local Ollama model:
+
+**1. Install the SDK:**
+
+```bash
+pip install openai           # for GPT
+pip install google-genai     # for Gemini
+pip install requests         # for Ollama
+```
+
+**2. Set the API key** (skip for Ollama — it runs locally):
+
+```bash
+export OPENAI_API_KEY=sk-...
+export GEMINI_API_KEY=...
+```
+
+**3. Edit `LLM_PROVIDER` in `run.py`:**
+
+```python
+LLM_PROVIDER = "openai"   # or "gemini", "ollama", "claude"
+```
+
+That's it. The chain, retrieval, and web UI all carry over — your existing
+memory works with any provider.
+
+For Ollama, install the [Ollama app](https://ollama.com/download), pull a
+model (`ollama pull llama3.1:8b`), and make sure the local server is
+running before you start `run.py`.
+
+To override the default model for a provider, edit `build_llm()` in
+`run.py`:
+
+```python
+def build_llm():
+    if LLM_PROVIDER == "ollama":
+        return make_ollama_client(model="qwen3:8b")
+    # ...
+```
+
+Or hoist it to a config constant if you'll be switching models often.
+
+A few practical notes:
+
+- You can switch providers mid-chain — your existing memory carries over.
+  The chain stores observations and responses, not which model produced
+  them.
+- Different providers will give different answers to the same prompt.
+  Same memory, different reasoner.
+- Streaming works on all four providers in the web UI.
+- Default model names in `llm_clients.py` may go stale as providers
+  release new versions. If you get a "model not found" error, look up
+  the current name and pass it explicitly via `make_X_client(model=...)`.
+  
 ## Web UI
 
 The optional `timechain_web/webapp.py` server provides a browser-based chat
