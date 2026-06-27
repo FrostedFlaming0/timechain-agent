@@ -124,3 +124,10 @@ h1.page { font-size: 34px; margin: 2px 0 6px; letter-spacing: -0.01em; }
 .cmd .what { margin: 6px 0 0; line-height: 1.5; }
 .cmd .why { margin: 4px 0 0; font-size: 13px; color: var(--muted); line-height: 1.5; }
 .cmd .why b { color: var(--ink); font-weight: 600; }
+
+/* Tool loop (Phase 6) */
+.tool-result details { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; background: var(--panel); }
+.tool-result summary { cursor: pointer; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.tool-result .tool-output { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word; max-height: 280px; overflow-y: auto; margin: 8px 0 2px; }
+/* (in-transcript pending-op cards were removed — the banner above the
+   composer is the single approval surface; see index.html) */

@@ -126,6 +126,78 @@
       gap: 8px;
       align-items: flex-end;
     }
+    .ws-row {
+      max-width: 760px;
+      margin: 0 auto 6px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      font-size: 12px;
+    }
+    .ws-chip {
+      padding: 7px 18px;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--bg);
+      color: var(--fg);
+      font-size: 16px;
+      cursor: pointer;
+      max-width: 460px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .ws-chip:hover { border-color: var(--accent); }
+    .ws-editor { display: flex; gap: 6px; align-items: center; flex: 1; }
+    .ws-editor input {
+      flex: 1;
+      padding: 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--bg);
+      font-size: 14px;
+      font-family: inherit;
+    }
+    .ws-editor button {
+      padding: 6px 14px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      cursor: pointer;
+      font-size: 14px;
+    }
+    .ws-error { color: #c0392b; }
+    .pending-banner {
+      max-width: 760px;
+      margin: 0 auto 6px;
+      padding: 6px 10px;
+      border: 1px solid #d4a017;
+      border-radius: 6px;
+      background: rgba(212, 160, 23, 0.08);
+      font-size: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .pending-banner .op-line {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .pending-banner .op-desc {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .pending-banner button {
+      padding: 2px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      cursor: pointer;
+      font-size: 12px;
+    }
     textarea {
       flex: 1;
       resize: none;
@@ -159,6 +231,14 @@
       font-size: 11px; color: var(--muted);
       font-family: var(--mono);
     }
+
+    .task-route {
+      max-width: 760px; margin: 0 auto 4px;
+      font-size: 12px; color: var(--muted);
+      font-family: var(--mono);
+    }
+    .task-route input { vertical-align: middle; }
+    .task-route #taskroutename { color: var(--ink); }
 
     aside {
       grid-area: side;
@@ -205,6 +285,23 @@
     }
     .typing-indicator span:nth-child(2) { animation-delay: 0.15s; }
     .typing-indicator span:nth-child(3) { animation-delay: 0.30s; }
+    /* Turn-progress line under the live agent bubble: stays visible for
+       the WHOLE turn — including tool-call pauses when no tokens stream —
+       so the user can tell "still working" from "stalled". */
+    .turn-status {
+      /* tuck into the bubble's 14px bottom margin: 4px below the bubble,
+         normal spacing before whatever follows */
+      max-width: 760px; margin: -10px auto 14px; padding-left: 14px;
+      font-size: 12px; color: var(--muted);
+      font-family: var(--mono);
+    }
+    .turn-status .glyph {
+      display: inline-block;
+      color: var(--accent);
+      animation: turn-spin 1.6s linear infinite;
+    }
+    @keyframes turn-spin { to { transform: rotate(360deg); } }
+
     @keyframes typing-bounce {
       0%, 60%, 100% { opacity: 0.4; transform: translateY(0); }
       30%           { opacity: 1.0; transform: translateY(-4px); }
@@ -253,13 +350,30 @@
   </aside>
 
   <div class="input-row">
+    <div class="pending-banner" id="pendingbanner" style="display:none"></div>
+    <div class="ws-row">
+      <button class="ws-chip" id="wschip" title="working directory">&#128193; …</button>
+      <span class="ws-editor" id="wseditor" style="display:none">
+        <input id="wsinput" list="wssuggest" placeholder="/path/to/repo" />
+        <datalist id="wssuggest"></datalist>
+        <button id="wsset">set</button>
+        <button id="wscancel">cancel</button>
+        <span id="wserror" class="ws-error"></span>
+      </span>
+    </div>
+    <div id="taskroute" class="task-route" style="display:none">
+      <label title="Uploads go to the artifacts chain by default; tick to seal this upload into the active task's chain instead.">
+        <input type="checkbox" id="taskroutecb">
+        ingest uploads into task <span id="taskroutename"></span>
+      </label>
+    </div>
     <div class="composer">
       <button class="attach" id="attachbtn" title="attach a file">+</button>
       <input type="file" id="fileinput" style="display:none" />
       <textarea id="composer" placeholder="message... (or /command)" rows="1"></textarea>
       <button class="send" id="sendbtn">send</button>
     </div>
-    <div class="hint">enter to send, shift+enter for newline. drag files anywhere to ingest.<br>commands: /verify /verify-semantic /length /seal /sysprompt /reflect /cambium /cambium-full /proposals /modalities /revise N text /file path /export-capsule path /import-capsule path /cypher-help /verify-source N /poq text /immune-status /immune-scan /lockdown /rollback N /recall-index /recall-fetch ids /recall query /think query /consensus-init /consensus-verify /cambium-grow text /migrate /continuum-resume /continuum-validate</div>
+    <div class="hint">enter to send, shift+enter for newline. drag files anywhere to ingest.<br>commands: /approve id /reject id /verify /verify-semantic /length /seal /sysprompt /reflect /cambium /cambium-full /proposals /modalities /revise N text /export-capsule path /import-capsule path /cypher-help /verify-source N /poq text /immune-status /immune-scan /lockdown /rollback N /recall-index /recall-fetch ids /recall query /think query /consensus-init /consensus-verify /cambium-grow text /migrate /continuum-resume /continuum-validate</div>
   </div>
 
 <script>
@@ -308,6 +422,10 @@ async function claimSession() {
   const r = await fetch('/api/session/claim', { method: 'POST' });
   const data = await r.json();
   SESSION = data.session_token;
+  // Share the token with sibling pages (the /audit dashboard) via
+  // localStorage — they must NOT claim their own session, or they would
+  // bump this tab off the single-session lock.
+  try { localStorage.setItem('tc_session', SESSION); } catch (e) {}
   statusEl.textContent = 'connected';
 }
 
@@ -351,22 +469,54 @@ function addFileTurn(rec, opts={}) {
   r.className = 'role'; r.textContent = 'you (uploaded)';
   div.appendChild(r);
   const c = rec.content;
-  if (c.kind === 'image') {
+  // Handles both legacy `file` records (kind/size_bytes) and Phase-14
+  // `attachment` records (mime_type/approx_bytes).
+  const kind = c.kind || c.mime_type || 'file';
+  const bytes = c.size_bytes ?? c.approx_bytes ?? 0;
+  if (c.kind === 'image' || (c.mime_type || '').startsWith('image/')) {
     const img = document.createElement('img');
     img.className = 'attach';
-    img.src = '/blobs/' + c.blob_sha256;
+    // Blob access is session-gated like the rest of the API; <img> can't
+    // send headers, so the token rides the query string for this endpoint.
+    img.src = '/blobs/' + c.blob_sha256 + '?session=' + encodeURIComponent(SESSION);
     img.alt = c.filename;
     div.appendChild(img);
   }
   const meta = document.createElement('div');
   meta.className = 'file-meta';
-  meta.textContent = `${c.filename} — ${c.kind}, ${c.size_bytes.toLocaleString()} bytes, sha256 ${c.blob_sha256.slice(0,12)}…`;
+  meta.textContent = `${c.filename} — ${kind}, ${bytes.toLocaleString()} bytes, sha256 ${(c.blob_sha256 || '').slice(0,12)}…`;
   div.appendChild(meta);
   placeTurn(div, opts);
 }
 
 function addSystemTurn(text) { return addTurn('system', text); }
 function addErrorTurn(text)  { return addTurn('error', text); }
+
+// Tool activity during a turn: a compact, expandable system note so the
+// transcript shows WHAT the agent did without burying the conversation.
+// During a live turn the card is anchored ABOVE the agent's streaming
+// bubble (the work happens before the answer it produces — and that is
+// also the order the chain seals: tool_use records before the response).
+function addToolResultTurn(d, opts={}) {
+  const div = document.createElement('div');
+  div.className = 'turn system tool-result';
+  const details = document.createElement('details');
+  const summary = document.createElement('summary');
+  summary.textContent = `🔧 ${d.tool} (round ${d.round})`;
+  details.appendChild(summary);
+  const pre = document.createElement('pre');
+  pre.className = 'tool-output';
+  pre.textContent = d.result;
+  details.appendChild(pre);
+  div.appendChild(details);
+  placeTurn(div, opts);
+}
+
+// Pending operations render in exactly ONE place: the banner above the
+// composer (refreshPendingBanner). An in-transcript approve/reject card
+// used to render too, but two approve prompts for one operation read as
+// two decisions. The collapsed 🔧 tool_result card still carries the
+// operation's full details in the transcript.
 
 // =========================================================================
 // History — load the persisted chain into the chat view on boot, with a
@@ -385,6 +535,15 @@ function addErrorTurn(text)  { return addTurn('error', text); }
 // compact system note so the timeline is honest about what's on the
 // chain, rather than silently dropping them.
 function renderHistoryRecord(rec, opts={}) {
+  // Every committed record renders at most once, whichever path gets to
+  // it first — history paging or a resumed live stream (see
+  // resumeActiveTurn: a turn that committed while the user was on the
+  // audit page is in BOTH the freshly loaded history and the replayed
+  // stream buffer).
+  if (typeof rec.index === 'number') {
+    if (RENDERED_INDICES.has(rec.index)) return;
+    RENDERED_INDICES.add(rec.index);
+  }
   const c = rec.content || {};
   switch (rec.type) {
     case 'observation':
@@ -394,7 +553,12 @@ function renderHistoryRecord(rec, opts={}) {
       addTurn('agent', c.text ?? '', opts);
       break;
     case 'file':
-      // addFileTurn expects the raw record (reads rec.content itself).
+    case 'attachment':
+      // addFileTurn expects the raw record (reads rec.content itself) and
+      // already handles both shapes: legacy `file` (kind/size_bytes) and
+      // Phase-14 `attachment` (mime_type/approx_bytes). Without this case
+      // an uploaded image rendered as a card live but degraded to an
+      // opaque "attachment record #N" note after reload.
       addFileTurn(rec, opts);
       break;
     case 'genesis':
@@ -413,6 +577,10 @@ function renderHistoryRecord(rec, opts={}) {
       addTurn('system', rec.type + ' record #' + rec.index, opts);
   }
 }
+
+// Chain indices of records already rendered into the transcript — the
+// dedupe ledger shared by history paging and resumed turn streams.
+const RENDERED_INDICES = new Set();
 
 // Lowest record index currently shown, and whether older pages exist.
 let historyOldestIndex = null;
@@ -455,7 +623,8 @@ async function loadHistory({ older = false } = {}) {
     if (older && historyOldestIndex !== null) {
       params.set('before', String(historyOldestIndex));
     }
-    const r = await fetch('/api/chain/records?' + params.toString());
+    const r = await fetch('/api/chain/records?' + params.toString(),
+                          { headers: { 'x-session-token': SESSION } });
     const d = await r.json();
     const recs = d.records || [];  // newest-first from the server
 
@@ -508,12 +677,21 @@ function showTruncationNotice() {
   );
 }
 
+function showToolBudgetNotice() {
+  addSystemTurn(
+    'the agent ran out of tool rounds before finishing the task \u2014 ' +
+    'type "continue" to give it a fresh budget and resume where it ' +
+    'left off, or raise DEFAULT_MAX_TOOL_ROUNDS in tools.py.'
+  );
+}
+
 // =========================================================================
 // Chain status + sidebar
 // =========================================================================
 async function refreshStatus() {
   try {
-    const r = await fetch('/api/chain/status');
+    const r = await fetch('/api/chain/status',
+                          { headers: { 'x-session-token': SESSION } });
     const d = await r.json();
     chainmetaEl.textContent = `${d.length} records · ${d.pubkey.slice(0,12)}… · ${d.llm_provider}`;
   } catch (e) {
@@ -523,7 +701,8 @@ async function refreshStatus() {
 
 async function refreshSidebar() {
   try {
-    const r = await fetch('/api/chain/sidebar');
+    const r = await fetch('/api/chain/sidebar',
+                          { headers: { 'x-session-token': SESSION } });
     const d = await r.json();
     const reflEl = document.getElementById('reflections');
     const revEl = document.getElementById('revisions');
@@ -683,6 +862,9 @@ function renderCommandResult(d) {
     addFileTurn(d.record);
   } else if (d.kind === 'cypher') {
     addSystemTurn(`${d.command}\n${d.output}`);
+  } else if (d.kind === 'pending_op_action') {
+    addSystemTurn(d.message);
+    refreshPendingBanner();
   } else {
     addSystemTurn(JSON.stringify(d));
   }
@@ -691,8 +873,24 @@ function renderCommandResult(d) {
 async function runTurn(text) {
   // Use SSE for streaming. EventSource doesn't support custom headers, so
   // we pass the session token in the query string for this endpoint only.
+  // The server runs the turn in a background task and this stream is only
+  // a viewer onto it — see streamTurn/resumeActiveTurn.
   const url = `/api/turn/stream?input=${encodeURIComponent(text)}&session=${encodeURIComponent(SESSION)}`;
+  return streamTurn(url);
+}
+
+// Consume one turn's SSE stream into the transcript. Used two ways:
+//   - runTurn: a fresh turn just sent from the composer.
+//   - resumeActiveTurn ({resumed:true}): reattaching to a turn that kept
+//     running on the server while this page was away (audit tab, reload).
+//     The replayed buffer re-delivers everything, so resumed mode also
+//     renders the user's own message if history didn't already, and drops
+//     the live bubble if the committed response is already on screen.
+async function streamTurn(url, { resumed = false } = {}) {
   const agentBody = addTurn('agent', '');
+  // The streaming turn's own .turn div — live tool/pending cards anchor
+  // above it so the work shows before the answer it produced.
+  const agentTurnDiv = agentBody.parentElement;
 
   // Show three-dot indicator immediately so the user sees feedback during
   // the latency before the first token arrives. The indicator lives inside
@@ -703,12 +901,93 @@ async function runTurn(text) {
   indicator.innerHTML = '<span></span><span></span><span></span>';
   keepScroll(() => agentBody.appendChild(indicator));
 
+  // Turn-progress line BELOW the bubble (Claude-Code style): a spinning
+  // glyph plus elapsed time, alive for the whole turn. The three-dot
+  // indicator above only covers the wait for the FIRST token; this one
+  // covers tool-call pauses mid-turn, when streaming stops but the turn
+  // is very much in progress.
+  const turnStart = Date.now();
+  const status = document.createElement('div');
+  status.className = 'turn-status';
+  status.innerHTML = '<span class="glyph">✻</span> '
+    + '<span class="verb">working</span> for <span class="t">0s</span>';
+  keepScroll(() => agentTurnDiv.after(status));
+  const fmtElapsed = (ms) => {
+    const s = Math.floor(ms / 1000);
+    return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+  };
+  const statusTimer = setInterval(() => {
+    const t = status.querySelector('.t');
+    if (t) t.textContent = fmtElapsed(Date.now() - turnStart);
+  }, 1000);
+  const clearTurnStatus = () => { clearInterval(statusTimer); status.remove(); };
+  const setVerb = (v) => {
+    const el = status.querySelector('.verb');
+    if (el && el.textContent !== v) el.textContent = v;
+  };
+
+  // Name the current activity. There is no "tool started" event — the
+  // server emits tool_result only AFTER a call finishes — but the raw
+  // token buffer already carries the (display-stripped) <tool_call>
+  // JSON, so the names of this round's calls are known the moment they
+  // finish streaming. The execution pause that follows is then labeled
+  // "running <name>"; each tool_result advances to the next call's name
+  // (or back to "working" while the model writes the next round).
+  let roundNames = [];      // tool names parsed from this round's raw buffer
+  let roundResults = 0;     // tool_result events received this round
+  const extractToolNames = (raw) => {
+    const names = [];
+    const re = /<tool_call>[^]*?"name"\s*:\s*"([A-Za-z0-9_]+)"/g;
+    let m; while ((m = re.exec(raw))) names.push(m[1]);
+    return names;
+  };
+
   let buffer = '';
   let firstTokenSeen = false;
 
   return new Promise((resolve) => {
     const es = new EventSource(url);
-    es.addEventListener('observation', () => { /* could show "thinking" */ });
+    es.addEventListener('observation', (ev) => {
+      // Register the sealed observation so history paging can't render it
+      // twice. On a resumed stream, also render it: the user's message is
+      // missing from the transcript when the turn started after this
+      // page's history load (it lands ABOVE the agent bubble, where the
+      // conversation order puts it).
+      try {
+        const d = JSON.parse(ev.data);
+        if (typeof d.index !== 'number') return;
+        if (resumed && !RENDERED_INDICES.has(d.index)) {
+          addTurn('you', (d.content || {}).text || '', { anchor: agentTurnDiv });
+        }
+        RENDERED_INDICES.add(d.index);
+      } catch (e) {}
+    });
+    // What the live bubble RENDERS: the raw buffer minus tool markup —
+    // <tool_call> JSON the loop will execute, and <tool_result> blocks
+    // some models echo back verbatim (whole files re-streamed at the
+    // user; the real results render as collapsed cards instead). An
+    // unclosed or partially-streamed marker is held back to the end so
+    // file contents never flash on screen mid-stream. Mirrors the
+    // server's tools.strip_tool_markup, which shapes the committed text.
+    function liveStripToolMarkup(text) {
+      // Mask inline-code spans first: a tag inside backticks is prose
+      // about the syntax (common when auditing this codebase), never a
+      // real call/echo — must survive the destructive tail-strip. Mirrors
+      // the server's tools.strip_tool_markup.
+      const spans = [];
+      let t = text.replace(/`[^`\n]*`/g, (m) => {
+        spans.push(m); return ''+(spans.length-1)+'';
+      });
+      t = t
+        .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
+        .replace(/<tool_result\b[^>]*>[\s\S]*?<\/tool_result>/g, '')
+        .replace(/<tool_(?:call|result)\b[^>]*>[\s\S]*$/, '')
+        .replace(/<tool_[a-z_]*$/, '')
+        .replace(/<\/tool_(?:call|result)>/g, '')   // stray closers
+        .replace(/(\d+)/g, (_m, i) => spans[+i] ?? '')
+        .replace(/\n{3,}/g, '\n\n');
+      return t;
+    }
     es.addEventListener('token', (ev) => {
       try {
         const d = JSON.parse(ev.data);
@@ -719,9 +998,39 @@ async function runTurn(text) {
             firstTokenSeen = true;
           }
           buffer += d.text;
-          agentBody.textContent = buffer;
+          agentBody.textContent = liveStripToolMarkup(buffer);
         });
+        // A fresh token means an LLM round is streaming: re-derive this
+        // round's tool names from the raw buffer. As soon as a complete
+        // call has streamed, the imminent pause is its execution.
+        roundResults = 0;
+        roundNames = extractToolNames(buffer);
+        setVerb(roundNames.length ? `running ${roundNames[0]}` : 'working');
       } catch (e) {}
+    });
+    es.addEventListener('tool_result', (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        // One call finished: label the next one in this round, or fall
+        // back to "working" while the model writes its next round.
+        roundResults += 1;
+        setVerb(roundNames[roundResults]
+                ? `running ${roundNames[roundResults]}` : 'working');
+        keepScroll(() => addToolResultTurn(d, { anchor: agentTurnDiv }));
+        // A tool round ends: collapse the buffer to its visible prose —
+        // the server commits that prose as part of the response
+        // (prose_segments), so erasing it here would make text the user
+        // already read vanish mid-turn.
+        buffer = liveStripToolMarkup(buffer).trim();
+        if (buffer) buffer += '\n\n';
+        if (firstTokenSeen) agentBody.textContent = buffer;
+      } catch (e) {}
+    });
+    es.addEventListener('pending_op', (ev) => {
+      // The banner above the composer is the SINGLE approval surface —
+      // rendering buttons in the transcript too showed two approve
+      // prompts for one operation, which read as two decisions.
+      refreshPendingBanner();
     });
     es.addEventListener('reflection', () => {
       addSystemTurn('[auto-reflection committed]');
@@ -753,31 +1062,84 @@ async function runTurn(text) {
       } catch (e) {}
     });
     es.addEventListener('done', (ev) => {
+      clearTurnStatus();
+      let d = null;
+      try { d = JSON.parse(ev.data); } catch (e) {}
+      const respIndex = d && d.response ? d.response.index : undefined;
+      if (typeof respIndex === 'number' && RENDERED_INDICES.has(respIndex)) {
+        // The committed response is already in the transcript (a resumed
+        // stream whose turn committed before this page loaded history) —
+        // drop the live duplicate and finish quietly.
+        agentTurnDiv.remove();
+        refreshPendingBanner();
+        refreshActiveTask();
+        es.close();
+        resolve();
+        return;
+      }
+      if (typeof respIndex === 'number') RENDERED_INDICES.add(respIndex);
       // If the stream finished without a single token (rare — empty response),
       // clean up the indicator so the user isn't left staring at dancing dots.
       if (!firstTokenSeen) agentBody.textContent = '(no response)';
       // If the model hit its max_tokens ceiling, the answer just shown is
       // cut off mid-thought. Surface a marker so the user knows to ask the
       // agent to continue.
-      try {
-        const d = JSON.parse(ev.data);
-        if (d && d.truncated) showTruncationNotice();
-      } catch (e) {}
+      if (d && d.truncated) showTruncationNotice();
+      if (d && d.tool_budget_exhausted) showToolBudgetNotice();
+      refreshPendingBanner();   // anything still unapproved stays visible
+      refreshActiveTask();      // the turn may have opened/resumed a task
       es.close();
       resolve();
     });
-    // Safety: if the stream just closes, resolve anyway.
+    // Safety: if the stream just closes, resolve anyway. (A transient
+    // error leaves readyState CONNECTING and EventSource auto-reconnects;
+    // the server resumes the SAME turn via Last-Event-ID, so reconnects
+    // are seamless and never re-run the turn.)
     es.onerror = () => {
-      // Real network error — close and resolve so the UI unblocks.
+      // Permanent close — unblock the UI.
       if (es.readyState === EventSource.CLOSED) {
+        clearTurnStatus();
         if (!firstTokenSeen) {
-          agentBody.textContent = '';
-          addErrorTurn('connection closed before any tokens received');
+          if (resumed) {
+            // The turn vanished between probe and attach (finished and
+            // its records are already rendered, or the server restarted).
+            // Nothing useful was lost — remove the empty bubble quietly.
+            agentTurnDiv.remove();
+          } else {
+            agentBody.textContent = '';
+            addErrorTurn('connection closed before any tokens received');
+          }
         }
         resolve();
       }
     };
   });
+}
+
+// On page load: if a turn is still running on the server (the user sent a
+// message, visited the audit tab, and came back), reattach to its stream.
+// The server replays everything already produced, then follows live — so
+// leaving the page mid-turn costs nothing. A turn that FINISHED while the
+// user was away needs no attach at all: its records arrive via history.
+async function resumeActiveTurn() {
+  let active = false;
+  try {
+    const r = await fetch('/api/turn/active', { headers: sessionHeaders() });
+    if (!r.ok) return;
+    active = !!(await r.json()).active;
+  } catch (e) { return; }
+  if (!active) return;
+  SENDING = true;
+  sendbtn.disabled = true;
+  try {
+    const url = `/api/turn/stream?attach=1&session=${encodeURIComponent(SESSION)}`;
+    await streamTurn(url, { resumed: true });
+  } finally {
+    SENDING = false;
+    sendbtn.disabled = false;
+    refreshStatus();
+    refreshSidebar();
+  }
 }
 
 async function runMigrateStream() {
@@ -820,10 +1182,38 @@ async function runMigrateStream() {
 // =========================================================================
 // File upload
 // =========================================================================
+// Active-task awareness: uploads default to the artifacts chain; when a
+// task is active the user may explicitly tick "ingest into task <name>".
+// The server is the source of truth (/api/tasks/active) — refreshed on
+// load and after every turn, since a turn can open or resume a task.
+let activeTask = null;
+async function refreshActiveTask() {
+  try {
+    const r = await fetch('/api/tasks/active',
+                          { headers: { 'x-session-token': SESSION } });
+    if (!r.ok) return;
+    const d = await r.json();
+    activeTask = d.active || null;
+  } catch (e) { activeTask = null; }
+  const row = document.getElementById('taskroute');
+  const nameEl = document.getElementById('taskroutename');
+  if (activeTask) {
+    nameEl.textContent = activeTask;
+    row.style.display = '';
+  } else {
+    row.style.display = 'none';
+    document.getElementById('taskroutecb').checked = false;
+  }
+}
+
 async function uploadFile(file) {
   const fd = new FormData();
   fd.append('file', file);
-  addSystemTurn(`uploading ${file.name}…`);
+  const intoTask = activeTask
+        && document.getElementById('taskroutecb').checked;
+  if (intoTask) fd.append('task', activeTask);
+  addSystemTurn(`uploading ${file.name}`
+                + (intoTask ? ` into task ${activeTask}…` : '…'));
   try {
     const r = await fetch('/api/upload', {
       method: 'POST',
@@ -836,7 +1226,9 @@ async function uploadFile(file) {
       return;
     }
     const d = await r.json();
-    addFileTurn(d.record);
+    // Task-route ingests have no identity record — show the result line.
+    if (d.record) addFileTurn(d.record);
+    else addSystemTurn(d.result || `ingested ${file.name}`);
     refreshSidebar();
   } catch (e) {
     addErrorTurn(`upload failed: ${e.message}`);
@@ -906,13 +1298,145 @@ document.addEventListener('drop', (e) => {
 });
 
 // =========================================================================
+// Pending-operations banner — a sticky strip right above the composer so
+// an approval can never hide off-screen in the transcript. Lists every
+// unresolved pending op with approve/reject; refreshed at boot, when a
+// pending_op event fires, at turn end, and after any approve/reject.
+// =========================================================================
+const pendingbanner = document.getElementById('pendingbanner');
+
+async function pendingOpAction(opId, action) {
+  try {
+    const r = await fetch(`/api/pending-ops/${encodeURIComponent(opId)}/${action}`,
+                          { method: 'POST', headers: sessionHeaders() });
+    const d = await r.json();
+    addSystemTurn(`${action}: ${d.result || d.detail || JSON.stringify(d)}`);
+  } catch (e) {
+    addErrorTurn(`${action} failed: ${e}`);
+  }
+  refreshPendingBanner();
+}
+
+async function refreshPendingBanner() {
+  try {
+    const r = await fetch('/api/pending-ops', { headers: sessionHeaders() });
+    if (!r.ok) return;
+    const d = await r.json();
+    const ops = (d.pending || []).filter(op => op.status === 'pending');
+    if (!ops.length) { pendingbanner.style.display = 'none'; return; }
+    pendingbanner.innerHTML = '';
+    ops.forEach(op => {
+      const line = document.createElement('div');
+      line.className = 'op-line';
+      const desc = document.createElement('span');
+      desc.className = 'op-desc';
+      desc.textContent = op.kind === 'tool_call'
+        ? `⏳ tool call awaiting approval: ${op.tool} ${JSON.stringify(op.arguments || {})}`
+        : `⏳ write awaiting approval: ${op.file} — ${op.change}`;
+      desc.title = desc.textContent;
+      const ok = document.createElement('button');
+      ok.textContent = 'approve';
+      ok.onclick = () => pendingOpAction(op.id, 'approve');
+      const no = document.createElement('button');
+      no.textContent = 'reject';
+      no.onclick = () => pendingOpAction(op.id, 'reject');
+      line.appendChild(desc);
+      line.appendChild(ok);
+      line.appendChild(no);
+      pendingbanner.appendChild(line);
+    });
+    pendingbanner.style.display = 'flex';
+  } catch (e) {}
+}
+
+// =========================================================================
+// Workspace selector — the USER's hand on the read/write boundary. The
+// chip shows the current working directory; clicking it opens a free-text
+// path field with suggestions (task source roots + recent choices). The
+// server validates the directory exists; the model has no tool for this.
+// =========================================================================
+const wschip = document.getElementById('wschip');
+const wseditor = document.getElementById('wseditor');
+const wsinput = document.getElementById('wsinput');
+const wssuggest = document.getElementById('wssuggest');
+const wserror = document.getElementById('wserror');
+let wsCurrent = '';
+
+function renderWsChip() {
+  const name = wsCurrent ? (wsCurrent.split('/').filter(Boolean).pop() || '/')
+                         : '…';
+  wschip.textContent = `\u{1F4C1} ${name}`;
+  wschip.title = `working directory: ${wsCurrent || 'unknown'}`;
+}
+
+async function loadWorkspace() {
+  try {
+    const r = await fetch('/api/workspace', { headers: sessionHeaders() });
+    if (!r.ok) return;
+    const d = await r.json();
+    wsCurrent = d.current || '';
+    wssuggest.innerHTML = '';
+    (d.suggestions || []).forEach(p => {
+      const opt = document.createElement('option');
+      opt.value = p;
+      wssuggest.appendChild(opt);
+    });
+    renderWsChip();
+  } catch (e) {}
+}
+
+wschip.onclick = () => {
+  wserror.textContent = '';
+  wsinput.value = wsCurrent;
+  wseditor.style.display = 'flex';
+  wschip.style.display = 'none';
+  wsinput.focus();
+};
+function wsCloseEditor() {
+  wseditor.style.display = 'none';
+  wschip.style.display = '';
+}
+document.getElementById('wscancel').onclick = wsCloseEditor;
+document.getElementById('wsset').onclick = async () => {
+  const path = wsinput.value.trim();
+  if (!path) return;
+  wserror.textContent = '';
+  try {
+    const r = await fetch('/api/workspace', {
+      method: 'POST',
+      headers: sessionHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ path }),
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) {
+      wserror.textContent = d.error || d.detail || 'failed';
+      return;
+    }
+    wsCurrent = d.current;
+    renderWsChip();
+    wsCloseEditor();
+    addSystemTurn(`[workspace] now working in ${d.current}`);
+  } catch (e) {
+    wserror.textContent = String(e);
+  }
+};
+wsinput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); document.getElementById('wsset').click(); }
+  if (e.key === 'Escape') wsCloseEditor();
+});
+
+// =========================================================================
 // Boot
 // =========================================================================
 (async () => {
   await claimSession();
   await refreshStatus();
   await refreshSidebar();
+  await loadWorkspace();
+  await refreshPendingBanner();  // an op left pending last session resurfaces
+  await refreshActiveTask();     // show the upload-routing toggle if a task is live
   await loadHistory();  // replay persisted chain into the chat view
+  await resumeActiveTurn();  // reattach to a turn still running server-side
   // Periodic sidebar refresh (cheap; reflections/revisions don't change often)
   setInterval(refreshSidebar, 30_000);
 })();

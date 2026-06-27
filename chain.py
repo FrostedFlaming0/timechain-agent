@@ -342,7 +342,13 @@ class Chain:
         self.db_path = str(db_path)
         self.signing_key = signing_key
         self.pubkey_hex = signing_key.verify_key_bytes.hex()
-        self._conn = sqlite3.connect(self.db_path)
+        # check_same_thread=False: the connection may be used from a worker
+        # thread (the webapp dispatches long-running tool executions via
+        # asyncio.to_thread to keep the event loop free). Safe because every
+        # consumer serializes access — the webapp under state.lock, the REPL
+        # by being single-threaded; the connection is never used by two
+        # threads concurrently.
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         # WAL mode: faster concurrent reads, no writer-blocks-reader.
         # synchronous=NORMAL: durable on power loss in WAL mode but ~10x faster
         # than FULL. Acceptable tradeoff for an append-only log; if a crash
@@ -457,9 +463,10 @@ class Chain:
                     "(revision_idx, superseded_idx) VALUES (?, ?)",
                     (index, superseded),
                 )
-        # Maintain the blob index for file records. The blob sha lives in
-        # the record content (`blob_sha256`); see file_ingest.
-        if type_ == "file" and isinstance(content, dict):
+        # Maintain the blob index for file AND attachment records (the
+        # latter sealed by ingest_blob's identity route). The blob sha
+        # lives in the record content (`blob_sha256`).
+        if type_ in ("file", "attachment") and isinstance(content, dict):
             sha = content.get("blob_sha256")
             if isinstance(sha, str) and sha:
                 cur.execute(
@@ -641,18 +648,20 @@ class Chain:
 
     def _backfill_blob_index(self) -> None:
         """
-        Populate the blob_index from existing `file` records on first
-        use. Same shape as `_backfill_supersedes_index`: idempotent,
-        skipped after first run, makes the upgrade transparent for
-        chains created before the index existed.
+        Populate the blob_index from existing `file` and `attachment`
+        records on first use. Same shape as `_backfill_supersedes_index`:
+        idempotent, skipped after first run, makes the upgrade transparent
+        for chains created before the index existed. (A chain backfilled
+        before attachments were indexed keeps working: the webapp's blob
+        lookup falls back to a linear scan on an index miss.)
         """
         cur = self._conn.cursor()
         cur.execute("SELECT 1 FROM blob_index LIMIT 1")
         if cur.fetchone() is not None:
             return
         cur.execute(
-            "SELECT idx, content_json FROM records WHERE type = 'file' "
-            "ORDER BY idx"
+            "SELECT idx, content_json FROM records "
+            "WHERE type IN ('file', 'attachment') ORDER BY idx"
         )
         for idx, content_json in cur.fetchall():
             try:
@@ -670,10 +679,55 @@ class Chain:
                 )
         self._conn.commit()
 
+    def find_indices_by_content_field(self, json_path: str,
+                                      value) -> list[int]:
+        """
+        Indices of records whose content_json holds `value` at `json_path`
+        (a SQLite JSON1 path like '$.data.operation_id'), ascending.
+
+        The match runs as json_extract inside SQLite — a C-level table
+        scan — instead of materializing and JSON-parsing every record in
+        Python, which matters on hot paths (the write-approval idempotency
+        check runs once per approve while the webapp holds its global
+        lock). Raises sqlite3.OperationalError when the SQLite build lacks
+        JSON1; callers may fall back to a Python-side scan.
+        """
+        cur = self._conn.execute(
+            "SELECT idx FROM records "
+            "WHERE json_extract(content_json, ?) = ? ORDER BY idx ASC",
+            (json_path, value),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+    def find_file_by_sha_prefix(self, prefix: str) -> Optional[Record]:
+        """
+        Like find_file_by_sha, but matches a UNIQUE hash prefix (>= 8 hex
+        chars). Returns None when the prefix is too short, matches nothing,
+        or is ambiguous (more than one distinct hash). Exists because hash
+        displays get truncated in conversation — a model quoting
+        `c884391d726e…` from history should still be able to fetch the
+        attachment rather than dead-ending on an exact-match miss.
+        """
+        prefix = (prefix or "").strip().rstrip(".…")
+        if len(prefix) < 8 or not all(ch in "0123456789abcdef"
+                                      for ch in prefix):
+            return None
+        self._backfill_blob_index()
+        cur = self._conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT blob_sha256, record_idx FROM blob_index "
+            "WHERE blob_sha256 LIKE ? LIMIT 2",
+            (prefix + "%",),
+        )
+        rows = cur.fetchall()
+        if len(rows) != 1:
+            return None        # nothing, or ambiguous — caller decides
+        return self.get(rows[0][1])
+
     def find_file_by_sha(self, blob_sha256: str) -> Optional[Record]:
         """
-        Return the file record with the given blob sha256, or None if no
-        such record exists. Indexed O(1) lookup — replaces the linear
+        Return the file or attachment record with the given blob sha256, or
+        None if no such record exists. Indexed O(1) lookup — replaces the linear
         `query_by_type("file", limit=500)` scan the webapp's `/blobs/<sha>`
         endpoint used to do per request (which had its own silent 500-
         record cap on a hot path).

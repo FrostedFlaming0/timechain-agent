@@ -45,6 +45,10 @@ from chain import Chain, Record
 from metadata import read_meta, half_life_days, EXPOSURE_QUARANTINE
 
 
+class EmbeddingStoreMismatchError(ValueError):
+    """The persisted vectors are incompatible with the active embedder."""
+
+
 # ---------------------------------------------------------------------------
 # Modality anchoring
 # ---------------------------------------------------------------------------
@@ -448,7 +452,11 @@ class EmbeddingIndex:
         self.db_path = str(db_path)
         self.embedder = embedder
         self.dim = dim
-        self._conn = sqlite3.connect(self.db_path)
+        # check_same_thread=False: mirrors chain.Chain — the webapp runs
+        # long tool executions (which touch per-task indexes) in worker
+        # threads via asyncio.to_thread; access is serialized under its
+        # state.lock, never concurrent.
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(EMBED_SCHEMA)
@@ -473,7 +481,8 @@ class EmbeddingIndex:
         # message rather than producing silently wrong retrieval.
         stored = self.stored_dim()
         if stored is not None and stored != dim:
-            raise ValueError(
+            self._conn.close()
+            raise EmbeddingStoreMismatchError(
                 f"embedding store at {self.db_path} holds {stored}-dim vectors, "
                 f"but the active embedder produces {dim}-dim vectors. The "
                 f"embedder changed since this store was built.\n"
@@ -510,7 +519,8 @@ class EmbeddingIndex:
             )
             sys.stderr.flush()
         elif stored_id is not None and stored_id != active_id:
-            raise ValueError(
+            self._conn.close()
+            raise EmbeddingStoreMismatchError(
                 f"embedding store at {self.db_path} was built by embedder "
                 f"{stored_id!r}, but the active embedder is {active_id!r}. "
                 f"Same dimension does not imply same coordinate space — "
@@ -551,11 +561,13 @@ class EmbeddingIndex:
     @staticmethod
     def record_to_text(rec: Record) -> str:
         """Flatten a record into text for embedding. Override for fancier schemes."""
-        # File records: embed by filename + extracted text. Avoids embedding
-        # the giant blob_sha256 hex string which would dominate the vector.
-        if rec.type == "file" and isinstance(rec.content, dict):
+        # File/attachment records: embed by filename + extracted text.
+        # Avoids embedding the giant blob_sha256 hex string which would
+        # dominate the vector. (Attachment records carry mime_type where
+        # legacy file records carried kind.)
+        if rec.type in ("file", "attachment") and isinstance(rec.content, dict):
             filename = rec.content.get("filename", "")
-            kind = rec.content.get("kind", "")
+            kind = rec.content.get("kind") or rec.content.get("mime_type", "")
             text = rec.content.get("extracted_text", "")
             return f"[file {filename} {kind}] {text}"
         try:
@@ -563,6 +575,21 @@ class EmbeddingIndex:
         except (TypeError, ValueError):
             content_str = str(rec.content)
         return f"[{rec.type}] {content_str}"
+
+    def _record_chunks(self, rec: Record) -> list[str]:
+        """The record's flattened text split into embeddable chunks — the
+        single chunking path shared by index_record and
+        index_records_batched. For file records, the descriptive
+        `[file name kind]` header is prepended to every chunk."""
+        if rec.type in ("file", "attachment") and isinstance(rec.content, dict):
+            filename = rec.content.get("filename", "")
+            kind = rec.content.get("kind") or rec.content.get("mime_type", "")
+            header = f"[file {filename} {kind}] "
+            body = rec.content.get("extracted_text", "")
+            pieces = chunk_text(body, target=CHUNK_TARGET_CHARS - len(header))
+            return [header + p for p in pieces]
+        text = self.record_to_text(rec)
+        return chunk_text(text, target=CHUNK_TARGET_CHARS)
 
     def index_record(self, rec: Record) -> None:
         """
@@ -584,20 +611,7 @@ class EmbeddingIndex:
         a chunk from the middle of a document should still carry the signal
         that it belongs to that file.
         """
-        text = self.record_to_text(rec)
-
-        # For file records, keep the descriptive header on every chunk.
-        header = ""
-        if rec.type == "file" and isinstance(rec.content, dict):
-            filename = rec.content.get("filename", "")
-            kind = rec.content.get("kind", "")
-            header = f"[file {filename} {kind}] "
-            body = rec.content.get("extracted_text", "")
-            pieces = chunk_text(body, target=CHUNK_TARGET_CHARS - len(header))
-            chunks = [header + p for p in pieces]
-        else:
-            chunks = chunk_text(text, target=CHUNK_TARGET_CHARS)
-
+        chunks = self._record_chunks(rec)
         chunk_count = len(chunks)
         cur = self._conn.cursor()
         cur.execute("DELETE FROM embeddings WHERE record_idx = ?", (rec.index,))
@@ -642,8 +656,10 @@ class EmbeddingIndex:
                     if rec.index not in existing]
         total = len(to_index)
         if total > 20:
-            print(f"  [index] embedding {total} records — this can take a "
-                  f"few minutes, progress below:")
+            slow = hasattr(self.embedder, "embed_batch")  # network-backed
+            note = (" — this can take a few minutes, progress below:"
+                    if slow else ":")
+            print(f"  [index] embedding {total} records{note}")
 
         added = 0
         skipped = 0
@@ -666,6 +682,100 @@ class EmbeddingIndex:
                   f"were skipped — they remain on the chain but are not "
                   f"searchable until re-indexed.")
         return added
+
+    def index_records_batched(self, records, batch_size: int = 64,
+                              progress=None) -> dict:
+        """
+        Embed many records at once, sending chunk texts through the
+        embedder's embed_batch() in groups of `batch_size` when it has one
+        (one Ollama /api/embed call per group) and falling back to
+        per-chunk embedding otherwise.
+
+        Note the honest ceiling: on CPU the per-chunk forward pass
+        dominates, so batching saves only the per-request overhead
+        (measured ~12% over sequential singles with nomic-embed-text) —
+        this is the natural unit for a deliberate task_reembed, not a way
+        to make a slow embedder fast.
+
+        Replaces cleanly: every record's existing rows are deleted before
+        its new chunks are inserted. A record whose embedding fails is
+        rolled back to "not embedded" (no partial chunk sets) and counted
+        in `failed_records`; the rest proceed.
+
+        `progress(done_chunks, total_chunks)` is called after each batch.
+        Returns {"records", "chunks", "failed_records"}.
+        """
+        per_record = [(rec, self._record_chunks(rec)) for rec in records]
+        flat = [(rec, ci, len(chunks), chunk)
+                for rec, chunks in per_record
+                for ci, chunk in enumerate(chunks)]
+        total = len(flat)
+        embed_batch = getattr(self.embedder, "embed_batch", None)
+        failed: set[int] = set()
+        cur = self._conn.cursor()
+        for rec, _chunks in per_record:
+            cur.execute("DELETE FROM embeddings WHERE record_idx = ?",
+                        (rec.index,))
+
+        done = 0
+        for start in range(0, total, batch_size):
+            batch = flat[start:start + batch_size]
+            texts = [chunk for _, _, _, chunk in batch]
+            vecs: list = []
+            try:
+                if embed_batch is not None:
+                    vecs = list(embed_batch(texts))
+                    if len(vecs) != len(texts):
+                        raise RuntimeError(
+                            f"embed_batch returned {len(vecs)} vectors "
+                            f"for {len(texts)} inputs")
+            except Exception as e:
+                # One bad batch must not lose the rest: retry this batch
+                # per-chunk so only the genuinely un-embeddable records
+                # fail.
+                print(f"  [reembed] batch failed ({type(e).__name__}: {e}) "
+                      f"— retrying per chunk")
+                vecs = []
+            if not vecs:
+                for _, _, _, chunk in batch:
+                    try:
+                        vecs.append(self.embedder(chunk))
+                    except Exception:
+                        vecs.append(None)
+            for (rec, ci, chunk_count, chunk), vec in zip(batch, vecs):
+                if rec.index in failed:
+                    continue
+                if vec is None:
+                    failed.add(rec.index)
+                    continue
+                vec = np.asarray(vec, dtype=np.float32)
+                if vec.shape != (self.dim,):
+                    raise ValueError(
+                        f"embedder returned shape {vec.shape}, "
+                        f"expected ({self.dim},)")
+                cur.execute(
+                    "INSERT INTO embeddings "
+                    "(record_idx, chunk_index, chunk_count, record_hash, "
+                    "vector, text) VALUES (?, ?, ?, ?, ?, ?)",
+                    (rec.index, ci, chunk_count, rec.record_hash,
+                     vec.tobytes(), chunk),
+                )
+            self._conn.commit()
+            done += len(batch)
+            if progress is not None:
+                progress(done, total)
+
+        # No partial chunk sets: a failed record loses any rows that landed
+        # before its first failure, so it reads as plainly "not embedded".
+        for idx in failed:
+            cur.execute("DELETE FROM embeddings WHERE record_idx = ?", (idx,))
+        if failed:
+            self._conn.commit()
+            print(f"  [reembed] {len(failed)} record(s) could not be "
+                  f"embedded and remain unindexed")
+        self._nn = None  # invalidate
+        return {"records": len(per_record), "chunks": total,
+                "failed_records": len(failed)}
 
     def _rebuild_ann(self) -> None:
         cur = self._conn.cursor()
@@ -793,6 +903,100 @@ class EmbeddingIndex:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+
+def open_or_rebuild_index(
+    db_path: str | Path,
+    embedder: "Embedder",
+    dim: int,
+    chain: Optional[Chain] = None,
+    force_rebuild: bool = False,
+    log=print,
+) -> EmbeddingIndex:
+    """
+    Open the derived embedding index at `db_path`, rebuilding it when that
+    is safe or explicitly requested.
+
+    Rebuild policy on EmbeddingStoreMismatchError:
+    - The store was built by the cheap lexical HashingEmbedder → delete and
+      reopen empty (the "Ollama got installed" upgrade path: the old store
+      cost seconds to build and the chain re-embeds it on the spot).
+    - The store was built by anything else (a semantic store that may have
+      taken hours over the network) → REFUSE and re-raise with instructions.
+      The active embedder may be a transient fallback — e.g. the tiered
+      resolver picked HashingEmbedder because the Ollama daemon happened to
+      be down at boot — and silently deleting the store would destroy that
+      work twice (once now, once again when the daemon returns).
+
+    `force_rebuild=True` skips the policy and rebuilds unconditionally —
+    the explicit path task_reembed uses. Either way the store is DERIVED
+    data; the chain itself is never touched.
+
+    When `chain` is given, index_chain() runs before returning, so any
+    records missing from the (possibly freshly rebuilt) store are re-embedded
+    immediately. Pass the chain everywhere a stale store must self-heal into
+    a searchable one; callers that run index_chain() themselves may omit it.
+
+    This is the SINGLE shared open-or-rebuild path — run.py, the webapp, and
+    per-task indexes (tools.py) must all open stores through it so the
+    recovery behavior cannot drift between entry points.
+    """
+    if force_rebuild:
+        log(f"rebuilding embedding store at {db_path} (explicitly "
+            f"requested); chain data is unchanged")
+        delete_index_store(db_path)
+        index = EmbeddingIndex(db_path, embedder, dim=dim)
+    else:
+        try:
+            index = EmbeddingIndex(db_path, embedder, dim=dim)
+        except EmbeddingStoreMismatchError as exc:
+            stored_id = _stored_embedder_id(db_path)
+            if not (stored_id or "").startswith("HashingEmbedder:"):
+                raise EmbeddingStoreMismatchError(
+                    f"{exc}\n"
+                    f"REFUSING to delete this store automatically: it was "
+                    f"built by {stored_id or 'an unknown embedder'} and may "
+                    f"represent hours of embedding work, while the active "
+                    f"embedder may be a temporary fallback (e.g. the Ollama "
+                    f"daemon is unreachable right now). Either restore the "
+                    f"original embedder and restart, or rebuild explicitly "
+                    f"(task_reembed for task stores, or delete "
+                    f"`{db_path}*` yourself)."
+                ) from exc
+            log(f"embedding store at {db_path} was built by the lexical "
+                f"{stored_id} — rebuilding with the active embedder; "
+                f"chain data is unchanged")
+            delete_index_store(db_path)
+            index = EmbeddingIndex(db_path, embedder, dim=dim)
+    if chain is not None:
+        index.index_chain(chain)
+    return index
+
+
+def delete_index_store(db_path) -> None:
+    """Delete a derived embedding store plus its WAL/SHM sidecars — the ONE
+    place that knows the sidecar list. The chain is never touched."""
+    for path in (Path(str(db_path)),
+                 Path(f"{db_path}-wal"),
+                 Path(f"{db_path}-shm")):
+        path.unlink(missing_ok=True)
+
+
+def _stored_embedder_id(db_path) -> Optional[str]:
+    """Best-effort peek at the embedder identity a store was built with.
+    Used by the rebuild policy after EmbeddingIndex refused to open (it
+    closed its own connection before raising)."""
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT value FROM embed_meta WHERE key = 'embedder_id'"
+            ).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1627,6 +1831,7 @@ class OllamaEmbedder:
         self.base_url = base_url.rstrip("/")
         self.timeout_s = timeout_s
         self._embed_url = f"{self.base_url}/api/embeddings"
+        self._batch_url = f"{self.base_url}/api/embed"
 
         # Resolve the output dimension AND confirm the server actually
         # answers, by doing one probe embed at construction time. The probe
@@ -1642,22 +1847,11 @@ class OllamaEmbedder:
         known = OLLAMA_EMBED_DIMS.get(model)
         self.dim = known if known is not None else int(probe.shape[0])
 
-    def _embed(self, text: str) -> np.ndarray:
-        """Single embeddings call. Raises RuntimeError with an actionable message."""
-        # Cap the input length. Embedding models have a fixed context
-        # window and Ollama returns a 500 for input that overflows it
-        # rather than truncating, so an oversized record (a large file, a
-        # long reflection) would otherwise crash indexing. Truncating here
-        # is safe: the leading chunk is a representative vector for
-        # topic-level retrieval.
-        if len(text) > OLLAMA_EMBED_MAX_CHARS:
-            text = text[:OLLAMA_EMBED_MAX_CHARS]
+    def _post(self, url: str, payload: dict, timeout: float) -> dict:
+        """POST to Ollama and return the parsed JSON body, mapping every
+        failure mode to a RuntimeError with an actionable message."""
         try:
-            resp = self._requests.post(
-                self._embed_url,
-                json={"model": self.model, "prompt": text},
-                timeout=self.timeout_s,
-            )
+            resp = self._requests.post(url, json=payload, timeout=timeout)
         except self._requests.exceptions.RequestException as e:
             raise RuntimeError(
                 f"cannot reach Ollama at {self.base_url}: {e}\n"
@@ -1682,16 +1876,61 @@ class OllamaEmbedder:
                 f"Ollama returned {resp.status_code} for model "
                 f"'{self.model}': {body or '(empty body)'}"
             )
-        embedding = resp.json().get("embedding")
-        if not embedding:
-            raise RuntimeError(
-                f"Ollama returned no embedding for model '{self.model}'"
-            )
+        return resp.json()
+
+    @staticmethod
+    def _normalize(embedding) -> np.ndarray:
         vec = np.asarray(embedding, dtype=np.float32)
         n = np.linalg.norm(vec)
         if n > 0:
             vec = vec / n
         return vec
+
+    def _embed(self, text: str) -> np.ndarray:
+        """Single embeddings call. Raises RuntimeError with an actionable message."""
+        # Cap the input length. Embedding models have a fixed context
+        # window and Ollama returns a 500 for input that overflows it
+        # rather than truncating, so an oversized record (a large file, a
+        # long reflection) would otherwise crash indexing. Truncating here
+        # is safe: the leading chunk is a representative vector for
+        # topic-level retrieval.
+        if len(text) > OLLAMA_EMBED_MAX_CHARS:
+            text = text[:OLLAMA_EMBED_MAX_CHARS]
+        data = self._post(self._embed_url,
+                          {"model": self.model, "prompt": text},
+                          timeout=self.timeout_s)
+        embedding = data.get("embedding")
+        if not embedding:
+            raise RuntimeError(
+                f"Ollama returned no embedding for model '{self.model}'"
+            )
+        return self._normalize(embedding)
+
+    def embed_batch(self, texts: list[str]) -> list[np.ndarray]:
+        """Embed many texts in ONE request via the newer /api/embed
+        endpoint (its `input` field accepts a list; the legacy
+        /api/embeddings used by _embed is single-prompt only).
+
+        Each text gets the same truncation and L2-normalization as
+        _embed. The timeout scales with batch size: the server embeds
+        the inputs sequentially on CPU, so a fixed timeout sized for one
+        chunk would abort every real batch.
+        """
+        if not texts:
+            return []
+        capped = [t[:OLLAMA_EMBED_MAX_CHARS] for t in texts]
+        timeout = self.timeout_s * max(1.0, len(capped) / 4)
+        data = self._post(self._batch_url,
+                          {"model": self.model, "input": capped},
+                          timeout=timeout)
+        embeddings = data.get("embeddings")
+        if not embeddings or len(embeddings) != len(capped):
+            got = len(embeddings) if embeddings else 0
+            raise RuntimeError(
+                f"Ollama returned {got} embeddings for {len(capped)} "
+                f"inputs (model '{self.model}')"
+            )
+        return [self._normalize(e) for e in embeddings]
 
     def __call__(self, text: str) -> np.ndarray:
         return self._embed(text)

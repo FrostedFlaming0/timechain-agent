@@ -12,8 +12,9 @@ a common shape so you can swap providers in run.py with one line:
     # llm = make_ollama_client()
 
 All clients implement:
-  - Sensible defaults for the current generation of models (as of May 2026).
-  - Configurable model, max_tokens, temperature, timeout.
+  - Sensible defaults for the current generation of models (as of June 2026).
+  - Configurable model, max_tokens, timeout (plus temperature where the
+    provider still accepts it — Claude Fable 5 rejects sampling params).
   - Retries with exponential backoff on transient errors.
   - Clear error messages when API keys are missing or the server is down.
   - Reasonable timeouts so a hung provider doesn't freeze the agent loop.
@@ -134,17 +135,28 @@ def _retry_with_backoff(
 # ---------------------------------------------------------------------------
 
 def make_claude_client(
-    model: str = "claude-opus-4-7",
+    model: str = "claude-fable-5",
     max_tokens: int = 1024,
-    temperature: float = 1.0,
-    timeout_s: float = 60.0,
+    timeout_s: float = 600.0,
 ) -> LLMCall:
     """
     Anthropic Claude client.
 
-    Default model is claude-opus-4-7 (most capable as of May 2026). For
-    cost-sensitive workloads use claude-sonnet-4-6 or claude-haiku-4-5.
+    Default model is claude-fable-5 (Anthropic's most capable model as of
+    June 2026). For cost-sensitive workloads use claude-opus-4-8,
+    claude-sonnet-4-6, or claude-haiku-4-5.
     Set ANTHROPIC_API_KEY in the environment.
+
+    Fable 5 API notes (why this client looks the way it does):
+    - No `temperature`/`top_p`/`top_k` — sampling parameters are removed on
+      Fable 5 and sending any of them returns a 400.
+    - No `thinking` parameter — thinking is always on (adaptive); an
+      explicit config is rejected, so the parameter is simply omitted.
+    - Turns can run for minutes (thinking is always on), hence the
+      10-minute default timeout instead of the old 60s.
+    - Safety classifiers can decline a request: HTTP 200 with
+      stop_reason == "refusal" and empty (or partial) content. Surfaced
+      as an honest inline note rather than a silent empty response.
     """
     try:
         import anthropic
@@ -201,17 +213,22 @@ def make_claude_client(
             kwargs = dict(
                 model=model,
                 max_tokens=max_tokens,
-                temperature=temperature,
                 messages=[{"role": "user", "content": content_blocks}],
             )
             if system:
                 kwargs["system"] = system
             msg = client.messages.create(**kwargs)
             # Record why generation stopped. Anthropic uses `stop_reason`
-            # ("end_turn" | "max_tokens" | ...); was_truncated() maps
-            # "max_tokens" to the truncation signal.
+            # ("end_turn" | "max_tokens" | "refusal" | ...); was_truncated()
+            # maps "max_tokens" to the truncation signal.
             call.last_finish_reason = getattr(msg, "stop_reason", None)
-            return "".join(b.text for b in msg.content if hasattr(b, "text"))
+            text = "".join(b.text for b in msg.content if hasattr(b, "text"))
+            if call.last_finish_reason == "refusal":
+                # The chain must stay honest: an unexplained empty response
+                # reads as a bug, so name what actually happened.
+                text += ("\n\n[refusal] the model's safety classifiers "
+                         "declined this request before completing it")
+            return text
 
         return _retry_with_backoff(_do, retryable_exceptions=retryable)
 
@@ -247,7 +264,6 @@ def make_claude_client(
         kwargs = dict(
             model=model,
             max_tokens=max_tokens,
-            temperature=temperature,
             messages=[{"role": "user", "content": content_blocks}],
         )
         if system:
@@ -288,6 +304,12 @@ def make_claude_client(
                 call.last_finish_reason = getattr(final, "stop_reason", None)
             except Exception:
                 pass
+            if call.last_finish_reason == "refusal":
+                # A mid-stream refusal leaves a partial (or empty) answer
+                # with no other signal — yield the honest note so the
+                # committed turn says what happened.
+                yield ("\n\n[refusal] the model's safety classifiers "
+                       "declined this request before completing it")
 
     call.stream = stream
     return call

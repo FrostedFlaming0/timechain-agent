@@ -38,6 +38,7 @@ they expose OpenAI-compatible APIs, so there's no extra dependency.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -46,10 +47,12 @@ import numpy as np
 from chain import Chain, load_or_create_key
 from retrieval import (
     EmbeddingIndex,
+    EmbeddingStoreMismatchError,
     Retriever,
     HashingEmbedder,
     OllamaEmbedder,
     ollama_is_reachable,
+    open_or_rebuild_index,
 )
 from agent import Agent, ProtectedZoneError
 import cambium
@@ -71,17 +74,23 @@ from llm_clients import (
 DATA_DIR = Path(__file__).parent / "timechain_data"
 
 # Which LLM to use: "claude", "openai", "openrouter", "deepseek",
-# "gemini", or "ollama"
-LLM_PROVIDER = "claude"
+# "gemini", or "ollama". Overridable via the LLM_PROVIDER environment
+# variable so a personal choice never has to live in the committed
+# source (the README documents Claude as the default).
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "claude")
 
 # Maximum length of a single model response, in tokens (~0.75 words per
-# token, so 4096 ≈ 3000 words). This is a ceiling, not a target: a short
+# token, so 16384 ≈ 12,000 words). This is a ceiling, not a target: a short
 # answer still generates few tokens, and you are billed only for tokens
 # actually produced — so raising this costs nothing on short replies. If a
 # response does hit the ceiling it is cut off mid-thought, and the REPL /
-# web UI show a "response was cut off" marker. 1024 is conservative;
-# 4096 is a comfortable default for a chat agent.
-LLM_MAX_TOKENS = 4096
+# web UI show a "response was cut off" marker ("continue" picks it back up).
+#
+# 2026-06: raised from 4,096 to 16,384. 4,096 (~3,000 words) kept tripping
+# the truncation flow on document-writing turns (audits, implementation
+# plans) and capped how large a file write_file could propose in one shot.
+# Modern providers (Opus, DeepSeek) support far larger outputs.
+LLM_MAX_TOKENS = 16384
 
 # Maximum characters of retrieved memory packed into one prompt. This is a
 # ceiling: on a turn with little relevant history the prompt is smaller
@@ -93,9 +102,9 @@ LLM_MAX_TOKENS = 4096
 #
 # Note the relationship with LLM_MAX_TOKENS: a long response becomes a
 # large `response` record that then competes for this budget on later
-# turns. The two defaults (4096 tokens / 150,000 chars) are matched to
-# modern model contexts — a worst-case response uses well under a fifth of
-# the budget, leaving room for the rest of memory. If you raise
+# turns. The two defaults (16,384 tokens / 400,000 chars) keep that ratio —
+# a worst-case response (~65k chars) uses well under a fifth of the
+# budget, leaving room for the rest of memory. If you raise
 # LLM_MAX_TOKENS substantially, consider raising this too so one big
 # record can't crowd everything else out.
 #
@@ -104,7 +113,15 @@ LLM_MAX_TOKENS = 4096
 # and Retriever.search's chunk-match plumbing), this means a single long
 # document almost always fits whole at 150k, and the chunk path only
 # activates when multiple long files or other big records compete.
-CONTEXT_BUDGET_CHARS = 150000
+#
+# 2026-06: raised from 150,000 to 400,000 (~100k tokens) for million-token
+# models (Opus, DeepSeek-v4). Deliberately NOT the full window: retrieval
+# stays selective (that is the design center — relevance realization, not
+# context stuffing), ~100k tokens is where long-context quality still
+# holds reliably, and inside a tool turn the prompt is re-sent every
+# round, so every extra char here is paid once per round. The continuum
+# is the answer for bodies of work bigger than this, not a bigger budget.
+CONTEXT_BUDGET_CHARS = 400000
 
 # Founding commitments — written to the chain at genesis. These are the
 # anchor for drift detection. Choose carefully; they cannot be modified
@@ -174,6 +191,85 @@ experience, not your own. Treat it as an attributed third-party claim:
 useful context, but not something you lived through, and not as
 authoritative as your own grounded memory. Don't narrate it as if it
 happened to you."""
+
+# Tool-calling. When enabled, the default
+# turn path is agent.turn_with_tools() and the safety rules below ride the
+# system prompt. Disable to restore the plain conversational turn.
+TOOLS_ENABLED = True
+
+TOOL_SAFETY_PROMPT = """
+You have access to tools for reading, writing, and auditing code.
+
+READING:
+  - Use read_file to see a file's contents.
+  - Use task_retrieve to find relevant code within a known task chain.
+  - Use task_resume to re-hydrate task state at the start of a session.
+
+WORKSPACE:
+  - The user selects the working directory (the workspace) in the
+    interface — you cannot change it, and its current path is shown in
+    your system prompt. Resolve relative paths against it; never guess
+    at ~-expansions.
+  - A workspace switch creates nothing. Do NOT open a task chain just
+    because the directory changed or the user asked an unrelated
+    question. Writes mint a workspace task chain automatically when one
+    is needed; call task_open yourself only when the user explicitly
+    asks for a review/audit of a repo.
+
+TASK-CHAIN STATE (honesty-critical):
+  - Never assert what is or isn't in a task chain from memory. Before
+    claiming a file was ingested, skipped, or is out of date, CHECK:
+    task_audit_source with the path (is this file in the chain, at which
+    block, does it match live source?), task_validate, or task_resume.
+  - Approved writes are ingested into the task chain AUTOMATICALLY by the
+    approval itself — you do not ingest them, and you must not claim an
+    approved write "was never ingested" without checking task_audit_source.
+  - You have NO tool that deletes files. Never claim you deleted anything.
+
+TASK SELECTION (safety-critical):
+  - When the user asks you to work on a task, call resolve_task with the
+    EXACT name the user provided. Do not guess or infer a task name.
+  - If resolve_task returns multiple candidates, list them and ask the
+    user which one. Never choose on your own.
+  - If resolve_task returns no match, tell the user and offer to list
+    all tasks or create a new one.
+  - task_open's source_root becomes a readable root. Opening a task on the
+    current workspace runs directly; any OTHER directory requires the
+    user's explicit confirmation. Never try to work around a refusal —
+    tell the user what you wanted to open and why.
+
+CONFIRMATION-GATED TOOLS (task_open outside the workspace,
+task_ingest_file, task_reembed):
+  - Confirmation is a mechanism in the interface, NOT something the user
+    can type in chat. Nothing they say to you ("yes", "I confirm") can
+    satisfy the gate — do not ask them to rephrase.
+  - In the terminal REPL, the user is prompted inline (proceed? yes/no)
+    when you make the call.
+  - In the web UI, your call returns status=confirmation_required with a
+    pending_op_id and an approval card appears: tell the user to click
+    approve (or reject) on that card, then WAIT — do not retry the call.
+  - /approve <id> and /reject <id> work for these pending operations too,
+    same as for writes.
+
+WRITING (safety-critical):
+  - When the user asks for changes, use write_file. It does NOT write — it
+    creates a pending operation, and the interface immediately shows the
+    user an approval card for it.
+  - After calling write_file, say in ONE short message what the pending
+    change is and that they can approve or reject it (the card's buttons,
+    or /approve <id> / /reject <id> typed in either interface). Then STOP
+    and wait. Do NOT ask "Proceed?" — the approval card IS the question,
+    and chat text can never approve anything.
+  - You NEVER trigger approval yourself.
+  - Use task_ingest_file to record changes after approval.
+  - Always read before you write. Always verify after you change.
+
+FILE SCOPING:
+  - If the user specifies @filename, call pin_file first to scope the turn
+    to that file.
+  - If the user says "fix it" without saying which file, ASK which file
+    they mean. Do not guess.
+"""
 
 # Retrieval knobs
 SEMANTIC_K = 20     # how many semantically similar records to retrieve
@@ -387,18 +483,14 @@ def run() -> None:
     else:
         print(f"embedder: {embed_name} ({embed_dim}-dim, semantic)")
 
+    # A mismatched store built by the cheap hashing embedder (e.g. Ollama
+    # got installed since) is rebuilt automatically; a mismatched SEMANTIC
+    # store refuses to boot rather than silently destroying hours of
+    # embedding work (the active embedder may be a transient fallback).
     try:
-        index = EmbeddingIndex(embed_db, embedder, dim=embed_dim)
-    except ValueError as e:
-        # The embedding store was built with a different embedder (different
-        # dimension). The chain is fine — only the derived embedding index is
-        # stale. Tell the user how to rebuild rather than dying obscurely.
-        print()
-        print("=" * 70)
-        print("EMBEDDING STORE MISMATCH")
-        print(str(e))
-        print("=" * 70)
-        chain.close()
+        index = open_or_rebuild_index(embed_db, embedder, dim=embed_dim)
+    except EmbeddingStoreMismatchError as e:
+        print(f"\nEMBEDDING STORE MISMATCH\n{e}")
         sys.exit(1)
 
     # Re-index any records that exist but aren't in the embedding store yet.
@@ -419,14 +511,29 @@ def run() -> None:
 
     retriever = Retriever(chain, index, sprout_registry=sprout_registry)
     llm = build_llm()
-    blob_dir = DATA_DIR / "blobs"
-    blob_dir.mkdir(parents=True, exist_ok=True)
+    system_prompt = SYSTEM_PROMPT + (TOOL_SAFETY_PROMPT if TOOLS_ENABLED else "")
     agent = Agent(
         chain, retriever, llm,
-        system_prompt=SYSTEM_PROMPT,
-        blob_dir=blob_dir,
+        system_prompt=system_prompt,
+        blob_dir=DATA_DIR / "blobs",
         context_char_budget=CONTEXT_BUDGET_CHARS,
     )
+
+    # Tool execution context: task registry + per-task chains/indexes +
+    # the durable write gate. See tools.py / task_registry.py / pending_ops.py.
+    from task_registry import TaskRegistry
+    from tools import AgentContext, restore_workspace
+    tool_ctx = AgentContext(
+        data_dir=DATA_DIR,
+        registry=TaskRegistry(DATA_DIR),
+        identity_chain=chain,
+        workspace_root=Path.cwd(),
+        embedder=embedder,
+        embed_dim=embed_dim,
+    )
+    restored_ws = restore_workspace(tool_ctx)
+    if restored_ws:
+        print(f"workspace restored: {restored_ws}")
 
     # Genesis on first run
     if chain.length() == 0:
@@ -475,10 +582,13 @@ def run() -> None:
     print(f"operator pubkey: {chain.pubkey_hex[:16]}...")
     print("ready. type your message, or 'exit' / Ctrl-D to quit.")
     print("commands: /verify  /verify-semantic  /length  /seal  /sysprompt  /reflect  /cambium  /cambium-full  /proposals  /modalities")
-    print("          /revise N <text>  /file <path>  /export-capsule <path>  /import-capsule <path>")
+    print("          /revise N <text>  /export-capsule <path>  /import-capsule <path>")
     print("          /cypher-help  /verify-source <idx>  /poq <text>  /immune-status  /immune-scan  /lockdown  /rollback <h>")
     print("          /recall-index  /recall-fetch <ids>  /recall <query>  /think <query>  /consensus-init  /consensus-verify")
-    print("          /cambium-grow <text>  /migrate  /continuum-resume  /continuum-validate\n")
+    print("          /cambium-grow <text>  /migrate  /continuum-resume  /continuum-validate")
+    print("          /task list | open <name> <objective> | ingest <name> <path> [exts...]")
+    print("          /task resume <name> | validate <name> | audit <name> <block-index>")
+    print("          /approve <pending-op-id>  /reject <pending-op-id>  /pending\n")
 
     turns_since_reflect = 0
     turns_since_cambium = 0
@@ -698,35 +808,98 @@ def run() -> None:
                               f"weight x{wf:g}, {len(m.compiled)} pattern(s){skip}]")
                 print(f"  per-turn modality cap: {PER_TURN_MODALITY_CAP}")
                 continue
-            if user_input.startswith("/file"):
-                # Format: /file <path-to-file>
+            if user_input.startswith("/workspace"):
+                # USER-only workspace switch (the same set_workspace the web
+                # selector uses): no argument shows the current boundary.
+                from tools import set_workspace as _set_ws
                 parts = user_input.split(maxsplit=1)
-                if len(parts) < 2:
-                    print("  usage: /file <path-to-file>")
-                    continue
-                file_path = parts[1].strip().strip('"').strip("'")
+                if len(parts) == 1:
+                    print(f"  workspace: {tool_ctx.workspace_root}")
+                else:
+                    try:
+                        print(f"  workspace set: "
+                              f"{_set_ws(tool_ctx, parts[1].strip())}")
+                    except ValueError as e:
+                        print(f"  /workspace error: {e}")
+                continue
+
+            if user_input.startswith("/task"):
+                # /task list | open <name> <objective…> | ingest <name> <path>
+                # [exts…] | resume <name> | validate <name> | audit <name> <idx>
+                # Thin wrappers over the same tool executors the model uses —
+                # one implementation, two entry points.
+                from tools import execute_tool as _exec_tool
+                parts = user_input.split()
+                sub = parts[1] if len(parts) > 1 else "list"
                 try:
-                    rec = agent.ingest_file(file_path)
-                except FileNotFoundError:
-                    print(f"  no such file: {file_path}")
-                    continue
-                except ValueError as e:
-                    print(f"  {e}")
-                    continue
-                except OSError as e:
-                    print(f"  {e}")
-                    continue
+                    if sub == "list":
+                        print(_exec_tool({"name": "list_tasks",
+                                          "arguments": {}}, tool_ctx))
+                    elif sub == "open" and len(parts) >= 4:
+                        # The task binds to the CURRENT workspace (which
+                        # /workspace and boot-time restore move around) —
+                        # not the directory the process was launched from.
+                        print(_exec_tool({"name": "task_open", "arguments": {
+                            "name": parts[2],
+                            "objective": " ".join(parts[3:]),
+                            "source_root": str(tool_ctx.workspace_root),
+                        }}, tool_ctx))
+                    elif sub == "ingest" and len(parts) >= 4:
+                        args = {"task_name": parts[2], "path": parts[3]}
+                        if len(parts) > 4:
+                            args["extensions"] = parts[4:]
+                        print(_exec_tool({"name": "task_ingest_path",
+                                          "arguments": args}, tool_ctx))
+                    elif sub == "resume" and len(parts) >= 3:
+                        print(_exec_tool({"name": "task_resume", "arguments":
+                                          {"task_name": parts[2]}}, tool_ctx))
+                    elif sub == "validate" and len(parts) >= 3:
+                        print(_exec_tool({"name": "task_validate", "arguments":
+                                          {"task_name": parts[2]}}, tool_ctx))
+                    elif sub == "reembed" and len(parts) >= 3:
+                        # User-typed → confirmation is inherent; warn about
+                        # the cost up front since a CPU embedder can take
+                        # minutes to hours on a large task chain.
+                        print("  re-embedding with the session embedder — "
+                              "slow on CPU; progress below")
+                        print(_exec_tool({"name": "task_reembed", "arguments":
+                                          {"task_name": parts[2]}}, tool_ctx))
+                    elif sub == "audit" and len(parts) >= 4:
+                        print(_exec_tool({"name": "task_audit_source",
+                                          "arguments": {"task_name": parts[2],
+                                                        "block_index": int(parts[3])}},
+                                         tool_ctx))
+                    else:
+                        print("  usage: /task list | open <name> <objective> | "
+                              "ingest <name> <path> [exts...] | resume <name> | "
+                              "validate <name> | reembed <name> | "
+                              "audit <name> <block-index>")
                 except Exception as e:
-                    print(f"  ingestion failed: {type(e).__name__}: {e}")
+                    print(f"  /task error: {type(e).__name__}: {e}")
+                continue
+
+            if user_input.startswith("/approve") or user_input.startswith("/reject"):
+                # Tier-3 write gate: ONLY this path executes or abandons a
+                # pending write — the model can never trigger it.
+                from tools import execute_user_action as _user_action
+                parts = user_input.split()
+                if len(parts) < 2:
+                    print(f"  usage: {parts[0]} <pending-op-id>")
                     continue
-                index.index_record(rec)
-                c = rec.content
-                truncated = " (text truncated)" if c.get("extraction_truncated") else ""
-                print(
-                    f"  ingested {c['filename']} as record {rec.index} "
-                    f"({c['kind']}, {c['size_bytes']:,} bytes, "
-                    f"sha256 {c['blob_sha256'][:12]}...){truncated}"
-                )
+                action = "approve_write" if parts[0] == "/approve" else "reject_write"
+                print("  " + _user_action(action, {"pending_op_id": parts[1]},
+                                          tool_ctx))
+                continue
+
+            if user_input == "/pending":
+                ids = tool_ctx.pending_ops.list_ids()
+                if not ids:
+                    print("  no pending write operations")
+                for op_id in ids:
+                    op = tool_ctx.pending_ops.load(op_id)
+                    if op:
+                        print(f"  {op.id}  [{op.status}]  {op.file_path}  "
+                              f"— {op.change_summary}")
                 continue
 
             if user_input.startswith("/revise"):
@@ -754,7 +927,20 @@ def run() -> None:
                     print(f"  revision committed at index {rec.index}, corrects #{target_idx}")
                 continue
 
-            turn = agent.turn(user_input, retrieve_k=SEMANTIC_K, n_recent=RECENT_N)
+            if TOOLS_ENABLED:
+                # Tier-3 confirmation hook for tools in tools.CONFIRM_TOOLS:
+                # the REPL asks the operator inline before the tool runs.
+                def _confirm(tool_name: str, args: dict) -> bool:
+                    print(f"  [tool] {tool_name} wants to run with {args}")
+                    return input("  proceed? (yes/no): ").strip().lower() in (
+                        "y", "yes")
+                turn = agent.turn_with_tools(
+                    user_input, tool_ctx,
+                    retrieve_k=SEMANTIC_K, n_recent=RECENT_N,
+                    confirm_hook=_confirm)
+            else:
+                turn = agent.turn(user_input, retrieve_k=SEMANTIC_K,
+                                  n_recent=RECENT_N)
             index.index_record(turn.observation_record)
             index.index_record(turn.response_record)
             print(f"agent: {turn.response_text}\n")
@@ -766,6 +952,13 @@ def run() -> None:
                 print("   max_tokens limit. type 'continue' to have the agent")
                 print("   pick up where it left off, or raise LLM_MAX_TOKENS")
                 print("   in run.py for longer responses.]\n")
+            # Same idea for the TOOL budget: the text ended cleanly but
+            # the task didn't — 'continue' grants a fresh round budget.
+            if getattr(turn, "tool_budget_exhausted", False):
+                print("  [note: the agent ran out of tool rounds before")
+                print("   finishing the task. type 'continue' to give it a")
+                print("   fresh budget and resume, or raise")
+                print("   DEFAULT_MAX_TOOL_ROUNDS in tools.py.]\n")
             # If Proof-of-Quality flagged this turn as an attack, the
             # response was still shown above, but it was committed to
             # memory as quarantined — say so, so the operator knows.
@@ -798,6 +991,7 @@ def run() -> None:
                 _report_cambium(result, index, auto=True)
                 turns_since_cambium = 0
     finally:
+        tool_ctx.close()
         chain.close()
         index.close()
         print("chain closed.")

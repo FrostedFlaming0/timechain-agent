@@ -93,6 +93,9 @@ VALID_SOURCES = {SOURCE_USER, SOURCE_ASSISTANT, SOURCE_SYSTEM, SOURCE_TOOL,
 DEFAULT_SOURCE_BY_TYPE = {
     "observation":   SOURCE_USER,
     "response":      SOURCE_ASSISTANT,
+    # A resolution records the USER approving/rejecting a pending
+    # operation — their decision, their source.
+    "resolution":    SOURCE_USER,
     "reflection":    SOURCE_ASSISTANT,
     "revision":      SOURCE_ASSISTANT,
     "system_prompt": SOURCE_SYSTEM,
@@ -178,6 +181,13 @@ DEFAULT_EPISTEMIC_BY_TYPE = {
     "quarantine_marker": EPISTEMIC_INFERRED,
     # Continuum blocks ingest verified source/data chunks (sha-anchored).
     "task_open":         EPISTEMIC_KNOWN,
+    # A tool_use record is a fact about what the agent executed (sanitized
+    # args + result summary) — known, not inferred. (No longer written as
+    # of v1.4 — kept so chains sealed before the change still read.)
+    "tool_use":          EPISTEMIC_KNOWN,
+    # A resolution is a fact about a USER decision (a pending operation
+    # approved or rejected) — known ground truth, never inference.
+    "resolution":        EPISTEMIC_KNOWN,
     "continuum":         EPISTEMIC_KNOWN,
     # A synthesis is reasoned conclusion, not ground truth.
     "synthesis":         EPISTEMIC_INFERRED,
@@ -255,6 +265,10 @@ DEFAULT_SALIENCE_BY_TYPE = {
     # Continuum blocks are a derived work-ledger — mid baseline salience.
     "task_open":         0.55,
     "continuum":         0.55,
+    # A resolution settles whether proposed work actually happened — the
+    # very next turns need it (it kills the stale-"pending" confabulation),
+    # so it sits above conversational baseline.
+    "resolution":        0.60,
     # A synthesis is a deliberate, high-value reasoning artifact.
     "synthesis":         0.80,
     # Faculty growth records are durable capability upgrades — high salience.
@@ -327,7 +341,8 @@ class RecordMeta:
 
     __slots__ = ("schema_version", "source", "salience", "confidence",
                  "supersedes", "epistemic_class", "exposure", "poq",
-                 "truncated", "modalities_activated", "senses_activated",
+                 "truncated", "tool_budget_exhausted",
+                 "modalities_activated", "senses_activated",
                  "is_default")
 
     def __init__(
@@ -344,6 +359,7 @@ class RecordMeta:
         modalities_activated: list,
         senses_activated: list,
         is_default: bool,
+        tool_budget_exhausted: bool = False,
     ):
         self.schema_version = schema_version
         self.source = source
@@ -363,6 +379,12 @@ class RecordMeta:
         # continuation-detection logic in `Agent._format_prompt` so
         # "continue" against a truncated response is unambiguous.
         self.truncated = truncated
+        # True when the turn's TOOL round budget ran out mid-task — the
+        # text ended cleanly (often a progress checkpoint), but the work
+        # did not. Distinct from `truncated` (text cut mid-sentence):
+        # "continue" against a budget-exhausted response means "resume
+        # the task with a fresh budget", not "finish the sentence".
+        self.tool_budget_exhausted = tool_budget_exhausted
         # The modality detectors (signals.py) that fired with non-trivial
         # activation when this record's content was analyzed by PoQ. For a
         # response record, this is "which capabilities the agent actually
@@ -421,6 +443,7 @@ def read_meta(record) -> RecordMeta:
             exposure=DEFAULT_EXPOSURE_BY_TYPE.get(rec_type, EXPOSURE_PRIVATE),
             poq=None,
             truncated=False,  # v1 records predate the truncation flag
+            tool_budget_exhausted=False,  # likewise
             modalities_activated=[],  # v1 records predate this field
             senses_activated=[],      # v1 records predate this field too
             is_default=True,
@@ -448,6 +471,7 @@ def read_meta(record) -> RecordMeta:
         ),
         poq=poq,
         truncated=bool(meta.get("truncated", False)),
+        tool_budget_exhausted=bool(meta.get("tool_budget_exhausted", False)),
         modalities_activated=(
             list(meta["modalities_activated"])
             if isinstance(meta.get("modalities_activated"), list)
@@ -485,6 +509,7 @@ def build_meta(
     exposure: Optional[str] = None,
     poq: Optional[dict] = None,
     truncated: Optional[bool] = None,
+    tool_budget_exhausted: Optional[bool] = None,
     modalities_activated: Optional[list] = None,
     senses_activated: Optional[list] = None,
 ) -> dict:
@@ -543,6 +568,9 @@ def build_meta(
         # identical to what earlier versions wrote, so existing chains
         # don't see spurious content-hash changes on rebuild.
         out["truncated"] = True
+    if tool_budget_exhausted:
+        # Same absent-unless-True rule as `truncated`, same reason.
+        out["tool_budget_exhausted"] = True
     if modalities_activated:
         # Only emit when non-empty, for the same reason as `truncated`:
         # a record that activated no modalities (or a record type PoQ

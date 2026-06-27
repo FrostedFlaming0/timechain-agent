@@ -24,13 +24,14 @@ anthropic>=0.40
 # Ollama LLM provider use. Uncomment it if you intend to use Ollama at all.
 # requests>=2.31
 
-# Optional - file ingestion
-pypdf>=4.0
-python-docx>=1.0
-openpyxl>=3.1
-python-pptx>=0.6
-Pillow>=10.0
-chardet>=5.0
+# Optional - content extraction for uploads (extractors.py). Each library
+# unlocks one format; missing ones degrade to a descriptive placeholder.
+# pypdf>=4.0
+# python-docx>=1.0
+# openpyxl>=3.1
+# python-pptx>=0.6
+# Pillow>=10.0
+# chardet>=5.0
 
 # Optional - web UI (timechain_web/webapp.py)
 # fastapi>=0.115

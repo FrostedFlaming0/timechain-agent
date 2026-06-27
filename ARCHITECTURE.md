@@ -2,7 +2,7 @@
 
 A guide to the files that make up the timechain agent, what each is responsible for, and how they fit together.
 
-**Version: 1.3.0.** This document describes the system as it currently
+**Version: 1.4.0.** This document describes the system as it currently
 stands. For the release-by-release history of how it got here, see
 [CHANGELOG.md](CHANGELOG.md).
 
@@ -35,8 +35,11 @@ Think of this as a four-layer system:
                     (Claude, OpenAI, OpenRouter, DeepSeek, Gemini, Ollama)
                     with optional system prompt and attachment support
 
-  file_ingest.py    INGEST — read documents/images/spreadsheets/code
-                    files into chain records + content-addressed blobs
+  tools.py          TOOLS — text-tool driver (extract/validate/execute/
+                    escape) + executors; task_registry.py TASKS — per-task
+                    chain registry; pending_ops.py WRITE GATE — durable
+                    user-approved writes; continuum.py INGEST — code/content
+                    enters as data-height blocks on task chains
 
   signals.py        ANALYSIS — modalities & senses: pure text detectors
                     (intent, coherence, integrity/injection, ...) → SignalReport
@@ -109,7 +112,11 @@ Helper functions: `canonical_json` for stable serialization, `sha256` for hashin
 | `response` | Every model response | What the agent said |
 | `reflection` | `/reflect` or auto-cadence | Agent's own summary of what mattered |
 | `revision` | `/revise N <text>` | Correction to a prior record (original is preserved) |
-| `file` | `/file <path>` | Ingested file: metadata + extracted text on chain, raw bytes in `blobs/` |
+| `file` | (legacy, pre-v1.4) | Ingested file: metadata + extracted text on chain. Still read and verified; new code enters via `continuum` blocks on task chains |
+| `tool_use` | (legacy, pre-v1.4) | Per-call sanitized audit — no longer written; the identity chain carries one observation + one response per turn, with the response narrating the tool work. Old records still read fine |
+| `resolution` | user approves/rejects a pending op | The USER's decision joins the stream: outcome, op id, kind, file/tool, bounded result — so the model's memory never holds a stale "pending" forever |
+| `continuum` | `/task ingest`, write approvals | One data-height source chunk with source coordinates, hashes, and rolling task state |
+| `attachment` | upload / paste (`ingest_blob`) | Tiny pointer ring: filename, mime, sha, refs into the artifacts chain — never the content itself, so big documents can't crowd identity retrieval |
 
 Every record's `content` dict carries a `_meta` block (see `metadata.py`). The chain itself is unaware of this — `_meta` is just JSON inside `content` from the chain's perspective — but reader code uses it to distinguish source, salience, and supersession.
 
@@ -454,7 +461,7 @@ Six builder functions, all returning a callable with shape
 `(prompt, system=None, attachments=None) -> str`. Each callable also
 exposes `.stream(prompt, system=None, attachments=None)` — a generator
 yielding text chunks, used by the web UI for streaming responses.
-- `make_claude_client(model, max_tokens, temperature, timeout_s)` — Anthropic Claude. Default: `claude-opus-4-7`.
+- `make_claude_client(model, max_tokens, timeout_s)` — Anthropic Claude. Default: `claude-fable-5`. No sampling parameters (Fable 5 rejects `temperature`/`top_p`/`top_k`); thinking is always on (the `thinking` param is omitted); a classifier `refusal` is surfaced as an honest inline note.
 - `make_openai_client(model, ...)` — OpenAI. Default: `gpt-5.5`.
 - `make_openrouter_client(model, ...)` — OpenRouter (aggregator). Default: `anthropic/claude-opus-4.7`. Reuses the OpenAI SDK against OpenRouter's base URL.
 - `make_deepseek_client(model, ...)` — DeepSeek. Default: `deepseek-v4-pro`. Reuses the OpenAI SDK against DeepSeek's base URL. The V4 models toggle thinking mode via a request parameter rather than a separate model name; this client runs the default (non-thinking) mode and, if a `reasoning_content` trace is returned, uses only the final answer.
@@ -476,33 +483,112 @@ Each builder:
 
 ---
 
-## file_ingest.py — Reading user files into the chain
+## The code-working agent (v1.4): tools.py, task_registry.py, pending_ops.py
 
-**Responsibility:** convert a user file on disk into (a) a content-addressed blob and (b) a normalized record payload ready to go on the chain.
+**Responsibility:** let the agent read, write, and audit code through tools,
+with per-task continuum chains as durable memory and a three-tier safety
+model. (This replaced `file_ingest.py` — code and content enter the system
+through continuum ingestion now; format-aware text extraction lives in
+`extractors.py`, and the content-addressed blob store remains the canonical
+home of uploaded bytes.)
 
-**Knows about:** file extensions, format-specific extractors (pypdf, python-docx, openpyxl, python-pptx, Pillow, chardet).
-**Does not know about:** the chain, retrieval, LLMs, the agent, metadata. (The `_meta` block is added by `agent.ingest_file` after this module returns its `IngestResult`.)
+**The tool loop.** `llm_clients.py` has no native function calling, so tools
+are TEXT: the model emits `<tool_call>{"name": …, "arguments": {…}}</tool_call>`
+blocks. `tools.py` is the single shared driver — a TOLERANT extractor (strips
+markdown fences, trailing commas, recovers every block) feeding a STRICT
+JSON-Schema validator (unknown tools/params/types rejected), an executor with
+a 64KB result cap, and an escaper that neutralizes `<tool_call>` markers in
+anything re-entering the prompt, so file content can never forge a call.
+`agent.turn_with_tools()` runs the bounded parse→execute→re-call loop with
+one reflective retry on malformed calls, and shares its post-LLM tail
+(`_finish_turn`: truncation, PoQ, verdict enforcement, commit) with the plain
+`turn()` so the quality gates cannot drift. The identity chain stays a
+low-noise stream of experience: ONE observation + ONE response per turn,
+no per-call audit records — the response is the self-written, PoQ-gated
+summary of the turn's work, and tool EFFECTS (ingest blocks with hashes
+and git coordinates) live on the per-task continuum chains. The
+committed response is everything the user saw: the prose of every tool-call
+round (`tools.strip_tool_markup` — the `<tool_call>` blocks removed, the
+surrounding text kept) joined with the final answer, in both loops and in
+the web UI's live view — never just the last round's fragment, which would
+read out of context on its own.
 
-**Supported file types:**
+**The three safety tiers:**
 
-| Category | Extensions |
-|----------|-----------|
-| Documents | .pdf, .doc, .docx, .dot, .dotx, .txt, .rtf, .md, .hwp, .hwpx, .odt |
-| Spreadsheets | .xlsx, .xls, .csv, .tsv, .ods |
-| Presentations | .pptx, .ppt, .odp |
-| Images | .jpg, .jpeg, .png, .webp, .heic, .heif, .gif, .bmp, .tiff |
-| Code | .json, .yaml, .xml, .html, .css, .js, .ts, .py, .sh, .c, .cpp, .h, .java, .rs, .go, .rb, .php, .sql, .toml, .ini, plus more |
+| Tier | Mechanism |
+|------|-----------|
+| 1. Task selection | `task_registry.resolve_task()` returns exact/ambiguous/not-found and never auto-selects a fuzzy match; the system prompt forbids the model from guessing |
+| 2. File scoping | `pin_file` scopes a turn's writes to one path; the pin resets at every turn start |
+| 3. Write gate | `write_file` only creates a durable `PendingOperation` (0600, 1MB cap, TTL); ONLY the user can `/approve` — approval checks the pre-write hash (TOCTOU), writes atomically, ingests idempotently (`operation_id`), audits the block against live source, then deletes the op file |
 
-For each file: bytes are stored under `<DATA_DIR>/blobs/<sha256>` (content-addressed, deduped). A `file` record is appended to the chain with metadata + extracted text. The chain record is signed and tamper-evident; the blob is verifiable by hash.
+Tier 3 also covers **boundary expansion**: `tools.requires_confirmation()` —
+the one policy function both the REPL and web loops call — gates
+`CONFIRM_TOOLS` (e.g. `task_ingest_file`, `task_reembed`) and any `task_open`
+whose `source_root` resolves outside the workspace, since a task's source
+root becomes an allowed read/ingest root. How the user confirms depends on
+the loop: the REPL prompts inline (`proceed? yes/no`); the web loop —
+which cannot prompt over one-way SSE — defers the call as a pending op of
+kind `tool_call` (`tools.defer_tool_call`: exact name + arguments pinned
+by hash, same TTL/0600 discipline as writes) and surfaces the existing
+approve/reject card; headless loops refuse. Chat text can never satisfy
+the gate — approval is `pending_ops._approve_tool_call`, reachable only
+through the user-only action path, single-shot (no resumable middle state,
+so a crash mid-execution can never double-run a non-idempotent tool).
 
-**Key functions:**
-- `ingest_file(path, blob_dir, max_bytes)` — main entry point. Reads bytes, hashes them, writes blob, extracts text, returns an `IngestResult`.
-- `verify_blob(content, blob_dir)` — confirm an on-disk blob still matches the sha256 recorded on the chain.
-- `is_supported(path)` / `classify_kind(ext)` — file-type helpers.
+**Workspace selection.** The workspace (`ctx.workspace_root`) is the
+user-chosen working directory and the read/write boundary. Selection is
+user-only — `POST /api/workspace` (session-gated; the UI's folder chip) or
+the REPL's `/workspace` — never a model tool, so a chosen workspace is
+inherently confirmed. `tools.set_workspace` validates the directory
+server-side, resets the active task and pin, and persists the choice in
+`<DATA_DIR>/workspace.json` (`restore_workspace` reloads it at boot).
+Switching is a pure boundary move: nothing is created or sealed. A
+workspace task chain appears lazily at the first action that needs durable
+state (`tools.ensure_workspace_task`, called by `write_file` when no task
+is active) — named after the directory, reused thereafter; reads and
+unrelated turns leave no registry state. The per-turn system prompt
+carries the current workspace path in both loops.
 
-**Image handling:** images don't get OCR or captioning here — only metadata extraction. The actual visual content is sent to multimodal LLMs at retrieval time via the `attachments` parameter on the LLM clients (see `agent._collect_attachments`). Text-only models simply ignore the attachments and rely on the metadata in the prompt.
+**Task chains.** `task_registry.py` tracks per-task continuum chains under
+`<DATA_DIR>/tasks/<name>/` (own `chain.sqlite`, `operator.key`,
+`embeddings.sqlite`). `tools.AgentContext` lazily opens chains, recalls,
+continuums, and embedding indexes per task and closes them all on exit.
+`Recall.retrieve_path_aware()` is the task-chain arbiter (blended semantic +
+path + chronological scoring with hard filters); the identity-chain
+`retrieve()` stays a pre-filter.
 
-**When you'd touch this file:** to add a new file type (add the extension to the right `*_EXTS` set, write an `_extract_*` function), to change extraction limits (`MAX_EXTRACTED_CHARS`, `DEFAULT_MAX_FILE_BYTES`), or to swap an extractor (e.g. replace `pypdf` with `pdfplumber`).
+**Artifacts routing.** Uploads and pastes (`ingest_blob`, `/api/upload`)
+default to the reserved `artifacts` task chain, lazily created on first
+upload. Bytes land in the content-addressed blob store (canonical — the
+vision path and `/blobs/<sha>` resolve by sha) plus a named copy in
+`ARTIFACTS_DIR` (default `~/.artifacts`, which doubles as the artifacts
+task's source_root so the copies are readable through the normal path
+gates); extracted content is chunked and embedded in the artifacts chain's
+OWN store; the identity chain gets one tiny `attachment` pointer ring (no
+content). Routing into a normal task is explicit only — `task_name` from
+the model, or the web UI's per-upload toggle — because an ACTIVE task
+capturing uploads silently pollutes unrelated, append-only task chains,
+and full text on the identity chain crowds retrieval. An upload never
+moves the session's task cursor; `task_open` refuses the reserved name.
+
+**Task-store embedder policy.** Task embedding stores default to the instant
+`HashingEmbedder` regardless of the session embedder — bulk ingest must never
+block on a slow embedding model (a CPU-bound Ollama at ~3–5s/chunk once
+turned a 10-second walk into a 2-hour tool call). A task opts into the
+session embedder only through the user-confirmed `task_reembed` tool, which
+rebuilds the derived store with batched embedding
+(`EmbeddingIndex.index_records_batched` → `OllamaEmbedder.embed_batch`, one
+`/api/embed` request per 64 chunks) and persists the choice as
+`task["embedder"] = "session"` in `tasks.json`, so later sessions reopen the
+store with the same embedder instead of mismatch-deleting it back to the
+hashing default. Ingest paths open the task index BEFORE sealing new blocks,
+so the first-open backfill and the post-seal indexing pass can never embed
+the same record twice.
+
+**When you'd touch these files:** add a tool (schema in `TOOLS`, executor in
+`EXECUTORS`), tighten write-path rules (`resolve_write_path`), add an
+extraction format (`extractors.py`), or extend the pending-op state machine
+(`pending_ops.execute_approve_write`).
 
 ---
 
@@ -517,12 +603,13 @@ For each file: bytes are stored under `<DATA_DIR>/blobs/<sha256>` (content-addre
 
 `webapp.py` is a FastAPI server that:
 - Boots the same Agent / Chain / Retriever stack as `run.py`, reusing `DATA_DIR`, `SYSTEM_PROMPT`, `FOUNDING_COMMITMENTS`, etc. directly.
-- Exposes endpoints for chain inspection (`/api/chain/status`, `/api/chain/recent`, `/api/chain/verify`), file upload (`/api/upload`), slash commands (`/api/command`), and chat turns (`/api/turn`, `/api/turn/stream`).
+- Exposes endpoints for chain inspection (`/api/chain/status`, `/api/chain/recent`, `/api/chain/verify`), slash commands (`/api/command`), chat turns (`/api/turn`, `/api/turn/stream`), the durable write gate (`/api/pending-ops`, `/api/pending-ops/{id}/approve|reject` — user-triggered only), and content ingestion (`/api/upload` → `ingest_blob` with an optional explicit `task` field, `GET /api/tasks/active` for the UI's routing toggle, `/blobs/{sha}` — session-gated like every other endpoint).
+- The streaming turn runs the async twin of `Agent.turn_with_tools`: tool calls parsed/validated/executed/escaped by tools.py (the single shared driver), surfaced to the browser as `tool_result` / `pending_op` SSE events between token rounds. Blocking work — tool execution, approved pending ops, upload ingestion — runs in worker threads (`asyncio.to_thread`; the chain/index SQLite connections are opened `check_same_thread=False` and all access stays serialized under the web lock), so a long re-embed or tree walk never freezes the event loop.
 - Streams responses via Server-Sent Events when the LLM client supports it (all six built-in providers do, via `llm.stream()`).
-- Serves blob bytes by sha256 (`/blobs/<sha>`) so ingested images render inline in chat. Cross-checks the chain to refuse arbitrary file reads.
+- **Turns are server-owned, not connection-owned.** Each turn runs in a background task (`TurnRun` / `_drive_turn`) that drains `_turn_events` into a per-turn event buffer; `/api/turn/stream` only subscribes (`_follow_turn`: replay the buffer, then follow live). Closing the page mid-turn — the audit tab, a reload, a network blip — detaches the viewer while the turn runs to completion and commits, so the chain can never strand a sealed observation without its response. The chat page probes `GET /api/turn/active` on load and reattaches with `?attach=1`; SSE event ids + `Last-Event-ID` make EventSource auto-reconnects resume the same run instead of starting a duplicate (a genuinely new input while one runs gets a 409). `POST /api/turn` rides the same runner.
 - Holds a single-session lock — only one browser tab is "active" at a time, protecting the chain's single-writer guarantee. All requests that touch the chain serialize through an asyncio lock regardless of session.
 
-`static/index.html` is a single-file frontend (vanilla JS, no build step). A typing indicator shows during the latency before tokens arrive; drag-and-drop ingestion works anywhere on the page; a sidebar surfaces recent reflections and revisions. The frontend reads `content.text`, `content.filename`, `content.kind`, `content.revises_index`, and other top-level content fields exactly as in v1 — the new `_meta` block sits next to them and is ignored by the UI. No changes needed.
+`static/index.html` is a single-file frontend (vanilla JS, no build step). A typing indicator shows during the latency before tokens arrive; a sidebar surfaces recent reflections and revisions. The frontend reads `content.text`, `content.revises_index`, and other top-level content fields exactly as in v1 — the `_meta` block sits next to them and is ignored by the UI.
 
 **The streaming endpoint** at `/api/turn/stream` deliberately inlines its chain writes (rather than calling `agent.turn()`) so it can split the LLM call into a thread. These inline writes use `metadata.build_meta()` to attach the same `_meta` block that `agent.turn()` produces — there's no path through the app that produces a record without one. If you ever extend this endpoint with new chain writes, do the same.
 
@@ -544,7 +631,7 @@ The web UI never appends record types the REPL wouldn't append. Same observation
 
 Top-of-file configuration block:
 - `DATA_DIR` — where chain, embeddings, and key live.
-- `LLM_PROVIDER` — which client to use ("claude", "openai", "gemini", "ollama").
+- `LLM_PROVIDER` — which client to use ("claude", "openai", "openrouter", "deepseek", "gemini", "ollama"). Read from the environment variable of the same name; defaults to "claude".
 - `FOUNDING_COMMITMENTS` — committed at genesis, immutable thereafter. Define the agent's values.
 - `SYSTEM_PROMPT` — sent to the LLM on every turn. Defines the agent's active behavior. Mutable; each version is logged to chain.
 - `SEMANTIC_K` / `RECENT_N` — retrieval knobs.
@@ -564,7 +651,8 @@ Slash commands:
 - `/sysprompt` — show all system prompt versions logged on chain.
 - `/reflect` — manually trigger a reflection.
 - `/revise N <text>` — append a correction to record N.
-- `/file <path>` — ingest a file into the chain (document, image, etc.).
+- `/task list|open|ingest|resume|validate|audit` — per-task continuum chains.
+- `/approve <id>` / `/reject <id>` / `/pending` — the durable write gate.
 
 **When you'd touch this file:** all the time. This is your knob panel. Change `LLM_PROVIDER` to swap models. Change `SYSTEM_PROMPT` to adjust personality (auto-logged to chain). Change `SEMANTIC_K` and `RECENT_N` to tune retrieval. Change `FOUNDING_COMMITMENTS` *only on first run* — they're sealed at genesis and can't be changed without starting a new chain.
 
@@ -653,7 +741,10 @@ The faculties, and how each maps onto the existing substrate:
 - **`immune.py` — active self-defense.** `screen` refuses covenant/scar inputs
   at the membrane; `scan` reuses the Ed25519 `chain.verify()` for tamper
   detection; `rollback` seals a `recovery` record and molts the wound into a
-  learned scar. Enforcement is a **one-line lockdown gate at the top of
+  learned scar — and, given a `faculty_dir`, offers the scar vector to
+  `FacultyGarden.grow(kind_override="sense")` so the attack becomes an
+  antibody faculty (the REPL `/rollback` does this automatically).
+  Enforcement is a **one-line lockdown gate at the top of
   `chain.append`** (only `recovery` may be sealed while a `LOCKED` sidecar flag
   exists) — so no seal path can bypass it. State is a sidecar, never on-chain.
 
@@ -675,6 +766,12 @@ The faculties, and how each maps onto the existing substrate:
 - **`consensus.py` — quorum attestation.** k-of-n HMAC witnesses attest each
   head over the *recomputed* `record_hash`, layering tamper-*resistance* on the
   chain's tamper-*evidence*. Sidecar config/attestations, never on-chain.
+  The `Agent` holds a `Quorum` handle and auto-attests every committed
+  response once `/consensus-init` has run (`Quorum.is_initialized()` checks
+  only the config file — requiring an attestation file too would deadlock);
+  an attestation failure never blocks a turn. The read-only `defense_status`
+  tool reports chain integrity, immune posture, quorum health, and antibody
+  count in one snapshot.
 
 - **`faculties.py` + `faculties/*.json` — faculties as data + growth.**
   Descriptive data faculties (84 modalities, 107 senses) complement the
@@ -720,7 +817,8 @@ exposes the faculties as slash commands via `cypher_commands.py` (`/cypher-help`
 | How memory is presented to the model | `agent.py` — `_format_prompt` method |
 | How the agent reflects | `agent.py` — `reflect` method and reflection prompt |
 | Adding a new LLM provider | `llm_clients.py` — add a new `make_X_client()` |
-| Adding a new file type | `file_ingest.py` — add to `*_EXTS` set and add an `_extract_*` function |
+| Adding a tool | `tools.py` — schema in `TOOLS`, executor in `EXECUTORS`, audit fields in `TOOL_AUDIT_FIELDS` |
+| Write-gate rules | `tools.resolve_write_path` and `pending_ops.execute_approve_write` |
 | Web UI behavior or appearance | `timechain_web/webapp.py` (server) and `timechain_web/static/index.html` (frontend) |
 | Streaming responses to the browser | `llm_clients.py` — each client's `.stream()` method |
 | Adding tests | `test_timechain.py` — pytest classes by concern; `test_cypher_port.py` / `test_cypher_integration.py` for the v1.3 faculties |

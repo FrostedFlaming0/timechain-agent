@@ -5,7 +5,7 @@ append-only memory substrate. Memory survives across sessions, is tamper-evident
 and can be cryptographically verified at any time. Provider-agnostic: works with
 Claude, GPT, Gemini, DeepSeek, any model on OpenRouter, or local models via Ollama.
 
-**Version: 1.3.0.** See [CHANGELOG.md](CHANGELOG.md) for the full release
+**Version: 1.4.0.** See [CHANGELOG.md](CHANGELOG.md) for the full release
 history. Project home:
 [github.com/frostedflaming0/timechain-agent](https://github.com/frostedflaming0/timechain-agent).
 
@@ -89,16 +89,23 @@ remembered exchange happened, and when there's been a long gap between sessions.
 - **Test suite** — pytest coverage of chain integrity, tamper detection,
   Merkle proofs, retrieval, agent workflows, drift detection, and budget
   truncation.
-- **File ingestion** — read documents, spreadsheets, presentations, images,
-  and code files into the chain. Bytes are stored content-addressed under
-  `blobs/`; extracted text plus metadata go on the chain. Multimodal LLMs
-  receive image/PDF bytes natively when those records are in retrieval
-  context.
+- **Code-working agent** — the default turn is a text-parsed tool-calling
+  loop (`turn_with_tools`): the model can read files, open per-task
+  continuum chains, ingest repositories as data-height blocks, retrieve
+  path-aware, and audit chain blocks against live source. Writes never
+  execute directly — `write_file` creates a durable PendingOperation that
+  only the user can `/approve` (optimistic concurrency, atomic replace,
+  idempotent ingest, automatic post-write audit).
+- **Task chains** — `task_registry.py` + `/task` commands manage per-task
+  continuum chains under `timechain_data/tasks/<name>/`, each with its own
+  chain database, signing key, and embedding index. Task selection is
+  always explicit (`resolve_task` never guesses among similar names).
 - **Web UI (optional)** — `webapp.py` runs a local FastAPI server with a
-  single-page browser frontend. Streaming responses, drag-and-drop file
-  ingestion, inline image rendering, and a sidebar showing recent
-  reflections and revisions. Same agent, same chain, just a different
-  I/O layer.
+  single-page browser frontend. Streaming responses (with the same tool
+  loop as the REPL — tool calls appear as collapsible notes, pending writes
+  as approve/reject cards), drag-drop content ingestion, and a sidebar
+  showing recent reflections and revisions. Same agent, same chain, just a
+  different I/O layer.
 
 See `ARCHITECTURE.md` for a detailed walkthrough of each component.
 
@@ -190,7 +197,10 @@ Slash commands inside the REPL:
 - `/proposals` — list proposal records (escalated first, with recurrence counts)
 - `/modalities` — list baked-in and sprouted modalities (status, domain flag, weight)
 - `/revise N <text>` — append a correction record targeting record N
-- `/file <path>` — ingest a file (document, image, spreadsheet, code, etc.)
+- `/task list|open|ingest|resume|validate|audit` — manage per-task continuum chains
+- `/approve <id>` / `/reject <id>` / `/pending` — the Tier-3 write gate
+  (a `write_file` tool call only ever creates a pending operation; nothing
+  touches disk until you approve it)
 
 To inspect the chain offline:
 ```bash
@@ -283,10 +293,11 @@ export DEEPSEEK_API_KEY=sk-...
 export GEMINI_API_KEY=...
 ```
 
-**3. Edit `LLM_PROVIDER` in `run.py`:**
+**3. Set the `LLM_PROVIDER` environment variable** (or edit the default in
+`run.py`):
 
-```python
-LLM_PROVIDER = "openai"   # or "openrouter", "deepseek", "gemini", "ollama", "claude"
+```bash
+export LLM_PROVIDER=openai   # or "openrouter", "deepseek", "gemini", "ollama", "claude"
 ```
 
 That's it. The chain, retrieval, and web UI all carry over — your existing
@@ -338,7 +349,7 @@ A few practical notes:
   release new versions. If you get a "model not found" error, look up
   the current name and pass it explicitly via `make_X_client(model=...)`.
 - **Response length.** `LLM_MAX_TOKENS` in `run.py` caps a single
-  response (default 4096 ≈ 3000 words); `build_llm()` feeds it to whatever
+  response (default 16384 ≈ 12,000 words); `build_llm()` feeds it to whatever
   provider is selected. If a response does hit the ceiling, it is cut off
   mid-thought and the REPL / web UI show a "response was cut off" marker so
   you know to type `continue`. The marker appears for Claude, OpenAI,
@@ -357,8 +368,7 @@ A few practical notes:
 The optional `timechain_web/webapp.py` server provides a browser-based chat
 interface as an alternative to the REPL. It wraps the same agent stack —
 same chain, same signing key, same configuration — and adds streaming
-responses, drag-and-drop file ingestion, an image renderer for ingested
-files, and a sidebar showing recent reflections and revisions.
+responses and a sidebar showing recent reflections and revisions.
 
 Install the extra dependencies:
 
@@ -389,15 +399,28 @@ All slash commands from the REPL work the same way:
 
 - `/verify` `/verify-semantic` `/length` `/seal` `/sysprompt`
 - `/reflect` `/revise N <text>` `/cambium` `/cambium-full` `/proposals` `/modalities`
-- `/file <path>` `/export-capsule <path>` `/import-capsule <path>`
+- `/export-capsule <path>` `/import-capsule <path>`
 - `/verify-source <idx>` `/poq <text>` `/immune-status` `/immune-scan` `/lockdown` `/rollback <N>`
 - `/recall-index` `/recall-fetch <ids>` `/recall <query>` `/think <query>`
 - `/consensus-init` `/consensus-verify` `/cambium-grow <text>` `/migrate` `/continuum-resume` `/continuum-validate`
 
-Drag and drop a file anywhere on the page to ingest it without needing
-`/file`. Images are rendered inline in chat; PDFs and other documents
-appear as metadata cards. The chain record is identical to what `/file`
-produces — same content-addressed blob, same provenance.
+Tool turns work in the browser too: the streaming endpoint runs the same
+tool loop as the REPL (one shared driver, so the safety gates can't drift),
+showing each tool call as a collapsible note in the transcript. When the
+agent proposes a `write_file`, the UI renders an approve/reject card — the
+write happens only when you click approve (`POST
+/api/pending-ops/{id}/approve`), never autonomously.
+
+Content ingestion runs through the continuum path: paste or upload via the
+web attach button (`POST /api/upload`) or the `ingest_blob` tool. Uploads
+default to the reserved `artifacts` task chain — bytes go to the
+content-addressed blob store (served at `/blobs/<sha>`) plus a named copy
+in `~/.artifacts` (`ARTIFACTS_DIR`), the extracted content is embedded in
+the artifacts chain's own store, and the identity chain gets one small
+pointer record (no content), so big documents never crowd identity
+retrieval. Routing into a task is explicit only: tick the "ingest uploads
+into task *name*" toggle that appears when a task is active (or the model
+passes `task_name`) — an active task never captures uploads silently.
 
 A few things worth knowing:
 
@@ -537,7 +560,7 @@ Run the full test suite with pytest:
 
 ```bash
 pip install pytest
-pytest test_timechain.py -v
+pytest test_timechain.py test_tools.py -v
 ```
 
 If you can't install pytest (sandboxed environments, etc.), a standalone
@@ -545,6 +568,14 @@ runner is included:
 
 ```bash
 python run_tests.py
+```
+
+For a fast end-to-end smoke of every mechanism (timechain, PoQ, faculties,
+continuum + cartography, recall, chronosynaptic, consensus, immune, task
+registry, the write gate, ingest_blob) on a throwaway chain:
+
+```bash
+python selftest.py   # exit 0 = all green, ~2 seconds
 ```
 
 Coverage includes chain signing and verification, tamper detection across
@@ -569,14 +600,15 @@ inflected verb forms, the short/holistic/no-match fall-through paths to
 full text, the excerpt's matched/context labeling, and verified ~70%
 budget savings on a 66k-char document with a targeted query), full
 agent workflow integrity, genesis drift detection, context-budget
-truncation, and time formatting. **310 tests pass** (3 skipped — they
-need the optional webapp dependency set).
+truncation, time formatting, and the v1.4 agent layers (tool loop, task
+registry, write gate, artifacts routing, path boundaries). **483 tests
+pass** across `test_timechain.py` and `test_tools.py`.
 
 The v1.3 cognitive faculties (see below) ship two additional standalone test
 suites that run without pytest or numpy where possible:
 
 ```bash
-python test_cypher_port.py          # 109 tests — the ported modules (numpy-free)
+python test_cypher_port.py          # 106 tests — the ported modules (numpy-free)
 python test_cypher_integration.py   # 30 tests — agent loop wiring (needs numpy)
 ```
 
@@ -639,5 +671,5 @@ original architect. This project preserves that attribution above.
 
 ## Status
 
-Prototype, version 1.3.0. Works end-to-end. Not production-hardened. Issues
+Prototype, version 1.4.0. Works end-to-end. Not production-hardened. Issues
 and PRs welcome.

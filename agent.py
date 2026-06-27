@@ -27,7 +27,6 @@ from typing import Callable, Optional
 
 from chain import Chain, Record
 from retrieval import Retriever, RetrievalHit
-from file_ingest import IngestResult, ingest_file as _ingest_file
 from metadata import (
     build_meta,
     read_meta,
@@ -200,6 +199,10 @@ class AgentTurn:
     # to ask the agent to continue. False when the answer completed, or
     # when the provider didn't report a finish reason.
     truncated: bool = False
+    # True if the turn's TOOL round budget ran out mid-task (the text ends
+    # cleanly, the work doesn't). The REPL and web UI use this to tell the
+    # user that "continue" will resume the task with a fresh budget.
+    tool_budget_exhausted: bool = False
 
 
 @dataclass
@@ -259,11 +262,12 @@ class Agent:
         retriever: Retriever,
         llm: LLMCall,
         system_prompt: Optional[str] = None,
-        context_char_budget: int = 80_000,
         blob_dir: Optional[Path] = None,
+        context_char_budget: int = 80_000,
         enable_poq: bool = True,
         route_modalities: bool = True,
         enable_immune: bool = True,
+        enable_consensus: bool = True,
         enforce_verdict: bool = False,
         score_hook: Optional[Callable] = None,
     ):
@@ -274,9 +278,6 @@ class Agent:
         model's window while leaving room for response generation. If retrieval
         produces more context than this, the lowest-salience records are
         dropped first until the budget fits.
-
-        blob_dir: directory where ingested file bytes are stored
-        (content-addressed by sha256). Required for file ingestion.
 
         enable_poq: when True (default), every turn's response is scored by
         Proof-of-Quality before commit (see poq.py). The PoQ score is stored
@@ -290,8 +291,11 @@ class Agent:
         self.retriever = retriever
         self.llm = llm
         self.system_prompt = system_prompt
-        self.context_char_budget = context_char_budget
+        # blob_dir: where ingested attachment bytes live (data_dir/"blobs").
+        # When set, retrieved image/PDF records ship their original bytes to
+        # multimodal LLM clients via llm_kwargs["attachments"].
         self.blob_dir = Path(blob_dir) if blob_dir else None
+        self.context_char_budget = context_char_budget
         self.enable_poq = enable_poq
         # PoQ evaluator and Cambium detector. Both are stateless beyond
         # their configuration, so one instance each is reused across turns.
@@ -324,6 +328,18 @@ class Agent:
             self.immune = Immune(self.chain, covenant=self.covenant())
         else:
             self.immune = None
+
+        # Consensus quorum handle (consensus.py). The handle is cheap (path
+        # config only — no I/O), so it is held by default; auto-attestation
+        # in commit_response stays dormant until the quorum is actually
+        # initialized on this chain (/consensus-init). The REAL opt-in is
+        # Quorum.init(); set enable_consensus=False to sever the handle
+        # entirely (e.g. for differential testing).
+        if enable_consensus:
+            from consensus import Quorum
+            self.consensus = Quorum(self.chain)
+        else:
+            self.consensus = None
 
         # Verdict enforcement (poq.py hard-gate). OPT-IN (default off) because
         # the repo's PoQ runs lexical PROXIES, and hard-suppressing output on a
@@ -533,9 +549,9 @@ class Agent:
         # 3. Build prompt
         prompt = self._format_prompt(user_input, context)
 
-        # 4. Gather any file attachments to send natively (images, PDFs).
-        # Multimodal models will use them; text-only models ignore them
-        # and rely on the extracted_text already in the prompt.
+        # 4. Attachments: pull original image/PDF bytes for any file or
+        # attachment records in the retrieved context, so multimodal LLM
+        # clients receive the real content alongside the extracted text.
         attachments = self._collect_attachments(context)
 
         llm_kwargs: dict = {}
@@ -659,7 +675,7 @@ class Agent:
         chain records exactly what informed the answer.
         """
         refs = [r.record_hash for r in prep.context] + [prep.observation_record.record_hash]
-        return self.chain.append(
+        response = self.chain.append(
             "response",
             {
                 "text": response_text,
@@ -673,6 +689,16 @@ class Agent:
             },
             refs=refs,
         )
+        # Auto-attest the new head when a quorum has been initialized
+        # (Phase 13): defense is automatic, not a step the operator can
+        # forget. An attestation failure must never block the turn — the
+        # record is already sealed; the witnesses just didn't co-sign yet.
+        if self.consensus is not None and self.consensus.is_initialized():
+            try:
+                self.consensus.attest()
+            except Exception:    # noqa: BLE001
+                pass
+        return response
 
     # ----- immune / verdict enforcement helpers (loop discipline) -----
 
@@ -756,6 +782,14 @@ class Agent:
         else:
             response_text = self.llm(prep.prompt)
 
+        return self._finish_turn(user_input, prep, response_text)
+
+    def _finish_turn(self, user_input: str, prep: TurnPrep,
+                     response_text: str,
+                     tool_budget_exhausted: bool = False) -> AgentTurn:
+        """Shared post-LLM tail for turn() AND turn_with_tools(): truncation
+        detection, PoQ scoring, verdict enforcement, commit. One copy, so the
+        quality gates cannot drift between the plain and tool-calling paths."""
         # Detect whether the model hit its max_tokens ceiling rather than
         # finishing. was_truncated() reads the finish reason the client
         # records after each call; an unknown reason counts as complete.
@@ -817,6 +851,12 @@ class Agent:
         # `_format_prompt`'s continue-after-truncation handling.
         if response_truncated:
             response_meta_kwargs["truncated"] = True
+        # Same persistence rule for the tool-budget flag: a later
+        # "continue" needs to know the previous turn stopped mid-TASK
+        # (fresh budget, resume the work) — see _format_prompt's
+        # continue-after-budget handling.
+        if tool_budget_exhausted:
+            response_meta_kwargs["tool_budget_exhausted"] = True
 
         response = self.commit_response(prep, response_text, response_meta_kwargs)
 
@@ -827,25 +867,18 @@ class Agent:
             response_text=response_text,
             poq=poq_result,
             truncated=response_truncated,
+            tool_budget_exhausted=tool_budget_exhausted,
         )
 
-    # Per-agent blob LRU. Multi-turn conversations frequently retrieve
-    # the same image or PDF across consecutive turns; without caching,
-    # the agent re-reads the bytes from disk every turn. The cache key is
-    # the file's sha256 (the blob's content hash, recorded on the file
-    # record), so it's safe across renames and trivially invalidation-
-    # free — a different blob can't share a sha256. The byte budget is
-    # generous enough to hold one or two large PDFs or several images
-    # without bloating the agent process.
+    # ----- attachments (multimodal context) -----
+
+    # Per-Agent LRU over blob bytes: a file that stays in retrieval across
+    # several turns is read from disk once, not every turn.
     _BLOB_CACHE_MAX_BYTES = 32 * 1024 * 1024  # 32 MB
     _BLOB_CACHE_MAX_ENTRIES = 16
 
     def _read_blob_cached(self, sha256_hex: str, blob_path: Path) -> bytes:
-        """
-        Read a blob's bytes, memoized by sha256 within this Agent's LRU.
-        Falls back to a plain disk read on the first hit; subsequent
-        retrievals of the same blob in the same process are in-memory.
-        """
+        """Read a blob's bytes, memoized by sha256 within this Agent's LRU."""
         cache = getattr(self, "_blob_cache", None)
         if cache is None:
             from collections import OrderedDict
@@ -855,7 +888,6 @@ class Agent:
 
         hit = cache.get(sha256_hex)
         if hit is not None:
-            # LRU touch: move to most-recently-used.
             cache.move_to_end(sha256_hex)
             return hit
 
@@ -867,68 +899,187 @@ class Agent:
             len(cache) > self._BLOB_CACHE_MAX_ENTRIES
             or self._blob_cache_bytes > self._BLOB_CACHE_MAX_BYTES
         ) and len(cache) > 1:
-            evict_key, evict_val = cache.popitem(last=False)
+            _evict_key, evict_val = cache.popitem(last=False)
             self._blob_cache_bytes -= len(evict_val)
         return data
 
     def _collect_attachments(self, context: list[Record]) -> list[dict]:
         """
-        Pull image and PDF blobs for any file records in the retrieved context,
-        so multimodal LLM clients can send the original bytes alongside the
-        extracted text. Capped to avoid sending excessive payloads per turn.
+        Pull image and PDF blobs for any file/attachment records in the
+        retrieved context, so multimodal LLM clients can send the original
+        bytes alongside the extracted text. Capped to avoid sending
+        excessive payloads per turn.
 
-        Blob reads are LRU-cached per Agent so a file that stays in
-        retrieval across several turns is read from disk once, not every
-        turn. See `_read_blob_cached`.
+        Covers BOTH record shapes: legacy `file` records from the removed
+        file_ingest pipeline (kind/ext + blob_sha256) and Phase-14
+        `attachment` records (mime_type + blob_sha256). Blobs are located
+        via tools.resolve_blob_path, which knows the sharded layout and
+        the legacy flat fallback.
         """
         if self.blob_dir is None:
             return []
+        from tools import resolve_blob_path
         MAX_ATTACHMENTS = 4
         MAX_ATTACH_BYTES = 10 * 1024 * 1024  # 10 MB total per turn
         out: list[dict] = []
         total = 0
-        blob_dir_resolved = self.blob_dir.resolve()
         for rec in context:
-            if rec.type != "file" or not isinstance(rec.content, dict):
+            if (rec.type not in ("file", "attachment")
+                    or not isinstance(rec.content, dict)):
                 continue
-            kind = rec.content.get("kind")
-            if kind not in ("image",) and rec.content.get("ext") != ".pdf":
+            c = rec.content
+            mime = (c.get("mime_type")
+                    or _guess_media_type(c.get("ext", "")))
+            is_image = c.get("kind") == "image" or mime.startswith("image/")
+            is_pdf = c.get("ext") == ".pdf" or mime == "application/pdf"
+            if not (is_image or is_pdf):
                 continue
-            blob_filename = rec.content.get("blob_path", "")
-            # Defense-in-depth: refuse anything other than a plain
-            # basename. file_ingest stores just the sha256 basename;
-            # this guard catches the case where a corrupted or
-            # maliciously-crafted file record tries to escape blob_dir.
-            # Without this, the agent would silently read arbitrary
-            # files at the operating system level and ship them to the
-            # LLM as attachments.
-            if (not blob_filename or "/" in blob_filename
-                    or "\\" in blob_filename
-                    or blob_filename in (".", "..")
-                    or blob_filename.startswith(".")):
+            # The sha IS the blob address. Validating it as 64 hex chars
+            # makes path traversal impossible — a corrupted or
+            # maliciously-crafted record cannot escape blob_dir (the same
+            # defense-in-depth the old basename guard provided, stronger).
+            sha = c.get("blob_sha256") or ""
+            if (len(sha) != 64
+                    or not all(ch in "0123456789abcdef" for ch in sha)):
                 continue
-            blob_path = (self.blob_dir / blob_filename).resolve()
-            try:
-                blob_path.relative_to(blob_dir_resolved)
-            except ValueError:
+            blob_path = resolve_blob_path(self.blob_dir, sha)
+            if blob_path is None:
                 continue
-            if not blob_path.exists():
-                continue
-            sha = rec.content.get("blob_sha256") or blob_filename
             data = self._read_blob_cached(sha, blob_path)
             if total + len(data) > MAX_ATTACH_BYTES:
                 continue
-            attach = {
-                "kind": "image" if kind == "image" else "pdf",
+            out.append({
+                "kind": "image" if is_image else "pdf",
                 "data": data,
-                "filename": rec.content.get("filename", ""),
-                "media_type": _guess_media_type(rec.content.get("ext", "")),
-            }
-            out.append(attach)
+                "filename": c.get("filename", ""),
+                "media_type": mime,
+            })
             total += len(data)
             if len(out) >= MAX_ATTACHMENTS:
                 break
         return out
+
+    # ----- tool-calling loop (text tools) -----
+
+    def turn_with_tools(
+        self,
+        user_input: str,
+        tool_ctx,
+        retrieve_k: int = 5,
+        n_recent: int = 15,
+        max_tool_rounds: Optional[int] = None,
+        confirm_hook: Optional[Callable[[str, dict], bool]] = None,
+    ) -> AgentTurn:
+        """
+        A turn with text-parsed tool calling (tools.py is the single shared
+        driver: tolerant extractor -> strict validator -> executor -> escaped
+        results). Same membrane / PoQ / commit discipline as `turn()`.
+
+        `tool_ctx` is a tools.AgentContext. `confirm_hook(name, args) -> bool`
+        gates the calls tools.requires_confirmation() flags (Tier 3:
+        CONFIRM_TOOLS, plus a task_open whose source_root would expand the
+        allowed read/ingest roots beyond the workspace); with no hook those
+        calls are refused — the safe default for headless runs. write_file
+        needs no hook: it only ever creates a PendingOperation, and
+        approve_write / reject_write are user-triggered, never model-callable.
+        """
+        import tools as tools_mod
+
+        if max_tool_rounds is None:
+            max_tool_rounds = tools_mod.DEFAULT_MAX_TOOL_ROUNDS
+
+        # Tier-2 scoping: a pin NEVER leaks across turns (reset at START).
+        tool_ctx.pinned_path = None
+
+        # Immune screen FIRST — same membrane as turn().
+        if self.immune is not None:
+            screen = self.immune.screen(user_input)
+            if screen.get("blocked"):
+                return self._refused_turn(user_input, screen)
+
+        prep = self.prepare_turn(
+            user_input, retrieve_k=retrieve_k, n_recent=n_recent
+        )
+
+        # Tool schemas ride the system prompt as TEXT for this call only —
+        # llm_clients has no native function calling.
+        llm_kwargs = dict(prep.llm_kwargs)
+        base_system = llm_kwargs.get("system") or ""
+        llm_kwargs["system"] = (base_system + "\n\n"
+                                + tools_mod.tools_prompt()
+                                + tools_mod.workspace_prompt(tool_ctx)).strip()
+
+        prompt = prep.prompt
+        response_text = self.llm(prompt, **llm_kwargs)
+
+        # Prose that accompanied tool-call rounds. The committed response is
+        # ALL of it plus the final answer — what the user saw is what the
+        # chain seals; keeping only the last round's text leaves a fragment
+        # that reads out of context, live and on every history reload.
+        prose_segments: list[str] = []
+        rounds = 0
+        reflected = False
+        budget_exhausted = False
+        while rounds < max_tool_rounds:
+            # Mitigation 1: ONLY the fresh model segment is scanned for tool
+            # calls — never the accumulated prompt, whose tool results and
+            # file content are escaped on entry (mitigation 2).
+            calls, parse_errors = tools_mod.extract_tool_calls(response_text)
+            if not calls:
+                if (not reflected
+                        and (parse_errors
+                             or tools_mod.looks_like_intended_tool_call(
+                                 response_text))):
+                    # Mitigation 5: ONE reflective retry when the model
+                    # clearly intended a tool call that failed to parse.
+                    reflected = True
+                    prompt += ("\n" + response_text
+                               + tools_mod.tool_retry_prompt(parse_errors))
+                    response_text = self.llm(prompt, **llm_kwargs)
+                    continue
+                break    # a final answer — leave the loop
+            rounds += 1
+            prompt += "\n" + response_text
+            prose = tools_mod.strip_tool_markup(response_text)
+            if prose:
+                prose_segments.append(prose)
+            for call in calls:
+                name = call.get("name", "?")
+                if (isinstance(name, str)
+                        and tools_mod.requires_confirmation(
+                            name, call.get("arguments", {}), tool_ctx)
+                        and not (confirm_hook
+                                 and confirm_hook(name,
+                                                  call.get("arguments", {})))):
+                    result = (f"REFUSED: {name} requires explicit user "
+                              f"confirmation and none was given.")
+                else:
+                    result = tools_mod.execute_tool(call, tool_ctx)
+                prompt += tools_mod.format_tool_result(name, result)
+            if rounds >= max_tool_rounds:
+                # The next LLM call is the last one this turn gets — tell
+                # it so, or it spends the call emitting tool calls that
+                # will be silently dropped instead of an answer.
+                prompt += tools_mod.TOOL_BUDGET_NUDGE
+            response_text = self.llm(prompt, **llm_kwargs)
+        else:
+            # Round cap hit: surface it rather than silently truncating work.
+            budget_exhausted = True
+            response_text += tools_mod.tool_cap_note(max_tool_rounds)
+
+        # The final round is stripped too: echoed <tool_result> walls and
+        # leftover call markup must reach neither the user nor the chain.
+        final = tools_mod.strip_tool_markup(response_text)
+        full_response = "\n\n".join(prose_segments + ([final] if final else []))
+        return self._finish_turn(user_input, prep, full_response,
+                                 tool_budget_exhausted=budget_exhausted)
+
+    # NOTE: per-call `tool_use` audit records were removed in v1.4 (the
+    # skill-style identity chain: ONE observation + ONE response per turn).
+    # The response narrates the tool work (prose accumulation above); tool
+    # EFFECTS live on the per-task continuum chains (ingest blocks with
+    # hashes and git coordinates). Old chains containing tool_use records
+    # still read fine — metadata.py keeps their type defaults.
 
     # -----------------------------------------------------------------
     # Reflection — the agent looks at recent history and writes about
@@ -1036,42 +1187,6 @@ class Agent:
             refs=refs,
         )
 
-    # -----------------------------------------------------------------
-    # File ingestion — read a file from disk, store its bytes content-
-    # addressed in the blob dir, and append a 'file' record carrying
-    # extracted text plus metadata. The blob is recoverable from disk;
-    # the chain record makes the file searchable and provenance-checked.
-    # -----------------------------------------------------------------
-
-    def ingest_file(self, path: str | Path,
-                    original_name: Optional[str] = None) -> Optional[Record]:
-        """
-        Append a 'file' record for `path`. Stores the file's bytes as a
-        blob (content-addressed by sha256) and records extracted text
-        plus metadata on the chain.
-
-        `original_name`: the file's real name when `path` is a temporary copy
-        (e.g. a browser upload) — so the record keeps the real filename the
-        retriever embeds and the user searches by.
-
-        Returns the new record, or raises if the file is missing,
-        unsupported, or too large. Returns None only if no blob_dir
-        was configured on this Agent.
-        """
-        if self.blob_dir is None:
-            raise RuntimeError(
-                "Agent.ingest_file requires blob_dir to be configured "
-                "in the Agent constructor"
-            )
-        result: IngestResult = _ingest_file(
-            path, self.blob_dir, original_name=original_name)
-        content = result.to_record_content()
-        content["_meta"] = build_meta(
-            "file",
-            source=SOURCE_TOOL,
-            confidence=1.0,  # the bytes are what they are; sha256 verifies it
-        )
-        return self.chain.append("file", content)
 
     def revise(self, target_index: int, correction_text: str) -> Optional[Record]:
         """
@@ -1476,10 +1591,12 @@ class Agent:
             # (document)\n<first 500 chars of text>" rather than the
             # serialized dict full of sha256 hex and metadata that
             # `str(rec.content)` produces.
-            if rec.type == "file" and isinstance(rec.content, dict):
+            if (rec.type in ("file", "attachment")
+                    and isinstance(rec.content, dict)):
                 c = rec.content
                 content = (
-                    f"{c.get('filename','?')} ({c.get('kind','?')})"
+                    f"{c.get('filename','?')} "
+                    f"({c.get('kind') or c.get('mime_type','?')})"
                     f" — {c.get('extracted_text','')}"
                 )
             else:
@@ -1679,16 +1796,32 @@ class Agent:
         """
         c = display_content if isinstance(display_content, dict) else {}
         filename = c.get("filename", "?")
-        kind = c.get("kind", "?")
-        size_bytes = c.get("size_bytes", 0)
-        sha_prefix = (c.get("blob_sha256", "") or "")[:12]
+        # Attachment records carry mime_type/approx_bytes where legacy
+        # file records carried kind/size_bytes — render either shape.
+        kind = c.get("kind") or c.get("mime_type", "?")
+        size_bytes = c.get("size_bytes") or c.get("approx_bytes", 0)
+        # The FULL sha, never truncated: this rendered line is the model's
+        # only handle for build_attachment(blob_sha256) — a 12-char prefix
+        # display once left the model unable to fetch the very record it
+        # was reading ("the hash in the record is truncated").
+        sha = c.get("blob_sha256", "") or ""
         trunc_note = " (text truncated)" if c.get("extraction_truncated") else ""
         full_text = c.get("extracted_text", "") or ""
+        # Pointer rings (artifacts routing) carry no text but do carry the
+        # on-disk path — surface it so the model can read_file the named
+        # copy or build_attachment the sha instead of dead-ending.
+        artifact_note = ""
+        if not full_text and c.get("artifact_path"):
+            artifact_note = (
+                f"\n[content not inlined: artifact stored at "
+                f"{c['artifact_path']}; fetch text via build_attachment "
+                f"with the sha256 above, or read_file the stored path]"
+            )
 
         def render_full() -> str:
             return (
                 f'file: {filename} ({kind}, {size_bytes:,} bytes, sha256 '
-                f'{sha_prefix}...){trunc_note}\n{full_text}'
+                f'{sha}){trunc_note}{artifact_note}\n{full_text}'
             )
 
         # (1) Short files: full render, no decision to make.
@@ -1740,7 +1873,7 @@ class Agent:
         # provided for continuity.
         header = (
             f'file: {filename} ({kind}, {size_bytes:,} bytes, sha256 '
-            f'{sha_prefix}...){trunc_note}\n'
+            f'{sha}){trunc_note}\n'
             f'[chunk-aware excerpt: showing {len(ordered)} of '
             f'{chunk_total} chunks, matched chunks marked]\n'
         )
@@ -1793,7 +1926,7 @@ class Agent:
             if isinstance(display_content, dict) and "_meta" in display_content:
                 display_content = {k: v for k, v in display_content.items() if k != "_meta"}
             try:
-                if rec.type == "file":
+                if rec.type in ("file", "attachment"):
                     # Render files specially: a short metadata header plus
                     # either the full extracted text or chunk-aware excerpts.
                     # The decision lives in `_file_content_repr` — it
@@ -2016,24 +2149,33 @@ class Agent:
         # working out what to continue from. With the directive, the
         # model knows the previous response is incomplete and resumes
         # generating from where it left off.
+        # The directive keys off the PERSISTED state (the truncated /
+        # tool_budget_exhausted meta flags on the last response), not off
+        # recognizing the user's phrasing: an earlier version only fired on
+        # a whitelist of exact phrases ("continue", "go on", …), so a user
+        # typing "resume" or "keep working" silently restarted the task on
+        # a fresh budget. A short explicit continue-phrase still gets the
+        # strongest wording; any other input gets an advisory note and the
+        # model judges whether it is a resume request.
         continuation_note = ""
         normalized = user_input.strip().lower().rstrip(".!")
-        is_continue_request = normalized in {
+        is_explicit_continue = normalized in {
             "continue", "go on", "keep going", "please continue",
-            "please go on", "carry on", "continue please",
+            "please go on", "carry on", "continue please", "resume",
+            "keep working",
         }
-        if is_continue_request:
-            # Walk backward from the just-appended observation to find
-            # the most recent response record. Limit the scan to avoid
-            # a full chain walk on every turn.
-            scan_start = max(0, head_idx - 20)
-            recent = list(self.chain.iter_records(start=scan_start, end=head_idx))
-            last_response = next(
-                (r for r in reversed(recent) if r.type == "response"), None
-            )
-            if last_response is not None:
-                last_meta = read_meta(last_response)
-                if last_meta.truncated:
+        # Walk backward from the just-appended observation to find the
+        # most recent response record. Limit the scan to avoid a full
+        # chain walk on every turn.
+        scan_start = max(0, head_idx - 20)
+        recent = list(self.chain.iter_records(start=scan_start, end=head_idx))
+        last_response = next(
+            (r for r in reversed(recent) if r.type == "response"), None
+        )
+        if last_response is not None:
+            last_meta = read_meta(last_response)
+            if last_meta.truncated:
+                if is_explicit_continue:
                     continuation_note = (
                         "IMPORTANT: your previous response (record "
                         f"{last_response.index}) was cut off at the "
@@ -2043,6 +2185,46 @@ class Agent:
                         "NOT restart, summarize what you said, or ask "
                         "what to continue from. Pick up mid-sentence "
                         "if necessary and finish the answer.\n\n"
+                    )
+                else:
+                    continuation_note = (
+                        "Note: your previous response (record "
+                        f"{last_response.index}) was cut off at the "
+                        "model's max_tokens limit — it is incomplete. "
+                        "If the user's message asks you to continue (in "
+                        "any wording), resume that response from exactly "
+                        "where it stopped instead of restarting; "
+                        "otherwise answer their message normally.\n\n"
+                    )
+            elif last_meta.tool_budget_exhausted:
+                # Distinct from truncation: the TEXT ended cleanly
+                # (a progress checkpoint), the TASK didn't. Resume
+                # mid-task, not mid-sentence.
+                if is_explicit_continue:
+                    continuation_note = (
+                        "IMPORTANT: your previous response (record "
+                        f"{last_response.index}) stopped because the "
+                        "turn's TOOL round budget ran out — the task is "
+                        "unfinished. The user is granting you a FRESH "
+                        "tool budget to resume it. Re-orient from the "
+                        "progress checkpoint in that response (what was "
+                        "done, what remains), then go straight back to "
+                        "work with tool calls. Do NOT restart from "
+                        "scratch, re-read what you already read, or ask "
+                        "what to continue from.\n\n"
+                    )
+                else:
+                    continuation_note = (
+                        "Note: your previous response (record "
+                        f"{last_response.index}) stopped at the turn's "
+                        "TOOL round budget — the task is unfinished and "
+                        "a progress checkpoint is in that response. If "
+                        "the user's message asks you to continue or "
+                        "resume (in any wording), re-orient from the "
+                        "checkpoint and go straight back to work with a "
+                        "fresh tool budget — do NOT restart from scratch "
+                        "or re-read what you already read. If they are "
+                        "asking something else, answer that instead.\n\n"
                     )
 
         return (

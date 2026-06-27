@@ -10,6 +10,13 @@ import. Run: `python3 test_cypher_port.py`.
 
 from __future__ import annotations
 
+# This is a STANDALONE script, not a pytest suite: its test_* functions take
+# a positional `workdir`, and check() reports without raising. conftest.py's
+# collect_ignore keeps bare `pytest` away; this flag covers the remaining
+# trap — pytest bypasses collect_ignore when the file is named explicitly
+# (`pytest test_cypher_port.py`), which would error on the missing fixture.
+__test__ = False
+
 import shutil
 import tempfile
 from pathlib import Path
@@ -18,7 +25,6 @@ from chain import Chain, load_or_create_key
 import metadata
 import ring_compat
 import poq
-import file_ingest
 import source_verify
 import immune
 import continuum
@@ -167,19 +173,34 @@ def test_poq_evaluate() -> None:
 # source_verify + file_ingest source coordinates
 # --------------------------------------------------------------------------- #
 
+def _file_record_content(src: Path) -> dict:
+    """Hand-built `file` record content with source coordinates — what
+    file_ingest used to produce, minus blob storage (removed in the
+    code-working refactor; continuum is the ingestion path now)."""
+    import hashlib as _hashlib
+    sha = _hashlib.sha256(src.read_bytes()).hexdigest()
+    return {
+        "filename": src.name,
+        "ext": src.suffix,
+        "kind": "code",
+        "size_bytes": src.stat().st_size,
+        "source_path": str(src),
+        "file_content_hash": sha,
+        "extracted_text": src.read_text(errors="replace"),
+    }
+
+
 def test_source_verify(workdir: Path) -> None:
     print("source_verify:")
     chain = _new_chain(workdir)
-    blob_dir = workdir / "blobs"
     src = workdir / "sample.py"
     src.write_text("print('hello world')\n# original content\n")
 
-    res = file_ingest.ingest_file(src, blob_dir)
-    content = res.to_record_content()
-    check("ingest captures source_path",
+    content = _file_record_content(src)
+    check("record carries source_path",
           content.get("source_path") is not None)
-    check("ingest captures file_content_hash",
-          content.get("file_content_hash") == content.get("blob_sha256"))
+    check("record carries file_content_hash",
+          bool(content.get("file_content_hash")))
     rec = chain.append("file", content)
 
     v1 = source_verify.verify_file_record(chain, rec.index)
@@ -535,27 +556,6 @@ def test_commands(workdir: Path) -> None:
     check("/cambium-grow runs (isolated faculty dir)", h and "dissonance" in out, out)
 
 
-def test_original_name(workdir: Path) -> None:
-    print("file ingest: original_name preserves the real filename:")
-    blob_dir = workdir / "blobs"
-    tmp = workdir / "tmpABC123.md"   # a temp basename, real .md suffix (upload case)
-    tmp.write_text("# CHANGELOG\n\nv1.3.0 ...\n")
-
-    res = file_ingest.ingest_file(tmp, blob_dir, original_name="CHANGELOG.md")
-    content = res.to_record_content()
-    check("filename is the real name, not the temp basename",
-          content["filename"] == "CHANGELOG.md", content["filename"])
-    check("ext derived from the real name", content["ext"] == ".md", content["ext"])
-    # A browser may send a path-y name; only the basename is kept.
-    res_p = file_ingest.ingest_file(tmp, blob_dir, original_name="docs/CHANGELOG.md")
-    check("original_name is reduced to its basename",
-          res_p.to_record_content()["filename"] == "CHANGELOG.md")
-    # Direct path ingest (no original_name) keeps the on-disk name as before.
-    res2 = file_ingest.ingest_file(tmp, blob_dir)
-    check("direct ingest still uses the on-disk name",
-          res2.to_record_content()["filename"] == "tmpABC123.md")
-
-
 def test_audit(workdir: Path) -> None:
     print("audit snapshot:")
     import audit
@@ -637,7 +637,6 @@ def main() -> int:
         test_pow(pw)
         test_faculties(fac)
         test_commands(root / "cmds")
-        test_original_name(onm)
         test_audit(aud)
     finally:
         shutil.rmtree(root, ignore_errors=True)

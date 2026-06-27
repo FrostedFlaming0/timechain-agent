@@ -106,10 +106,15 @@ def dispatch(user_input: str, chain, agent=None, repo_root: Optional[Path] = Non
                 if not args:
                     print("  usage: /rollback <first_bad_height>")
                     return True
-                r = im.rollback(int(args[0]))
+                r = im.rollback(int(args[0]), grow_antibody=True,
+                                faculty_dir=_faculty_dir(repo_root))
                 print(f"  rolled back to clean height {r['safe_height']}; "
                       f"quarantined {r['quarantined']}; scar {r['scar']['id']} learned; "
                       f"recovery sealed as Ring {r['recovery_ring']}.")
+                if r.get("antibody"):
+                    ab = r["antibody"]
+                    print(f"  antibody grown from scar: {ab['name']} "
+                          f"[{ab['action']}] (dissonance {ab['gap_dissonance']})")
 
         elif cmd in ("/recall-index", "/recall-fetch", "/recall"):
             import recall as _recall

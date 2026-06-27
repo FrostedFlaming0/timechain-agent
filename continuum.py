@@ -31,11 +31,55 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import ring_compat
+# ONE hashing rule for content: pending_ops owns sha256_text (the write
+# gate hashes proposed content with it; continuum blocks store
+# file_content_hash with it) so approval-time checks and post-write audits
+# can never drift on normalization. Re-exported here for existing callers.
+from pending_ops import sha256_text  # noqa: F401
+
+
+@dataclass
+class WalkResult:
+    """Return value of Continuum.walk(). Use the named attributes; `sealed`
+    and `state` carry what the per-task embedding index needs
+    (walk -> seal -> index_record)."""
+    files: list = field(default_factory=list)            # discovered file paths
+    results: list = field(default_factory=list)          # (relative_path, chunk_count)
+    sealed: list = field(default_factory=list)           # (Record, token_count)
+    state: Optional[dict] = None                         # refreshed task state
+
+
+def find_by_operation_id(chain, operation_id: str) -> Optional[list]:
+    """Ring indices of continuum blocks sealed with this operation_id, or
+    None if the id has never been sealed. The write-approval flow calls this
+    BEFORE ingesting so a crash-retry cannot double-seal (idempotency).
+
+    Runs as an SQL-level json_extract lookup — this fires on EVERY
+    approve_write (under the webapp's global lock), and the old
+    implementation materialized the whole task chain through
+    ring_compat.load_rings per call. Falls back to that scan only when
+    the SQLite build lacks JSON1."""
+    if not operation_id:
+        return None
+    try:
+        hits = chain.find_indices_by_content_field(
+            "$.data.operation_id", operation_id)
+    except sqlite3.OperationalError:
+        hits = [
+            ring["index"]
+            for ring in ring_compat.load_rings(chain,
+                                               exclude_quarantined=False)
+            if (ring.get("payload", {}).get("data") or {})
+            .get("operation_id") == operation_id
+        ]
+    return hits or None
 
 
 # Data-height band, measured in approximate tokens (~4 chars/token).
@@ -115,10 +159,6 @@ def chunk_text(text: str, target=TARGET_TOKENS, min_=MIN_TOKENS, max_=MAX_TOKENS
 
 def language_for_extension(ext: str):
     return LANGUAGE_BY_EXT.get(ext.lower())
-
-
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def redact_secrets(text: str):
@@ -228,7 +268,6 @@ class Continuum:
         self.target, self.min, self.max = target, min_, max_
         self._state = None       # cached rolling state across a walk -> no reload
         self._labeler = labeler  # optional callable(content)->labels dict (recall)
-        self._embed = None
 
     def _rings(self):
         return ring_compat.load_rings(self.chain, exclude_quarantined=False)
@@ -318,11 +357,17 @@ class Continuum:
                 "git_remote": metadata.get("git_remote"),
                 "content_hash": sha256_text(ch),
                 "file_content_hash": file_content_hash,
+                "operation_id": metadata.get("operation_id"),
                 "redacted": bool(metadata.get("redacted")),
                 "redaction_count": metadata.get("redaction_count", 0),
                 "approx_tokens": approx_tokens(ch),
                 "content": ch,
             }
+            # Pass through custom metadata keys (Phase 14: mime_type,
+            # workspace_path, source, approx_bytes, …). setdefault so a
+            # custom key can never shadow the canonical chunk fields above.
+            for k, v in metadata.items():
+                data.setdefault(k, v)
             payload = {"event": "continuum", "task": st["objective"][:48],
                        "state": st, "data": data}
             if label:
@@ -385,9 +430,8 @@ class Continuum:
                 latest[rel] = h
         return latest
 
-    def walk(self, path, exts, objective, label=True, embed=None,
-             redact=True, changed_only=False, skip_dirs=None):
-        self._embed = embed
+    def walk(self, path, exts, objective, label=True,
+             redact=True, changed_only=False, skip_dirs=None) -> "WalkResult":
         path = Path(path)
         skip_dirs = DEFAULT_SKIP_DIRS if skip_dirs is None else set(skip_dirs)
         files = sorted(
@@ -404,8 +448,25 @@ class Continuum:
                 continue
             planned.append((file_index, f, rel, text))
         git_info = git_info_for(path)
-        self.open_task(objective, items_total=len(planned))
+        # Reuse an already-open task instead of re-opening. open_task seals
+        # a task_open ring, and walk used to call it unconditionally — so
+        # every open-with-auto-ingest (and every later walk into the same
+        # task) wrote a redundant task_open record 1s after the real one.
+        # One task, one open ring: when state already exists, just extend
+        # its metrics in memory (`objective` is the task's, not this
+        # walk's) — every sealed block carries the refreshed state anyway.
+        state = self._state if self._state is not None else self._head_state()
+        if state is None:
+            self.open_task(objective, items_total=len(planned))
+        else:
+            st = json.loads(json.dumps(state))   # never mutate sealed state
+            m = st.setdefault("metrics", {})
+            m["items_total"] = (m.get("items_done") or 0) + len(planned)
+            st["next_action"] = f"ingest {len(planned)} item(s)"
+            self._state = st
         results = []
+        sealed_all = []
+        state = self._state
         for file_index, f, rel, text in planned:
             sealed_text, redaction_count = redact_secrets(text) if redact else (text, 0)
             ndef = text.count("def "); ncls = text.count("class ")
@@ -414,7 +475,9 @@ class Continuum:
                 finding += f", {redaction_count} secret(s) redacted"
             meta = file_metadata(path, f, file_index, text, git_info=git_info,
                                  redaction_count=redaction_count)
-            sealed, _ = self.ingest(rel, sealed_text, finding=finding,
-                                    label=label, metadata=meta)
+            sealed, state = self.ingest(rel, sealed_text, finding=finding,
+                                        label=label, metadata=meta)
+            sealed_all.extend(sealed)
             results.append((rel, len(sealed)))
-        return files, results
+        return WalkResult(files=files, results=results,
+                          sealed=sealed_all, state=state)

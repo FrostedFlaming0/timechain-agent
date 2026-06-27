@@ -210,6 +210,7 @@ class Immune:
         first_bad_height: int,
         lesson: str = "prompt-injection / jailbreak",
         grow_antibody: bool = False,
+        faculty_dir: Optional[str | Path] = None,
     ) -> dict:
         """Resume from the clean height before `first_bad_height`; seal a
         `recovery` record (permitted under lockdown), molt the wound into a
@@ -259,10 +260,30 @@ class Immune:
         if self.lock_path.exists():
             self.lock_path.unlink()
 
-        # Antibody growth (cambium.grow on the scar vector) is a Phase-5
-        # follow-up once faculty growth lands; until then the scar is recorded
-        # and recognized by screen()/match_scar. Accepted for forward-compat.
+        # Scar-to-antibody growth (Phase 13): offer the scar's attack vector
+        # to the FacultyGarden as a candidate sense. The garden applies its
+        # own dissonance floor — a vector the existing senses already cover
+        # grows nothing. Growth failure never blocks recovery: the scar is
+        # already recorded and recognized by screen()/match_scar either way.
         antibody = None
+        if grow_antibody and faculty_dir is not None:
+            try:
+                from faculties import FacultyGarden
+                garden = FacultyGarden(self.chain, faculty_dir)
+                result, _rec = garden.grow(
+                    " ".join(vector),
+                    context=(f"scar {scar['id']} from attack at "
+                             f"heights {quarantined}: {lesson}"),
+                    kind_override="sense",
+                )
+                if result.get("grew"):
+                    antibody = {
+                        "name": result["faculty"]["name"],
+                        "action": result["action"],
+                        "gap_dissonance": result["gap"]["dissonance"],
+                    }
+            except Exception:    # noqa: BLE001 — recovery must complete
+                antibody = None
         return {
             "safe_height": safe,
             "quarantined": quarantined,

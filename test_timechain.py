@@ -61,6 +61,7 @@ from chain import (
 )
 from retrieval import (
     EmbeddingIndex,
+    EmbeddingStoreMismatchError,
     HashingEmbedder,
     OllamaEmbedder,
     Retriever,
@@ -69,6 +70,7 @@ from retrieval import (
     chunk_text,
     CHUNK_TARGET_CHARS,
     CHUNK_HARD_MAX_CHARS,
+    open_or_rebuild_index,
 )
 from agent import Agent, MockLLM, _humanize_delta, _format_absolute_time
 from metadata import build_meta, read_meta
@@ -1038,7 +1040,7 @@ class TestEmbedderFallback:
         idx.index_chain(chain)
         idx.close()
 
-        with pytest.raises(ValueError, match="dim"):
+        with pytest.raises(EmbeddingStoreMismatchError, match="dim"):
             EmbeddingIndex(db, HashingEmbedder(dim=128), dim=128)
 
     def test_index_accepts_matching_dimension_on_reopen(self, workdir, chain):
@@ -1088,6 +1090,86 @@ class TestEmbedderFallback:
                 "EmbeddingIndex accepted a different embedder identity on "
                 "an existing store — the coordinate-space guard isn't firing"
             )
+
+    def test_open_or_rebuild_passes_through_clean_store(self, workdir, chain):
+        # A store that matches the active embedder opens unchanged — no
+        # deletion, existing vectors preserved.
+        db = workdir / "e.sqlite"
+        idx = EmbeddingIndex(db, HashingEmbedder(dim=64), dim=64)
+        chain.append("note", {"text": "hello"})
+        idx.index_chain(chain)
+        idx.close()
+
+        idx2 = open_or_rebuild_index(db, HashingEmbedder(dim=64), 64)
+        try:
+            assert idx2.stored_dim() == 64
+        finally:
+            idx2.close()
+
+    def test_open_or_rebuild_heals_dim_mismatch_and_backfills(self, workdir, chain):
+        # The Ollama-install scenario: a 64-dim store exists, the active
+        # embedder now produces 128-dim vectors. The helper must delete the
+        # derived store, reopen, and (given the chain) re-embed every record
+        # so the rebuilt store is immediately searchable.
+        db = workdir / "e.sqlite"
+        idx = EmbeddingIndex(db, HashingEmbedder(dim=64), dim=64)
+        chain.append("note", {"text": "first"})
+        chain.append("note", {"text": "second"})
+        idx.index_chain(chain)
+        idx.close()
+
+        messages = []
+        rebuilt = open_or_rebuild_index(
+            db, HashingEmbedder(dim=128), 128,
+            chain=chain, log=messages.append)
+        try:
+            assert rebuilt.stored_dim() == 128
+            cur = rebuilt._conn.cursor()
+            cur.execute("SELECT COUNT(DISTINCT record_idx) FROM embeddings")
+            assert cur.fetchone()[0] == len(list(chain.iter_records()))
+            assert any("rebuilding" in m for m in messages)
+        finally:
+            rebuilt.close()
+
+    def test_open_or_rebuild_heals_identity_mismatch(self, workdir, chain):
+        # Same dimension, different coordinate space (different embedder
+        # identity) — must rebuild rather than raise or mix spaces.
+        db = workdir / "e.sqlite"
+        idx = EmbeddingIndex(db, HashingEmbedder(dim=64), dim=64)
+        chain.append("note", {"text": "hello world"})
+        idx.index_chain(chain)
+        idx.close()
+
+        import numpy as np
+
+        class ForeignEmbedder:
+            model = "completely-different-embedder"
+            dim = 64
+            def __call__(self, text):
+                return np.zeros(64, dtype=np.float32)
+
+        rebuilt = open_or_rebuild_index(
+            db, ForeignEmbedder(), 64, chain=chain, log=lambda _m: None)
+        try:
+            # Fresh store, repopulated from the chain by the foreign embedder.
+            cur = rebuilt._conn.cursor()
+            cur.execute("SELECT COUNT(DISTINCT record_idx) FROM embeddings")
+            assert cur.fetchone()[0] == len(list(chain.iter_records()))
+        finally:
+            rebuilt.close()
+
+    def test_open_or_rebuild_backfills_without_mismatch(self, workdir, chain):
+        # Passing the chain also backfills records that were sealed while
+        # the store was absent — the task-index case in tools.py.
+        chain.append("note", {"text": "sealed before any index existed"})
+        db = workdir / "e.sqlite"
+        idx = open_or_rebuild_index(db, HashingEmbedder(dim=64), 64, chain=chain)
+        try:
+            cur = idx._conn.cursor()
+            cur.execute("SELECT COUNT(DISTINCT record_idx) FROM embeddings")
+            assert cur.fetchone()[0] == len(list(chain.iter_records()))
+        finally:
+            idx.close()
 
     def test_hashing_embedder_deterministic_in_process(self):
         # Same input, same vector, within one process. Necessary but not
@@ -1357,117 +1439,6 @@ class TestAgent:
         agent.revise(2, "correction")
         ok, msg = agent.chain.verify(expected_pubkey=agent.chain.pubkey_hex)
         assert ok, msg
-
-
-# ---------------------------------------------------------------------------
-# File ingestion
-# ---------------------------------------------------------------------------
-
-class TestFileIngestion:
-    def test_text_file_ingest(self, workdir, chain, index):
-        from agent import Agent
-        retriever = Retriever(chain, index)
-        blob_dir = workdir / "blobs"
-        agent = Agent(chain, retriever, MockLLM(), system_prompt="t", blob_dir=blob_dir)
-
-        # Create a text file
-        f = workdir / "hello.txt"
-        f.write_text("hello world\nthis is a test file\nline three", encoding="utf-8")
-
-        rec = agent.ingest_file(f)
-        index.index_record(rec)
-
-        assert rec.type == "file"
-        assert rec.content["filename"] == "hello.txt"
-        assert rec.content["kind"] == "document"
-        assert "hello world" in rec.content["extracted_text"]
-        assert (blob_dir / rec.content["blob_sha256"]).exists()
-
-    def test_csv_file_ingest(self, workdir, chain, index):
-        from agent import Agent
-        retriever = Retriever(chain, index)
-        blob_dir = workdir / "blobs"
-        agent = Agent(chain, retriever, MockLLM(), system_prompt="t", blob_dir=blob_dir)
-
-        f = workdir / "data.csv"
-        f.write_text("name,age,city\nAlice,30,NYC\nBob,25,LA\n", encoding="utf-8")
-
-        rec = agent.ingest_file(f)
-        index.index_record(rec)
-        assert rec.content["kind"] == "spreadsheet"
-        assert "Alice" in rec.content["extracted_text"]
-        assert "30" in rec.content["extracted_text"]
-
-    def test_code_file_ingest(self, workdir, chain, index):
-        from agent import Agent
-        retriever = Retriever(chain, index)
-        blob_dir = workdir / "blobs"
-        agent = Agent(chain, retriever, MockLLM(), system_prompt="t", blob_dir=blob_dir)
-
-        f = workdir / "test.py"
-        f.write_text("def hello():\n    return 'world'\n", encoding="utf-8")
-
-        rec = agent.ingest_file(f)
-        assert rec.content["kind"] == "code"
-        assert "def hello" in rec.content["extracted_text"]
-
-    def test_unsupported_extension_rejected(self, workdir, chain, index):
-        from agent import Agent
-        retriever = Retriever(chain, index)
-        blob_dir = workdir / "blobs"
-        agent = Agent(chain, retriever, MockLLM(), system_prompt="t", blob_dir=blob_dir)
-
-        f = workdir / "binary.exe"
-        f.write_bytes(b"\x00\x01\x02")
-        with pytest.raises(ValueError):
-            agent.ingest_file(f)
-
-    def test_missing_file_raises(self, workdir, chain, index):
-        from agent import Agent
-        retriever = Retriever(chain, index)
-        blob_dir = workdir / "blobs"
-        agent = Agent(chain, retriever, MockLLM(), system_prompt="t", blob_dir=blob_dir)
-        with pytest.raises(FileNotFoundError):
-            agent.ingest_file(workdir / "does_not_exist.txt")
-
-    def test_blob_sha_matches_content(self, workdir, chain, index):
-        from agent import Agent
-        from file_ingest import verify_blob
-        retriever = Retriever(chain, index)
-        blob_dir = workdir / "blobs"
-        agent = Agent(chain, retriever, MockLLM(), system_prompt="t", blob_dir=blob_dir)
-
-        f = workdir / "x.txt"
-        f.write_text("integrity test content", encoding="utf-8")
-        rec = agent.ingest_file(f)
-        assert verify_blob(rec.content, blob_dir)
-
-        # Tamper with the blob — verify_blob should detect it
-        blob_path = blob_dir / rec.content["blob_sha256"]
-        blob_path.write_bytes(b"tampered content")
-        assert not verify_blob(rec.content, blob_dir)
-
-    def test_chain_verifies_after_file_ingest(self, workdir, chain, index):
-        from agent import Agent
-        retriever = Retriever(chain, index)
-        blob_dir = workdir / "blobs"
-        agent = Agent(chain, retriever, MockLLM(), system_prompt="t", blob_dir=blob_dir)
-
-        agent.commit_genesis(["x"])
-        f = workdir / "doc.md"
-        f.write_text("# Title\n\nSome content here.", encoding="utf-8")
-        agent.ingest_file(f)
-        agent.turn("tell me about the file")
-
-        ok, msg = chain.verify(expected_pubkey=chain.pubkey_hex)
-        assert ok, msg
-
-    def test_ingest_without_blob_dir_raises(self, chain, index):
-        from agent import Agent
-        retriever = Retriever(chain, index)
-        agent = Agent(chain, retriever, MockLLM())  # no blob_dir
-        with pytest.raises(RuntimeError, match="blob_dir"):
-            agent.ingest_file("/tmp/anything.txt")
 
 class TestGenesisDrift:
     def test_no_drift_returns_none(self, agent, index):
@@ -3245,140 +3216,6 @@ class TestAutoSprout:
 
 # ===========================================================================
 
-class TestAttachmentCache:
-    """
-    Per-Agent LRU cache for blob bytes. Multi-turn conversations
-    frequently retrieve the same image or PDF across consecutive
-    turns; without caching, the agent re-reads the bytes from disk
-    every turn. The cache is keyed by blob sha256 and bounded by both
-    entry count and total bytes. These tests pin the contract; until
-    they were written, the cache code in agent.py existed but had no
-    coverage for hit/eviction behavior.
-    """
-
-    def _make_agent_with_blob(self, workdir, chain, index, blob_bytes: bytes):
-        from agent import Agent, MockLLM
-        from file_ingest import ingest_file
-        import hashlib
-        blob_dir = workdir / "blobs"
-        blob_dir.mkdir(exist_ok=True)
-        # Write a tiny "image" blob and the file record that references it.
-        sha = hashlib.sha256(blob_bytes).hexdigest()
-        (blob_dir / sha).write_bytes(blob_bytes)
-        # A minimal file record. content matches what file_ingest produces.
-        chain.append("file", {
-            "filename": "test.png",
-            "ext": ".png",
-            "kind": "image",
-            "size_bytes": len(blob_bytes),
-            "blob_sha256": sha,
-            "blob_path": sha,
-            "extracted_text": "[image: test.png]",
-            "extraction_method": "pillow-metadata",
-            "extraction_truncated": False,
-        })
-        agent = Agent(
-            chain=chain,
-            retriever=None,  # not exercised in these tests
-            llm=MockLLM(),
-            blob_dir=blob_dir,
-        )
-        return agent, sha, blob_dir / sha
-
-    def test_cache_hit_returns_same_bytes_without_rereading(
-        self, workdir, chain, index
-    ):
-        # Two reads of the same sha must return the same bytes, and
-        # the second must not touch disk. We assert this by replacing
-        # the file's on-disk bytes between calls — a cache hit ignores
-        # the change.
-        payload = b"\x89PNG\r\n\x1a\nfake-png-bytes-for-test"
-        agent, sha, path = self._make_agent_with_blob(
-            workdir, chain, index, payload
-        )
-
-        first = agent._read_blob_cached(sha, path)
-        # Overwrite the file. If the cache reread from disk, the second
-        # call would return the new bytes.
-        path.write_bytes(b"DIFFERENT")
-        second = agent._read_blob_cached(sha, path)
-        assert first == second == payload
-
-    def test_cache_evicts_lru_when_over_entry_budget(
-        self, workdir, chain, index
-    ):
-        # Fill the cache past _BLOB_CACHE_MAX_ENTRIES. The oldest entry
-        # should be evicted; reading it again must touch disk.
-        from agent import Agent
-        agent, sha0, path0 = self._make_agent_with_blob(
-            workdir, chain, index, b"original-0"
-        )
-        # Pre-populate so we know the cache has agent._BLOB_CACHE_MAX_ENTRIES + 1
-        # synthetic shas in it after the loop.
-        agent._read_blob_cached(sha0, path0)
-        # Manufacture enough distinct shas to push sha0 out.
-        for i in range(agent._BLOB_CACHE_MAX_ENTRIES + 1):
-            fake_sha = f"synthetic-sha-{i:040x}"
-            fake_path = path0.parent / fake_sha
-            fake_path.write_bytes(f"synthetic-{i}".encode())
-            agent._read_blob_cached(fake_sha, fake_path)
-        # sha0 should be evicted now. Overwrite its on-disk bytes; a
-        # re-read must see the new bytes (proving the cache missed and
-        # went to disk).
-        path0.write_bytes(b"AFTER_EVICTION")
-        out = agent._read_blob_cached(sha0, path0)
-        assert out == b"AFTER_EVICTION", (
-            "sha0 was still cached after the eviction loop — the LRU "
-            "didn't evict the least-recently-used entry"
-        )
-
-    def test_collect_attachments_rejects_path_traversal(
-        self, workdir, chain, index
-    ):
-        # Regression: `Agent._collect_attachments` reads
-        # `rec.content["blob_path"]` and joins it under `blob_dir`. If
-        # the chain were corrupted (or built by a buggy ingestion
-        # tool), a value like `../../etc/passwd` would escape the
-        # blob directory and the agent would silently ship arbitrary
-        # files to the LLM as attachments. Defense-in-depth: refuse
-        # anything that isn't a plain basename.
-        from agent import Agent, MockLLM
-        from metadata import build_meta, SOURCE_USER
-        blob_dir = workdir / "blobs"
-        blob_dir.mkdir()
-        # Plant a real "secret" file outside the blob directory that
-        # the traversal attempt would target.
-        secret_path = workdir / "secret.txt"
-        secret_path.write_bytes(b"SECRET")
-        # Now commit a file record whose blob_path tries to escape.
-        chain.append("file", {
-            "filename": "innocuous.png",
-            "ext": ".png",
-            "kind": "image",
-            "size_bytes": 6,
-            "blob_sha256": "fake",
-            "blob_path": "../secret.txt",  # the traversal payload
-            "extracted_text": "[image: innocuous.png]",
-            "extraction_method": "pillow-metadata",
-            "extraction_truncated": False,
-        })
-        # Look up that record. _collect_attachments should refuse it.
-        agent = Agent(
-            chain=chain,
-            retriever=None,
-            llm=MockLLM(),
-            blob_dir=blob_dir,
-        )
-        file_rec = chain.query_by_type("file", limit=1)[0]
-        attachments = agent._collect_attachments([file_rec])
-        assert attachments == [], (
-            f"agent followed a path-traversal blob_path and "
-            f"produced {len(attachments)} attachment(s) — the "
-            f"defense in _collect_attachments isn't catching "
-            f"escape attempts"
-        )
-
-
 # ===========================================================================
 # apply_proposal.py — scaffolding tool
 #
@@ -4491,6 +4328,41 @@ class TestWebappCapsuleLogic:
         assert "/api/capsule/export" in paths
         assert "/api/capsule/import" in paths
 
+    def test_webapp_rebuilds_incompatible_embedding_store(self, workdir):
+        import importlib
+        import pytest as _pt
+        try:
+            wm = importlib.import_module("timechain_web.webapp")
+        except (ImportError, SystemExit):
+            _pt.skip("webapp dependency set not installed")
+            return
+
+        db = workdir / "embeddings.sqlite"
+        old = EmbeddingIndex(db, HashingEmbedder(dim=64), dim=64)
+        old._conn.execute(
+            "INSERT INTO embeddings "
+            "(record_idx, chunk_index, chunk_count, record_hash, vector, text) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (0, 0, 1, "old", bytes(64 * 4), "old"),
+        )
+        old._conn.commit()
+        old.close()
+
+        # The webapp must open stores through the SINGLE shared
+        # open-or-rebuild path so recovery behavior cannot drift
+        # between entry points.
+        import retrieval as _retrieval
+        assert wm.open_or_rebuild_index is _retrieval.open_or_rebuild_index
+
+        rebuilt = wm.open_or_rebuild_index(
+            db, HashingEmbedder(dim=128), 128, log=lambda _m: None
+        )
+        try:
+            assert rebuilt.dim == 128
+            assert rebuilt.stored_dim() is None
+        finally:
+            rebuilt.close()
+
 
 class TestWebappCapsuleEndpointsHTTP:
     """#8 (hardening): the capsule endpoints' HTTP behavior.
@@ -4548,3 +4420,767 @@ class TestWebappCapsuleEndpointsHTTP:
         src = inspect.getsource(wm.capsule_export)
         assert "export_capsule" in src
         assert not re.search(r"to_thread\(\s*_capsule\.export_capsule", src)
+
+
+class TestWebappToolLoop:
+    """Phase 6: the streaming endpoint's tool loop, driven in-process.
+
+    Starlette's TestClient runs handlers on an event loop in a separate
+    thread, which SQLite's check_same_thread chains can't cross (see
+    TestWebappCapsuleEndpointsHTTP). Instead we call the endpoint
+    coroutines directly and iterate the SSE generator inside asyncio.run()
+    in THIS thread — a faithful end-to-end exercise of the tool loop and
+    the pending-op endpoints with zero HTTP."""
+
+    @pytest.fixture()
+    def web_env(self, workdir, monkeypatch):
+        import importlib
+        try:
+            wm = importlib.import_module("timechain_web.webapp")
+        except (ImportError, SystemExit):
+            pytest.skip("webapp dependency set not installed")
+        import asyncio
+        from agent import Agent
+        from task_registry import TaskRegistry
+        from tools import AgentContext
+
+        src = workdir / "repo"
+        src.mkdir()
+        (src / "mod.py").write_text("def f():\n    return 1\n")
+        key = load_or_create_key(workdir / "op.key")
+        chain = Chain(workdir / "chain.sqlite", key)
+        emb = HashingEmbedder()
+        index = EmbeddingIndex(workdir / "emb.sqlite", emb, dim=emb.dim)
+        retr = Retriever(chain, index)
+        ctx = AgentContext(data_dir=workdir / "data",
+                           registry=TaskRegistry(workdir / "data"),
+                           workspace_root=src, identity_chain=chain,
+                           embedder=emb, embed_dim=emb.dim)
+
+        class ScriptedLLM:
+            def __init__(self):
+                self.script = []
+            def __call__(self, prompt, **kwargs):
+                self.last_prompt = prompt
+                return self.script.pop(0) if self.script else "Final answer."
+
+        llm = ScriptedLLM()
+        agent = Agent(chain, retr, llm, system_prompt="web tool test")
+        stub = SimpleNamespace(chain=chain, index=index, agent=agent,
+                               tool_ctx=ctx, lock=asyncio.Lock(),
+                               active_token="tok",
+                               turns_since_reflect=0, turns_since_cambium=0)
+        monkeypatch.setattr(wm, "state", stub)
+        monkeypatch.setattr(wm, "TOOLS_ENABLED", True)
+        monkeypatch.setattr(wm, "AUTO_REFLECT_EVERY", 0)
+        monkeypatch.setattr(wm, "AUTO_CAMBIUM_EVERY", 0)
+        yield wm, stub, llm, src
+        ctx.close()
+        index.close()
+        chain.close()
+
+    @staticmethod
+    def _scope():
+        return {"type": "http", "method": "GET", "path": "/x",
+                "headers": [(b"x-session-token", b"tok")],
+                "query_string": b""}
+
+    def _events(self, wm, stub, user_input):
+        import asyncio
+        from starlette.requests import Request
+
+        async def run():
+            stub.lock = asyncio.Lock()   # fresh lock per event loop
+            resp = await wm.turn_stream(Request(self._scope()),
+                                        input=user_input, session="tok")
+            return [ev async for ev in resp.body_iterator]
+        # Hard timeout: a hung stream must FAIL the test, never block the
+        # whole suite waiting on an SSE generator that won't finish.
+        return asyncio.run(asyncio.wait_for(run(), timeout=30))
+
+    def test_stream_runs_tool_round_then_commits(self, web_env):
+        wm, stub, llm, src = web_env
+        llm.script = [
+            '<tool_call>{"name": "read_file", '
+            '"arguments": {"path": "mod.py"}}</tool_call>',
+            "mod.py defines f returning 1.",
+        ]
+        events = self._events(wm, stub, "what is in mod.py?")
+        kinds = [e["event"] for e in events]
+        assert "tool_result" in kinds and kinds[-1] == "done"
+        tr = json.loads(
+            [e for e in events if e["event"] == "tool_result"][0]["data"])
+        assert tr["tool"] == "read_file" and "def f()" in tr["result"]
+        done = json.loads(events[-1]["data"])
+        assert "mod.py defines" in done["response"]["content"]["text"]
+        # one observation + one response — no per-call tool_use records
+        assert not [r for r in stub.chain.iter_records()
+                    if r.type == "tool_use"]
+
+    def test_turn_survives_subscriber_disconnect(self, web_env):
+        # The audit-tab regression: the user sends a message, the page
+        # navigates away (the EventSource closes), and the turn must STILL
+        # run to completion and commit a paired response — the turn belongs
+        # to a server-owned background task, not to the SSE connection.
+        # Closing the connection mid-turn used to cancel the whole turn and
+        # strand the sealed observation with no response.
+        import asyncio
+        import threading
+        from starlette.requests import Request
+        wm, stub, llm, src = web_env
+
+        class GatedLLM:
+            """Blocks until released — keeps the turn in flight while the
+            test detaches the subscriber mid-turn."""
+            def __init__(self):
+                self.gate = threading.Event()
+
+            def __call__(self, prompt, **kwargs):
+                assert self.gate.wait(timeout=15), "gate never released"
+                return "All done after the tab switch."
+
+        gated = GatedLLM()
+        stub.agent.llm = gated
+
+        async def run():
+            stub.lock = asyncio.Lock()
+            stub.active_turn = None
+            resp = await wm.turn_stream(Request(self._scope()),
+                                        input="hello?", session="tok")
+            it = resp.body_iterator
+            first = await it.__anext__()          # the sealed observation
+            assert first["event"] == "observation"
+            probe = await wm.turn_active(Request(self._scope()))
+            assert probe == {"active": True, "input": "hello?"}
+            # The user clicks the audit tab: the subscriber goes away...
+            await it.aclose()
+            # ...the turn keeps running and commits.
+            gated.gate.set()
+            await stub.active_turn.task
+            kinds = [e["event"] for e in stub.active_turn.events]
+            assert kinds[-1] == "done"
+            probe2 = await wm.turn_active(Request(self._scope()))
+            assert probe2 == {"active": False}
+            # Coming back: attach replays the full buffer, ending in done.
+            resp2 = await wm.turn_stream(Request(self._scope()),
+                                         attach="1", session="tok")
+            replay = [ev async for ev in resp2.body_iterator]
+            assert [e["event"] for e in replay] == kinds
+            return replay
+
+        replay = asyncio.run(asyncio.wait_for(run(), timeout=30))
+        done = json.loads(replay[-1]["data"])
+        assert "after the tab switch" in done["response"]["content"]["text"]
+        # The chain holds a PAIRED turn — no stranded observation.
+        recs = [r for r in stub.chain.iter_records()
+                if r.type in ("observation", "response")]
+        assert [r.type for r in recs] == ["observation", "response"]
+
+    def test_reconnect_never_starts_a_duplicate_turn(self, web_env):
+        # An EventSource auto-reconnect repeats the start URL (same input)
+        # with a Last-Event-ID header. That must resume the original run —
+        # replaying only the undelivered tail — and NEVER run a new turn
+        # from the stale URL, even after the original finished.
+        import asyncio
+        from starlette.requests import Request
+        wm, stub, llm, src = web_env
+        llm.script = ["First answer.", "SECOND TURN RAN"]
+
+        def scope(last_id=None):
+            headers = [(b"x-session-token", b"tok")]
+            if last_id is not None:
+                headers.append((b"last-event-id", str(last_id).encode()))
+            return {"type": "http", "method": "GET", "path": "/x",
+                    "headers": headers, "query_string": b""}
+
+        async def run():
+            stub.lock = asyncio.Lock()
+            stub.active_turn = None
+            resp = await wm.turn_stream(Request(scope()),
+                                        input="same question",
+                                        session="tok")
+            events = [ev async for ev in resp.body_iterator]
+            assert events[-1]["event"] == "done"
+            n = len(events)
+            resp2 = await wm.turn_stream(Request(scope(last_id=n - 1)),
+                                         input="same question",
+                                         session="tok")
+            tail = [ev async for ev in resp2.body_iterator]
+            assert [e["event"] for e in tail] == ["done"]
+            assert (json.loads(tail[0]["data"])
+                    == json.loads(events[-1]["data"]))
+
+        asyncio.run(asyncio.wait_for(run(), timeout=30))
+        # Exactly ONE turn committed.
+        obs = [r for r in stub.chain.iter_records()
+               if r.type == "observation"]
+        assert len(obs) == 1
+        resps = [r for r in stub.chain.iter_records()
+                 if r.type == "response"]
+        assert len(resps) == 1
+        assert "SECOND TURN RAN" not in resps[0].content["text"]
+
+    def test_stream_write_file_emits_pending_op_and_approve_endpoint_writes(
+            self, web_env):
+        import asyncio
+        from starlette.requests import Request
+        wm, stub, llm, src = web_env
+        llm.script = [
+            '<tool_call>{"name": "write_file", "arguments": {'
+            '"path": "out.py", "content": "x = 1\\n", '
+            '"change_summary": "add out.py"}}</tool_call>',
+            "Created a pending write; awaiting your approval.",
+        ]
+        events = self._events(wm, stub, "please write out.py")
+        pend = [e for e in events if e["event"] == "pending_op"]
+        assert pend, "write_file did not surface a pending_op SSE event"
+        op = json.loads(pend[0]["data"])
+        assert op["status"] == "confirmation_required"
+        assert not (src / "out.py").exists()   # nothing written yet
+
+        async def approve():
+            stub.lock = asyncio.Lock()
+            return await wm.pending_op_approve(Request(self._scope()),
+                                               op["pending_op_id"])
+        result = asyncio.run(asyncio.wait_for(approve(), timeout=30))
+        assert result["ok"], result
+        assert (src / "out.py").read_text() == "x = 1\n"
+        assert stub.tool_ctx.pending_ops.list_ids() == []
+
+    def test_stream_budget_nudge_and_visible_cap_notice(self, web_env,
+                                                        monkeypatch):
+        # With the cap at 1: the model's second call must carry the
+        # budget nudge (so it answers instead of emitting dropped tool
+        # calls), and the cap notice must be STREAMED as a token event —
+        # not just appended server-side after the browser stopped seeing
+        # tokens.
+        import tools as tools_mod
+        monkeypatch.setattr(tools_mod, "DEFAULT_MAX_TOOL_ROUNDS", 1)
+        wm, stub, llm, src = web_env
+        llm.script = [
+            '<tool_call>{"name": "read_file", '
+            '"arguments": {"path": "mod.py"}}</tool_call>',
+            "Wrap-up answer from what I have.",
+        ]
+        events = self._events(wm, stub, "write a plan")
+        from tools import TOOL_BUDGET_NUDGE
+        assert TOOL_BUDGET_NUDGE.strip() in llm.last_prompt
+        tokens = "".join(json.loads(e["data"]).get("text", "")
+                         for e in events if e["event"] == "token")
+        assert "Stopped after 1 tool rounds" in tokens   # visible live
+        done = json.loads(events[-1]["data"])
+        text = done["response"]["content"]["text"]
+        assert "Wrap-up answer" in text and "Stopped after 1" in text
+        # the continue-flow flag rides the done payload AND the sealed meta
+        assert done["tool_budget_exhausted"] is True
+        meta = done["response"]["content"].get("_meta", {})
+        assert meta.get("tool_budget_exhausted") is True
+
+    def test_approve_slash_command_in_web_chat(self, web_env, workdir):
+        # REPL parity in the chat box: typing /approve <id> must hit the
+        # same user-only path as the card buttons (the field failure:
+        # the model suggested /approve and the web UI said "unknown
+        # command").
+        import asyncio
+        from starlette.requests import Request
+        import tools as tools_mod
+        wm, stub, llm, src = web_env
+        outside = workdir / "sibling"
+        outside.mkdir()
+        (outside / "a.py").write_text("pass\n")
+        out = json.loads(tools_mod.defer_tool_call(
+            {"name": "task_open", "arguments": {
+                "name": "sib", "objective": "review",
+                "source_root": str(outside)}}, stub.tool_ctx))
+        op_id = out["pending_op_id"]
+
+        async def run(command):
+            stub.lock = asyncio.Lock()
+            return await wm.run_command(Request(self._scope()),
+                                        {"command": command})
+        bad = asyncio.run(asyncio.wait_for(run("/approve nonexistent"), 30))
+        assert bad["kind"] == "pending_op_action" and bad["ok"] is False
+        good = asyncio.run(asyncio.wait_for(run(f"/approve {op_id}"), 30))
+        assert good["ok"] is True, good
+        assert stub.tool_ctx.registry.get("sib") is not None
+        assert stub.tool_ctx.pending_ops.list_ids() == []
+
+    def test_stream_failure_midloop_still_commits_response(self, web_env):
+        # The stranded-observation bug: a stream failure on a tool round
+        # used to `return` with the observation sealed but NO response —
+        # the chain held a user message with no reply, invisible to the
+        # next turn ("I don't see the prior turn"). Now the turn commits
+        # what it has, paired with the observation, with an error note.
+        wm, stub, llm, src = web_env
+
+        class FailingStreamLLM:
+            def __init__(self):
+                self.calls = 0
+                self.last_finish_reason = "stop"
+            def __call__(self, prompt, **k):     # non-stream fallback
+                return "unused"
+            def stream(self, prompt, **k):
+                self.calls += 1
+                if self.calls == 1:
+                    yield ('Reading the file.\n<tool_call>{"name": '
+                           '"read_file", "arguments": {"path": "mod.py"}}'
+                           '</tool_call>')
+                else:
+                    raise RuntimeError("provider 503")
+        stub.agent.llm = FailingStreamLLM()
+
+        before = len(list(stub.chain.iter_records()))
+        events = self._events(wm, stub, "review mod.py")
+        kinds = [e["event"] for e in events]
+        assert "error" in kinds                 # the failure surfaced
+        assert kinds[-1] == "done"              # but the turn finished
+        after = list(stub.chain.iter_records())
+        # exactly one observation AND one response were sealed — no orphan
+        new = after[before:]
+        types = [r.type for r in new]
+        assert types.count("observation") == 1
+        assert types.count("response") == 1
+        resp = [r for r in new if r.type == "response"][0]
+        from recall import block_text
+        import ring_compat
+        text = block_text(ring_compat.record_to_ring(resp))
+        assert "Reading the file" in text       # round-1 prose preserved
+        assert "stream error" in text           # honest note recorded
+
+    def test_audit_endpoints_serve_task_chains(self, web_env):
+        # The audit dashboard can read per-task continuum chains: ?task=
+        # selects the chain, the snapshot lists available tasks for the
+        # selector, and the ring detail honors the same param.
+        import asyncio
+        from starlette.requests import Request
+        wm, stub, llm, src = web_env
+        from tools import execute_tool
+        out = execute_tool({"name": "task_open", "arguments": {
+            "name": "aud", "objective": "review",
+            "source_root": str(src)}}, stub.tool_ctx)
+        assert "opened" in out
+
+        async def run():
+            stub.lock = asyncio.Lock()
+            snap = await wm.api_audit(Request(self._scope()), task="aud")
+            ring = await wm.api_audit_ring(0, Request(self._scope()),
+                                           task="aud")
+            ident = await wm.api_audit(Request(self._scope()))
+            return snap, ring, ident
+        snap, ring, ident = asyncio.run(asyncio.wait_for(run(), timeout=30))
+        assert snap["viewing"] == "aud"
+        assert any(t["name"] == "aud" for t in snap["task_chains"])
+        assert snap["metrics"]["rings"] >= 2          # task_open + blocks
+        assert ring["type"] == "task_open"
+        # identity view unchanged, but still lists the tasks for the selector
+        assert ident["viewing"] == ""
+        assert any(t["name"] == "aud" for t in ident["task_chains"])
+        # unknown task -> 404
+        from fastapi import HTTPException
+        async def bad():
+            stub.lock = asyncio.Lock()
+            return await wm.api_audit(Request(self._scope()), task="nope")
+        with pytest.raises(HTTPException):
+            asyncio.run(asyncio.wait_for(bad(), timeout=30))
+
+    def test_workspace_endpoints_get_and_set(self, web_env, workdir):
+        # The selector: GET shows the current boundary + suggestions; POST
+        # is the user-only switch (validated server-side, persisted, pure
+        # boundary move — nothing created).
+        import asyncio
+        from starlette.requests import Request
+
+        class _Req(Request):
+            def __init__(self, scope, body: bytes):
+                super().__init__(scope)
+                self._payload = body
+
+            async def json(self):
+                return json.loads(self._payload)
+
+        wm, stub, llm, src = web_env
+        new_ws = workdir / "second-repo"
+        new_ws.mkdir()
+
+        async def run():
+            stub.lock = asyncio.Lock()
+            got = await wm.workspace_get(Request(self._scope()))
+            assert got["current"] == str(src)
+            bad = await wm.workspace_set(_Req(
+                self._scope() | {"method": "POST"},
+                json.dumps({"path": str(workdir / "ghost")}).encode()))
+            assert bad["ok"] is False and "not an existing" in bad["error"]
+            ok = await wm.workspace_set(_Req(
+                self._scope() | {"method": "POST"},
+                json.dumps({"path": str(new_ws)}).encode()))
+            assert ok["ok"] is True
+            return ok
+        ok = asyncio.run(asyncio.wait_for(run(), timeout=30))
+        ctx = stub.tool_ctx
+        assert ctx.workspace_root == new_ws.resolve()
+        assert ctx.registry.list_all() == []     # switch created nothing
+        data = json.loads((ctx.data_dir / "workspace.json").read_text())
+        assert data["current"] == str(new_ws.resolve())
+
+    def test_stream_tool_round_prose_survives_into_commit(self, web_env):
+        # The disappearing-greeting regression, web side: prose streamed in
+        # a tool-call round must end up in the committed/done response —
+        # not just the final round's out-of-context fragment.
+        wm, stub, llm, src = web_env
+        llm.script = [
+            'Hello again! Let me look at mod.py.\n'
+            '<tool_call>{"name": "read_file", '
+            '"arguments": {"path": "mod.py"}}</tool_call>',
+            "mod.py defines f returning 1.",
+        ]
+        events = self._events(wm, stub, "hello, what is in mod.py?")
+        done = json.loads(events[-1]["data"])
+        text = done["response"]["content"]["text"]
+        assert text == ("Hello again! Let me look at mod.py."
+                        "\n\nmod.py defines f returning 1.")
+        assert "<tool_call>" not in text
+
+    def test_stream_defers_confirm_tools_to_pending_op(self, web_env):
+        # No inline confirm hook over SSE — a confirmation-gated call must
+        # become a pending op (surfaced as a pending_op event), NOT run and
+        # NOT dead-end in a flat refusal the user can never satisfy.
+        wm, stub, llm, src = web_env
+        # the precheck requires the task and file to exist before deferring
+        stub.tool_ctx.registry.create("t", "audit", str(src))
+        llm.script = [
+            '<tool_call>{"name": "task_ingest_file", "arguments": {'
+            '"task_name": "t", "path": "mod.py", "finding": "x"}}'
+            '</tool_call>',
+            "Created a pending op; awaiting your approval.",
+        ]
+        events = self._events(wm, stub, "ingest mod.py")
+        tr = json.loads(
+            [e for e in events if e["event"] == "tool_result"][0]["data"])
+        parsed = json.loads(tr["result"])
+        assert parsed["status"] == "confirmation_required"
+        assert parsed["tool"] == "task_ingest_file"
+        pend = [e for e in events if e["event"] == "pending_op"]
+        assert pend and json.loads(pend[0]["data"])["kind"] == "tool_call"
+        # deferred, not executed:
+        assert stub.tool_ctx.pending_ops.list_ids() == [
+            parsed["pending_op_id"]]
+
+    def test_stream_task_open_outside_workspace_approve_executes(
+            self, web_env, workdir):
+        # The field scenario: the user asks for a task on a directory
+        # OUTSIDE the workspace; chat text can never satisfy the gate, so
+        # the call defers to a pending op whose approve endpoint (user-only)
+        # actually opens the task.
+        import asyncio
+        from starlette.requests import Request
+        wm, stub, llm, src = web_env
+        outside = workdir / "sibling-repo"
+        outside.mkdir()
+        (outside / "code.py").write_text("pass\n")
+        llm.script = [
+            '<tool_call>{"name": "task_open", "arguments": {'
+            f'"name": "sib", "objective": "review", '
+            f'"source_root": "{outside}"}}}}</tool_call>',
+            "I created a pending operation — approve it to open the task.",
+        ]
+        events = self._events(wm, stub, "open a task on the sibling repo")
+        pend = [e for e in events if e["event"] == "pending_op"]
+        assert pend, "gated task_open did not surface a pending_op event"
+        op = json.loads(pend[0]["data"])
+        assert op["kind"] == "tool_call" and op["tool"] == "task_open"
+        assert stub.tool_ctx.registry.get("sib") is None   # not yet
+
+        async def approve():
+            stub.lock = asyncio.Lock()
+            return await wm.pending_op_approve(Request(self._scope()),
+                                               op["pending_op_id"])
+        result = asyncio.run(asyncio.wait_for(approve(), timeout=30))
+        assert result["ok"], result
+        task = stub.tool_ctx.registry.get("sib")
+        assert task and task["source_root"] == str(outside.resolve())
+        assert stub.tool_ctx.pending_ops.list_ids() == []
+
+    def test_stream_shares_the_single_tool_driver(self):
+        # The async loop must use tools.py's extractor/validator/executor/
+        # escaper — never a private re-implementation (the gates would
+        # drift). The loop lives in _turn_events (shared by /api/turn and
+        # /api/turn/stream — one implementation, two transports).
+        import importlib, inspect
+        try:
+            wm = importlib.import_module("timechain_web.webapp")
+        except (ImportError, SystemExit):
+            pytest.skip("webapp dependency set not installed")
+        src = inspect.getsource(wm._turn_events)
+        for needle in ("extract_tool_calls", "execute_tool",
+                       "format_tool_result", "looks_like_intended_tool_call",
+                       "requires_confirmation", "pinned_path"):
+            assert needle in src, f"_turn_events missing shared-driver {needle}"
+        assert "re.compile" not in src
+        # Both transports must ride the same background driver, and that
+        # driver must drain the one shared generator: one turn
+        # implementation, two transports, one server-owned task.
+        assert "_turn_events" in inspect.getsource(wm._drive_turn)
+        assert "_follow_turn" in inspect.getsource(wm.turn)
+        assert "_follow_turn" in inspect.getsource(wm.turn_stream)
+
+    def test_pending_endpoints_are_user_only_path(self):
+        import importlib, inspect
+        try:
+            wm = importlib.import_module("timechain_web.webapp")
+        except (ImportError, SystemExit):
+            pytest.skip("webapp dependency set not installed")
+        src = inspect.getsource(wm._pending_op_action)
+        # run_user_action is the structured (ok, message) wrapper over
+        # execute_user_action — still the user-only path.
+        assert "run_user_action" in src
+        paths = {getattr(r, "path", "") for r in wm.app.routes}
+        assert "/api/pending-ops" in paths
+        assert "/api/pending-ops/{op_id}/approve" in paths
+        assert "/api/pending-ops/{op_id}/reject" in paths
+
+    def test_blob_endpoint_is_session_gated(self, web_env, monkeypatch,
+                                            tmp_path):
+        # /blobs/{sha} must match the rest of the single-session-locked API:
+        # without the active token, blob bytes are not served (regression
+        # guard — the v1.4 rewrite briefly dropped this check). The MIME
+        # type comes back via the blob_index, which now also covers
+        # attachment records.
+        import asyncio
+        import hashlib
+        wm, stub, llm, src = web_env
+        raw = b"\x89PNG fake image bytes"
+        sha = hashlib.sha256(raw).hexdigest()
+        blob = tmp_path / "blobs" / sha[:2] / sha
+        blob.parent.mkdir(parents=True)
+        blob.write_bytes(raw)
+        monkeypatch.setattr(wm, "DATA_DIR", tmp_path)
+        stub.chain.append("attachment", {
+            "filename": "shot.png", "mime_type": "image/png",
+            "blob_sha256": sha, "approx_bytes": len(raw)})
+
+        with pytest.raises(wm.HTTPException) as ei:
+            asyncio.run(wm.serve_blob(sha))               # no token
+        assert ei.value.status_code == 409
+        with pytest.raises(wm.HTTPException) as ei:
+            asyncio.run(wm.serve_blob(sha, session="wrong-token"))
+        assert ei.value.status_code == 409
+        resp = asyncio.run(wm.serve_blob(sha, session="tok"))
+        assert resp.media_type == "image/png"             # indexed lookup
+        with pytest.raises(wm.HTTPException) as ei:
+            asyncio.run(wm.serve_blob("0" * 64, session="tok"))
+        assert ei.value.status_code == 404                # auth before 404
+
+    def test_chain_endpoints_are_session_gated(self, web_env):
+        # Record contents ARE the agent's memory; the read-only inspection
+        # endpoints must demand the same token as everything else.
+        import asyncio
+        from starlette.requests import Request
+        wm, stub, llm, src = web_env
+        noauth = {"type": "http", "method": "GET", "path": "/x",
+                  "headers": [], "query_string": b""}
+        for call in (
+            lambda r: wm.chain_status(r),
+            lambda r: wm.chain_recent(r),
+            lambda r: wm.chain_records(r),
+            lambda r: wm.chain_sidebar(r),
+            lambda r: wm.api_audit_ring(0, r),
+        ):
+            with pytest.raises(wm.HTTPException) as ei:
+                asyncio.run(call(Request(noauth)))
+            assert ei.value.status_code == 409
+        # the active token unlocks them
+        out = asyncio.run(wm.chain_status(Request(self._scope())))
+        assert "length" in out
+
+    def test_chain_recent_clamps_n(self, web_env):
+        # SQLite treats LIMIT -1 as unlimited — n must be clamped, never
+        # passed straight through (?n=-1 used to dump the entire chain).
+        import asyncio
+        from starlette.requests import Request
+        wm, stub, llm, src = web_env
+        for i in range(3):
+            stub.chain.append("observation", {"text": f"r{i}"})
+        out = asyncio.run(wm.chain_recent(Request(self._scope()), n=-1))
+        assert len(out["records"]) == 1                   # clamped low end
+        out = asyncio.run(wm.chain_recent(Request(self._scope()), n=10))
+        assert len(out["records"]) == 3
+
+    def test_nonstreaming_turn_drains_shared_generator(self, web_env):
+        # /api/turn rides _turn_events (same generator as the SSE endpoint),
+        # so its LLM calls run in worker threads and the legacy response
+        # shape is preserved.
+        import asyncio
+        from starlette.requests import Request
+        wm, stub, llm, src = web_env
+        llm.script = [
+            '<tool_call>{"name": "read_file", '
+            '"arguments": {"path": "mod.py"}}</tool_call>',
+            "mod.py read complete.",
+        ]
+        scope = dict(self._scope())
+        scope["method"] = "POST"
+
+        async def run():
+            stub.lock = asyncio.Lock()   # fresh lock per event loop
+            return await wm.turn(Request(scope), {"input": "read mod.py"})
+        out = asyncio.run(asyncio.wait_for(run(), timeout=30))
+        assert out["response_text"] == "mod.py read complete."
+        assert out["response"]["content"]["text"] == "mod.py read complete."
+        assert out["observation"]["type"] == "observation"
+        assert out["truncated"] is False
+        assert isinstance(out["retrieved_indices"], list)
+        assert out["reflection"] is None and out["cambium"] is None
+        # one observation + one response — no per-call tool_use records
+        assert not [r for r in stub.chain.iter_records()
+                    if r.type == "tool_use"]
+
+
+class TestSelfDefenseLoopIntegration:
+    """Phase 13: defense modules wired into the automatic turn loop."""
+
+    def test_quorum_is_initialized_checks_cfg_only(self, workdir, chain):
+        from consensus import Quorum
+        q = Quorum(chain)
+        assert not q.is_initialized()
+        q.init(n=3, quorum=2)
+        # True immediately after init — BEFORE any attest() has run. If
+        # is_initialized also required attestations.jsonl, auto-attest
+        # would deadlock (never initialized -> never attests -> never
+        # creates the file).
+        assert q.is_initialized()
+        assert not q.att_path.exists()
+
+    def test_agent_auto_attests_on_commit_when_quorum_initialized(
+            self, workdir, chain):
+        from consensus import Quorum
+        emb = HashingEmbedder()
+        idx = EmbeddingIndex(workdir / "e.sqlite", emb, dim=emb.dim)
+        retr = Retriever(chain, idx)
+        agent = Agent(chain, retr, MockLLM(), system_prompt="t")
+        assert agent.consensus is not None
+
+        # No quorum yet: a turn commits fine and attests nothing.
+        agent.turn("hello before quorum")
+        assert not agent.consensus.att_path.exists()
+
+        Quorum(chain).init(n=3, quorum=2)
+        agent.turn("hello after quorum")
+        assert agent.consensus.att_path.exists()
+        ok, detail = agent.consensus.verify()
+        assert ok, detail
+        idx.close()
+
+    def test_agent_consensus_opt_out(self, workdir, chain):
+        emb = HashingEmbedder()
+        idx = EmbeddingIndex(workdir / "e.sqlite", emb, dim=emb.dim)
+        retr = Retriever(chain, idx)
+        agent = Agent(chain, retr, MockLLM(), system_prompt="t",
+                      enable_consensus=False)
+        assert agent.consensus is None
+        agent.turn("still works without the handle")
+        idx.close()
+
+    def test_rollback_grows_antibody_from_scar(self, workdir, chain):
+        from immune import Immune
+        fac_dir = workdir / "faculties"
+        fac_dir.mkdir()
+        im = Immune(chain, state_dir=workdir,
+                    covenant=["honest", "faithful"])
+        chain.append("observation", {"text": "user said hello"})
+        chain.append(
+            "response",
+            {"summary": "I will deceive and manipulate and harm you."})
+        head = chain.head().index
+
+        r = im.rollback(head, lesson="injection test",
+                        grow_antibody=True, faculty_dir=fac_dir)
+        # Recovery semantics unchanged…
+        assert r["scar"]["vector"]
+        assert not im.is_locked()
+        # …and the scar vector was offered to the garden. Whether it
+        # GREW depends on the dissonance floor, but the outcome must be
+        # consistent: an antibody entry implies an emergent faculty was
+        # recorded, and vice versa.
+        emergent = fac_dir / "emergent.json"
+        if r["antibody"] is not None:
+            assert emergent.exists()
+            assert r["antibody"]["name"]
+            data = json.loads(emergent.read_text())
+            assert any(f["kind"] == "sense" for f in data["faculties"])
+        else:
+            assert not emergent.exists() or not json.loads(
+                emergent.read_text())["faculties"]
+
+    def test_rollback_without_faculty_dir_unchanged(self, workdir, chain):
+        from immune import Immune
+        im = Immune(chain, state_dir=workdir,
+                    covenant=["honest", "faithful"])
+        chain.append("observation", {"text": "hello"})
+        chain.append("response", {"summary": "I will deceive you."})
+        r = im.rollback(chain.head().index, grow_antibody=True)
+        assert r["antibody"] is None     # no dir -> no growth, no error
+
+
+class TestPendingOpEndpointResults:
+    """Codex finding 4: a failed approval (expired / not found / TOCTOU)
+    must report ok=false, not success."""
+
+    def test_failed_approve_reports_not_ok(self, workdir, monkeypatch):
+        import importlib
+        try:
+            wm = importlib.import_module("timechain_web.webapp")
+        except (ImportError, SystemExit):
+            pytest.skip("webapp dependency set not installed")
+        import asyncio
+        from starlette.requests import Request
+        from task_registry import TaskRegistry
+        from tools import AgentContext
+
+        ctx = AgentContext(data_dir=workdir / "data",
+                           registry=TaskRegistry(workdir / "data"),
+                           workspace_root=workdir)
+        stub = SimpleNamespace(tool_ctx=ctx, active_token="tok",
+                               lock=None)
+        monkeypatch.setattr(wm, "state", stub)
+        monkeypatch.setattr(wm, "TOOLS_ENABLED", True)
+        scope = {"type": "http", "method": "POST", "path": "/x",
+                 "headers": [(b"x-session-token", b"tok")],
+                 "query_string": b""}
+
+        async def act(action):
+            stub.lock = asyncio.Lock()
+            handler = (wm.pending_op_approve if action == "approve"
+                       else wm.pending_op_reject)
+            return await handler(Request(scope), "bogus-op-id")
+
+        res = asyncio.run(asyncio.wait_for(act("approve"), timeout=30))
+        assert res["ok"] is False
+        assert res["result"].startswith("ERROR")
+        res = asyncio.run(asyncio.wait_for(act("reject"), timeout=30))
+        assert res["ok"] is False
+        ctx.close()
+
+
+class TestWebappStreamingClientBranch(TestWebappToolLoop):
+    """Exercise the queue/producer streaming branch (not just the
+    non-streaming fallback), including the hardened bounded-wait consumer."""
+
+    def test_streaming_client_round_trips(self, web_env):
+        wm, stub, llm, src = web_env
+        llm.script = [
+            '<tool_call>{"name": "read_file", '
+            '"arguments": {"path": "mod.py"}}</tool_call>',
+            "streamed: mod.py defines f.",
+        ]
+
+        def stream(prompt, **kwargs):
+            text = llm(prompt, **kwargs)     # consume the script
+            for i in range(0, len(text), 8):
+                yield text[i:i + 8]
+        llm.stream = stream                  # _llm_supports_streaming -> True
+
+        events = self._events(wm, stub, "what is in mod.py?")
+        kinds = [e["event"] for e in events]
+        assert "tool_result" in kinds and kinds[-1] == "done"
+        done = json.loads(events[-1]["data"])
+        assert "streamed: mod.py defines" in done["response"]["content"]["text"]

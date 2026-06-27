@@ -73,6 +73,17 @@ class Quorum:
         self.cfg_path.write_text(json.dumps(cfg, indent=2))
         return cfg
 
+    def is_initialized(self) -> bool:
+        """True if consensus has been initialized on this chain.
+
+        Check cfg_path only — NOT attestations.jsonl. init() writes
+        config.json but attestations.jsonl is only created by the first
+        attest() call. Checking both would deadlock: is_initialized()
+        returns False after init(), so attest() never runs, so the
+        attestations file is never created.
+        """
+        return self.cfg_path.exists()
+
     def _cfg(self) -> dict:
         return json.loads(self.cfg_path.read_text())
 

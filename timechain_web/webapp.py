@@ -8,11 +8,15 @@ still one process (this one) holding the signing key and appending records.
 What you get:
   - Streaming responses (Server-Sent Events) when the LLM client supports it,
     falling back to non-streaming otherwise.
-  - File ingestion via drag-and-drop or file picker.
-  - Image rendering for ingested file blobs (served from /blobs/<sha256>).
+  - Tool turns with the same shared driver as the REPL: tool_result /
+    pending_op SSE events, user-only approve/reject endpoints for the
+    durable write gate.
+  - Content ingestion via drag-and-drop or file picker (POST /api/upload →
+    ingest_blob: task workspace when a task is active, identity-chain
+    attachment + content-addressed blob otherwise).
   - Sidebar showing recent reflections + revisions.
   - All slash commands from run.py: /verify, /length, /seal, /sysprompt,
-    /reflect, /cambium, /proposals, /revise N <text>, /file <path>.
+    /reflect, /cambium, /proposals, /revise N <text>.
   - Single-session lock: only one browser tab is "active" at a time. A second
     tab can take over, but they don't run concurrently — protects the chain's
     single-writer guarantee.
@@ -63,8 +67,12 @@ except ImportError:
 # Reuse run.py's configuration verbatim — same chain, same provider, same
 # system prompt. The web UI is just an alternative I/O layer.
 from chain import Chain, load_or_create_key
-from retrieval import EmbeddingIndex, Retriever
+from retrieval import EmbeddingIndex, Retriever, open_or_rebuild_index
 from agent import Agent, ProtectedZoneError
+
+# (The tool-loop round budget is tools.DEFAULT_MAX_TOOL_ROUNDS — read
+# fresh at each turn, the same knob the REPL loop reads, so an override
+# changes both transports and the two can never drift.)
 from run import (
     DATA_DIR,
     LLM_PROVIDER,
@@ -88,6 +96,8 @@ from run import (
     AGENT_NAME,
     AGENT_PURPOSE,
     AGENT_COVENANT,
+    TOOLS_ENABLED,
+    TOOL_SAFETY_PROMPT,
     build_llm,
     make_tiered_embedder,
 )
@@ -120,6 +130,10 @@ class AppState:
         self.chain: Optional[Chain] = None
         self.index: Optional[EmbeddingIndex] = None
         self.agent: Optional[Agent] = None
+        # Tool execution context (tools.AgentContext) — task registry,
+        # per-task chains/indexes, and the durable write gate. None when
+        # TOOLS_ENABLED is off in run.py.
+        self.tool_ctx = None
         # Serialize all chain-touching work; the chain assumes single-writer.
         self.lock = asyncio.Lock()
         # Session token — only one tab is "active" at a time.
@@ -129,6 +143,11 @@ class AppState:
         # Counter for auto-Cambium — a separate, longer cadence than
         # auto-reflection (mirrors run.py's AUTO_CAMBIUM_EVERY behavior).
         self.turns_since_cambium = 0
+        # The in-flight (or most recently finished) background turn — a
+        # TurnRun. A turn's lifetime belongs to the SERVER, not to any one
+        # SSE connection: navigating away mid-turn only detaches a viewer,
+        # never cancels the turn (see TurnRun / _drive_turn).
+        self.active_turn = None
 
     def boot(self) -> None:
         """Set up chain, index, agent. Idempotent — safe to call once at startup."""
@@ -136,8 +155,6 @@ class AppState:
         chain_db = DATA_DIR / "chain.sqlite"
         embed_db = DATA_DIR / "embeddings.sqlite"
         key_path = DATA_DIR / "operator.key"
-        blob_dir = DATA_DIR / "blobs"
-        blob_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"[boot] data dir: {DATA_DIR}")
         print(f"[boot] llm provider: {LLM_PROVIDER}")
@@ -158,15 +175,9 @@ class AppState:
         else:
             print(f"[boot] embedder: {embed_name} ({embed_dim}-dim, semantic)")
 
-        try:
-            self.index = EmbeddingIndex(embed_db, embedder, dim=embed_dim)
-        except ValueError as e:
-            # Embedding store built with a different embedder. The chain is
-            # intact; only the derived index is stale. Surface the rebuild
-            # instructions and abort boot — the server can't serve sensible
-            # retrieval against a mismatched store.
-            self.chain.close()
-            raise RuntimeError(f"embedding store mismatch — {e}") from e
+        self.index = open_or_rebuild_index(
+            embed_db, embedder, embed_dim,
+            log=lambda msg: print(f"[boot] {msg}"))
 
         added = self.index.index_chain(self.chain)
         if added:
@@ -180,11 +191,34 @@ class AppState:
             print(f"[boot] sprouted modalities: {', '.join(sprout_registry.names())}")
         retriever = Retriever(self.chain, self.index, sprout_registry=sprout_registry)
         llm = build_llm()
+        # Same system-prompt composition as run.py: the tool-safety prompt
+        # rides along whenever tools are enabled, so web turns and REPL
+        # turns see identical instructions.
+        system_prompt = SYSTEM_PROMPT + (TOOL_SAFETY_PROMPT
+                                         if TOOLS_ENABLED else "")
         self.agent = Agent(
             self.chain, retriever, llm,
-            system_prompt=SYSTEM_PROMPT, blob_dir=blob_dir,
+            system_prompt=system_prompt,
+            blob_dir=DATA_DIR / "blobs",
             context_char_budget=CONTEXT_BUDGET_CHARS,
         )
+
+        # Tool execution context (mirrors run.py). Built even before first
+        # genesis — it only touches the registry/pending-op dirs lazily.
+        if TOOLS_ENABLED:
+            from task_registry import TaskRegistry
+            from tools import AgentContext, restore_workspace
+            self.tool_ctx = AgentContext(
+                data_dir=DATA_DIR,
+                registry=TaskRegistry(DATA_DIR),
+                identity_chain=self.chain,
+                workspace_root=Path.cwd(),
+                embedder=embedder,
+                embed_dim=embed_dim,
+            )
+            restored = restore_workspace(self.tool_ctx)
+            if restored:
+                print(f"[boot] workspace restored: {restored}")
 
         # First-run genesis (mirrors run.py exactly).
         if self.chain.length() == 0:
@@ -215,6 +249,9 @@ class AppState:
         print(f"[boot] ready at http://{HOST}:{PORT}")
 
     def shutdown(self) -> None:
+        if self.tool_ctx is not None:
+            try: self.tool_ctx.close()
+            except Exception: pass
         if self.chain is not None:
             try: self.chain.close()
             except Exception: pass
@@ -236,6 +273,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # Stop an in-flight background turn before tearing down the chain —
+        # otherwise its task would race the connection close below. This is
+        # the ONE place a running turn is cancelled (server shutdown); a
+        # browser disconnect never reaches here.
+        run = getattr(state, "active_turn", None)
+        if run is not None and run.task is not None and not run.task.done():
+            run.task.cancel()
+            try:
+                await run.task
+            except BaseException:
+                pass
         state.shutdown()
 
 
@@ -380,11 +428,15 @@ async def session_claim(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Chain inspection — read-only, no session required
+# Chain inspection — read-only, but session-gated: record contents ARE the
+# agent's memory (conversations, ingested code, reflections). Serving them
+# anonymously would hand the whole chain to anyone with reach to the port,
+# while every mutating endpoint demands the token — same rule as /blobs.
 # ---------------------------------------------------------------------------
 
 @app.get("/api/chain/status")
-async def chain_status():
+async def chain_status(request: Request):
+    _require_session(request)
     head = state.chain.head()
     return {
         "length": state.chain.length(),
@@ -397,7 +449,12 @@ async def chain_status():
 
 
 @app.get("/api/chain/recent")
-async def chain_recent(n: int = 30, type_filter: Optional[str] = None):
+async def chain_recent(request: Request, n: int = 30,
+                       type_filter: Optional[str] = None):
+    _require_session(request)
+    # Clamp n: SQLite treats a negative LIMIT as unlimited, so n=-1 would
+    # serialize the entire chain in one response.
+    n = max(1, min(n, 200))
     if type_filter:
         recs = state.chain.query_by_type(type_filter, limit=n)
     else:
@@ -407,7 +464,8 @@ async def chain_recent(n: int = 30, type_filter: Optional[str] = None):
 
 
 @app.get("/api/chain/records")
-async def chain_records(before: Optional[int] = None, limit: int = 50):
+async def chain_records(request: Request, before: Optional[int] = None,
+                        limit: int = 50):
     """
     Paginated window into the full chain, newest-first.
 
@@ -428,6 +486,7 @@ async def chain_records(before: Optional[int] = None, limit: int = 50):
     event-loop thread and reuses the main Chain connection (same as
     /recent); iter_records is a single indexed SELECT, cheap per page.
     """
+    _require_session(request)
     head = state.chain.head()
     if head is None:
         return {"records": [], "has_more": False, "oldest_index": None}
@@ -452,8 +511,9 @@ async def chain_records(before: Optional[int] = None, limit: int = 50):
 
 
 @app.get("/api/chain/sidebar")
-async def chain_sidebar():
+async def chain_sidebar(request: Request):
     """Reflections and revisions for the sidebar — most recent first."""
+    _require_session(request)
     reflections = state.chain.query_by_type("reflection", limit=10)
     revisions = state.chain.query_by_type("revision", limit=20)
     return {
@@ -655,70 +715,6 @@ async def capsule_import(request: Request):
     }
 
 
-@app.get("/blobs/{sha}")
-async def serve_blob(sha: str, session: Optional[str] = None,
-                     request: Request = None):
-    """
-    Serve an ingested file's bytes by sha256 — used for image rendering
-    in chat.
-
-    Requires a session token (passed as a `?session=` query parameter so
-    `<img src>` tags can carry it). Without auth, anyone with reach to
-    the port could pull every ingested file by guessing or harvesting
-    sha values — the rest of the API is single-session-locked; this
-    must match.
-
-    Lookup goes through the chain's indexed `find_file_by_sha`, not a
-    linear scan of every file record. Both are O(1)-ish, but the old
-    scan also had a silent `limit=500` cap that would silently 404 the
-    501st file onward.
-    """
-    # Session check — same shape as `_require_session`, but the query
-    # parameter is named `session` and we accept the header form too.
-    token = (session
-             or (request.headers.get("x-session-token") if request else None))
-    if not token or state.active_token != token:
-        raise HTTPException(
-            status_code=409,
-            detail={"error": "session_inactive",
-                    "message": "blob access requires the active session token"},
-        )
-
-    rec = state.chain.find_file_by_sha(sha)
-    if rec is None:
-        raise HTTPException(404, "no file record references that hash")
-    blob_dir = DATA_DIR / "blobs"
-    blob_filename = rec.content.get("blob_path", "")
-
-    # Defense-in-depth: validate that `blob_filename` is a plain basename
-    # within blob_dir, not a relative path that escapes it. file_ingest
-    # only ever stores the sha256 basename, so this is normally a no-op
-    # — but the chain is the source of truth, and a corrupted chain
-    # (or a buggy ingestion tool) could plant `../../etc/passwd`. The
-    # session check protects against random callers; this protects
-    # against a malformed record. We resolve both paths to absolute and
-    # check the candidate is under blob_dir.
-    if not blob_filename or "/" in blob_filename or "\\" in blob_filename \
-            or blob_filename in (".", "..") or blob_filename.startswith("."):
-        raise HTTPException(
-            400, "file record's blob_path is not a plain basename")
-    candidate = (blob_dir / blob_filename).resolve()
-    try:
-        candidate.relative_to(blob_dir.resolve())
-    except ValueError:
-        raise HTTPException(
-            400, "blob_path escapes the blob directory")
-    path = candidate
-    if not path.exists():
-        raise HTTPException(404, "blob missing on disk")
-    # Map ext -> media type for the common cases.
-    ext = rec.content.get("ext", "").lower()
-    media = {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-        ".webp": "image/webp", ".gif": "image/gif", ".bmp": "image/bmp",
-        ".pdf": "application/pdf",
-    }.get(ext, "application/octet-stream")
-    return FileResponse(path, media_type=media, filename=rec.content.get("filename"))
 
 
 # ---------------------------------------------------------------------------
@@ -851,19 +847,6 @@ async def run_command(request: Request, body: dict):
                 "target_index": target_idx,
             }
 
-        if cmd.startswith("/file"):
-            parts = cmd.split(maxsplit=1)
-            if len(parts) < 2:
-                raise HTTPException(400, "usage: /file <path>")
-            file_path = parts[1].strip().strip('"').strip("'")
-            try:
-                rec = state.agent.ingest_file(file_path)
-            except FileNotFoundError:
-                raise HTTPException(404, f"no such file: {file_path}")
-            except (ValueError, OSError) as e:
-                raise HTTPException(400, str(e))
-            state.index.index_record(rec)
-            return {"kind": "file", "record": _record_to_dict(rec)}
 
         # cypher-tempre port commands (/verify-source, /poq, /immune-*,
         # /recall-*, /think, /consensus-*, /cambium-grow, /migrate,
@@ -885,59 +868,22 @@ async def run_command(request: Request, body: dict):
                 "output": buf.getvalue().rstrip() or "(no output)",
             }
 
+        # /approve <id> and /reject <id> — REPL parity in the chat box, so
+        # the muscle memory (and the model's instructions) work in both
+        # interfaces. Same user-only path the card buttons hit.
+        parts = cmd.split()
+        if parts[0] in ("/approve", "/reject"):
+            _require_tools()
+            if len(parts) != 2:
+                raise HTTPException(400, f"usage: {parts[0]} <pending_op_id>")
+            import tools as tools_mod
+            action = ("approve_write" if parts[0] == "/approve"
+                      else "reject_write")
+            ok, result = tools_mod.run_user_action(
+                action, {"pending_op_id": parts[1]}, state.tool_ctx)
+            return {"kind": "pending_op_action", "ok": ok, "message": result}
+
         raise HTTPException(400, f"unknown command: {cmd}")
-
-
-# ---------------------------------------------------------------------------
-# File upload (drag-and-drop) — calls agent.ingest_file under the hood
-# ---------------------------------------------------------------------------
-
-@app.post("/api/upload")
-async def upload_file(request: Request, file: UploadFile = File(...)):
-    _require_session(request)
-    # Save to a temp path (basename is random), keeping the original suffix.
-    # The REAL filename is passed to ingest_file via original_name so the record
-    # stores "CHANGELOG.md", not the temp basename — the retriever embeds the
-    # filename, so the user must be able to search by the real name.
-    suffix = Path(file.filename or "upload").suffix
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        data = await file.read()
-        tmp.write(data)
-        tmp_path = Path(tmp.name)
-    try:
-        async with state.lock:
-            try:
-                rec = state.agent.ingest_file(tmp_path, original_name=file.filename)
-            except (ValueError, OSError) as e:
-                raise HTTPException(400, str(e))
-            except HTTPException:
-                raise
-            except Exception as e:
-                # Anything else (e.g. an embedder failure, a dependency
-                # missing, a Python-version incompatibility) would otherwise
-                # surface as an opaque 500. Return the real error type and
-                # message so the cause is visible in the browser, and also
-                # print a full traceback to the server console.
-                import traceback
-                traceback.print_exc()
-                raise HTTPException(
-                    500, f"ingest failed: {type(e).__name__}: {e}")
-            try:
-                state.index.index_record(rec)
-            except Exception as e:
-                # The file WAS committed to the chain — indexing is a
-                # separate, derived step. Surface the indexing error
-                # rather than masking it as a generic 500.
-                import traceback
-                traceback.print_exc()
-                raise HTTPException(
-                    500,
-                    f"file committed to chain (record {rec.index}) but "
-                    f"indexing failed: {type(e).__name__}: {e}")
-            return {"record": _record_to_dict(rec)}
-    finally:
-        try: tmp_path.unlink()
-        except Exception: pass
 
 
 # ---------------------------------------------------------------------------
@@ -949,163 +895,285 @@ def _llm_supports_streaming(llm) -> bool:
     return callable(getattr(llm, "stream", None))
 
 
+class TurnRun:
+    """One background turn: the event buffer + completion flag.
+
+    The turn's lifetime belongs to the SERVER, not to any one connection.
+    `_drive_turn` (an asyncio task) drains `_turn_events` into `events`;
+    any number of subscribers replay the buffer and then follow live via
+    `_follow_turn`. A browser that navigates away (the audit tab, a reload)
+    only detaches its subscriber — the turn keeps running and COMMITS, so
+    the chain can never be left with a sealed observation and no paired
+    response just because the viewer left.
+
+    Events are stamped with 1-based sequential SSE ids, so a reconnecting
+    EventSource (which sends Last-Event-ID) resumes exactly where it left
+    off instead of replaying — or worse, re-running — the turn.
+    """
+
+    def __init__(self, turn_id: str, user_input: str) -> None:
+        self.id = turn_id
+        self.input = user_input
+        self.events: list = []
+        self.done = False
+        self.cond = asyncio.Condition()
+        self.task: Optional[asyncio.Task] = None
+
+
+async def _drive_turn(run: TurnRun) -> None:
+    """Drain ONE turn's events into its buffer, then mark it done.
+
+    This coroutine — not any HTTP response — owns the turn. It is only
+    ever cancelled at server shutdown (see lifespan); a client disconnect
+    cancels its `_follow_turn` subscriber instead, which this never sees.
+    """
+    def _stamp(ev: dict) -> dict:
+        ev = dict(ev)
+        ev["id"] = str(len(run.events) + 1)
+        return ev
+
+    try:
+        async for ev in _turn_events(run.input):
+            async with run.cond:
+                run.events.append(_stamp(ev))
+                run.cond.notify_all()
+    except Exception as e:
+        # _turn_events converts LLM/stream failures into a committed turn,
+        # so reaching here is an unexpected crash — surface it as an event
+        # rather than dying silently with subscribers still waiting.
+        async with run.cond:
+            run.events.append(_stamp({
+                "event": "error",
+                "data": json.dumps(
+                    {"message": f"{type(e).__name__}: {e}"}),
+            }))
+            run.cond.notify_all()
+    finally:
+        async with run.cond:
+            run.done = True
+            run.cond.notify_all()
+
+
+def _start_turn(user_input: str) -> TurnRun:
+    """Create a TurnRun and start its background driver task."""
+    run = TurnRun(secrets.token_hex(8), user_input)
+    state.active_turn = run
+    run.task = asyncio.create_task(_drive_turn(run))
+    return run
+
+
+async def _follow_turn(run: TurnRun, after: int = 0):
+    """Replay a run's buffered events, then follow live until done.
+
+    `after` skips events already delivered (the Last-Event-ID contract:
+    ids are 1-based, so `after=N` resumes at event N+1).
+    """
+    i = after
+    while True:
+        async with run.cond:
+            while i >= len(run.events) and not run.done:
+                await run.cond.wait()
+            if i >= len(run.events):
+                return
+            ev = run.events[i]
+            i += 1
+        yield ev
+
+
+def _last_event_seq(request: Request) -> int:
+    """The Last-Event-ID a reconnecting EventSource sends, as an int."""
+    try:
+        return int(request.headers.get("last-event-id", "0"))
+    except ValueError:
+        return 0
+
+
+_TURN_IN_PROGRESS = {
+    "error": "turn_in_progress",
+    "message": "a turn is already running; wait for it to finish "
+               "(GET /api/turn/active to check, or attach to its stream "
+               "with /api/turn/stream?attach=1).",
+}
+
+
+@app.get("/api/turn/active")
+async def turn_active(request: Request):
+    """Probe: is a turn currently running in the background?
+
+    The chat page calls this on load and re-attaches to the live stream
+    when it reports active — the half of the design that makes navigating
+    away mid-turn (audit tab, reload) lossless for the viewer too."""
+    _require_session(request)
+    run = getattr(state, "active_turn", None)
+    if run is None or run.done:
+        return {"active": False}
+    return {"active": True, "input": run.input}
+
+
 @app.post("/api/turn")
 async def turn(request: Request, body: dict):
     """
     Non-streaming turn endpoint. Always available regardless of LLM streaming
-    support. Returns the full response after the turn commits. The UI prefers
-    /api/turn/stream when streaming is supported.
+    support. Rides the SAME background TurnRun the SSE endpoint serves
+    (token events are discarded, the terminal events become the JSON
+    payload): one turn implementation, two transports, one driver task. The
+    background task also makes this endpoint disconnect-proof — starlette
+    cancels a handler whose client went away, but the turn commits anyway.
     """
     _require_session(request)
     user_input = (body.get("input") or "").strip()
     if not user_input:
         raise HTTPException(400, "empty input")
+    prior = getattr(state, "active_turn", None)
+    if prior is not None and not prior.done:
+        raise HTTPException(status_code=409, detail=_TURN_IN_PROGRESS)
+    run = _start_turn(user_input)
 
-    async with state.lock:
-        # SQLite connections in chain/index were opened in the main thread,
-        # so chain ops run inline. Only the LLM call needs a thread (it
-        # blocks on the network), and Agent.turn() does that synchronously
-        # inside a single function — we can't isolate just the network call
-        # without rewriting Agent.turn(), so we accept that this endpoint
-        # blocks the loop while the LLM responds. The streaming endpoint
-        # below decomposes the turn so the LLM call CAN go to a thread.
-        turn_obj = state.agent.turn(user_input, SEMANTIC_K, n_recent=RECENT_N)
-        state.index.index_record(turn_obj.observation_record)
-        state.index.index_record(turn_obj.response_record)
-        state.turns_since_reflect += 1
-        state.turns_since_cambium += 1
+    observation = None
+    reflection = None
+    cambium = None
+    done = None
+    error_message = None
+    async for ev in _follow_turn(run):
+        kind = ev.get("event")
+        if kind == "token":
+            # Token payloads are discarded here — skip the parse.
+            continue
+        try:
+            data = json.loads(ev.get("data") or "null")
+        except (ValueError, TypeError):
+            data = None
+        if kind == "observation":
+            observation = data
+        elif kind == "reflection":
+            reflection = data
+        elif kind == "cambium":
+            cambium = data
+        elif kind == "error":
+            # Do NOT raise here: the turn converts stream failures into a
+            # committed turn, so drain to the `done` event and report the
+            # failure after. (Abandoning the subscriber early would not
+            # hurt the turn — the background driver owns it — but it would
+            # return before `done` carries the committed record.)
+            error_message = (data or {}).get("message", "?")
+        elif kind == "done":
+            done = data
+    if done is None:
+        # The generator is exhausted (commit path ran or genuinely never
+        # produced a result), so raising is safe now.
+        raise HTTPException(
+            502 if error_message else 500,
+            f"LLM call failed: {error_message}" if error_message
+            else "turn ended without a result")
 
-        # Auto-reflection mirrors run.py's behavior.
-        reflection_rec = None
-        if AUTO_REFLECT_EVERY > 0 and state.turns_since_reflect >= AUTO_REFLECT_EVERY:
-            reflection_rec = state.agent.reflect()
-            if reflection_rec is not None:
-                state.index.index_record(reflection_rec)
-            state.turns_since_reflect = 0
-
-        # Auto-Cambium on its own separate, longer cadence (mirrors
-        # run.py's AUTO_CAMBIUM_EVERY). The scan is LLM-free and cheap.
-        cambium_result = None
-        if AUTO_CAMBIUM_EVERY > 0 and state.turns_since_cambium >= AUTO_CAMBIUM_EVERY:
-            result = state.agent.run_cambium(max_records=MAX_CAMBIUM_RECORDS)
-            for group in ("proposals", "recurrences", "escalations"):
-                for rec in result.get(group, []):
-                    state.index.index_record(rec)
-            cambium_result = _cambium_result_to_dict(result)
-            state.turns_since_cambium = 0
-
-    return {
-        "observation": _record_to_dict(turn_obj.observation_record),
-        "response": _record_to_dict(turn_obj.response_record),
-        "response_text": turn_obj.response_text,
-        "retrieved_indices": [r.index for r in turn_obj.retrieved],
-        "reflection": _record_to_dict(reflection_rec) if reflection_rec else None,
-        "cambium": cambium_result,
-        "truncated": turn_obj.truncated,
+    response = done.get("response") or {}
+    out = {
+        "observation": observation,
+        "response": response,
+        "response_text": (response.get("content") or {}).get("text", ""),
+        "retrieved_indices": done.get("retrieved_indices", []),
+        "reflection": reflection,
+        "cambium": cambium,
+        "truncated": done.get("truncated", False),
+        "tool_budget_exhausted": done.get("tool_budget_exhausted", False),
     }
+    if error_message:
+        # The turn committed (with the stream-error note sealed into the
+        # response) but was cut short — let non-SSE clients see why.
+        out["stream_error"] = error_message
+    # Extra signals the stream carries (poq, quarantined, refused) ride along.
+    for key in ("poq", "quarantined", "refused"):
+        if key in done:
+            out[key] = done[key]
+    return out
 
 
-@app.get("/api/turn/stream")
-async def turn_stream(request: Request, input: str, session: str):
+async def _turn_events(user_input: str):
+    """Drive ONE full turn as an async event stream.
+
+    Shared by /api/turn/stream (which serves the events as SSE) and
+    /api/turn (which drains them and returns the final payload as JSON):
+    one implementation, two transports. Both get the same immune screen,
+    PoQ scoring, and commit discipline, and the same thread-dispatched LLM
+    calls — the event loop is never parked on the network. Chain and index
+    writes stay on the loop thread (SQLite same-thread).
     """
-    Streaming turn via Server-Sent Events.
+    # Acquire the chain lock for the whole turn — single-writer guarantee.
+    async with state.lock:
+        agent = state.agent
+        chain = state.chain
 
-    If the LLM client exposes a .stream(prompt, **kwargs) method that yields
-    text chunks, we stream those to the browser as 'token' events, then
-    commit the full response to the chain and emit a 'done' event with the
-    final record metadata. If the client doesn't support streaming, we fall
-    back to a single-chunk emission (so the UI works either way).
+        # 0. Immune screen FIRST — parity with Agent.turn(). The
+        # non-streaming /turn path gets this for free (it calls
+        # agent.turn()); the streaming path composes the steps by hand, so
+        # it must screen here too or it would silently diverge. A blocked
+        # input is refused at the membrane: an honest refusal is sealed (no
+        # LLM call), emitted, and the turn ends.
+        if agent.immune is not None:
+            _screen = agent.immune.screen(user_input)
+            if _screen.get("blocked"):
+                refused = agent._refused_turn(user_input, _screen)
+                state.index.index_record(refused.observation_record)
+                state.index.index_record(refused.response_record)
+                yield {
+                    "event": "observation",
+                    "data": json.dumps(_record_to_dict(refused.observation_record)),
+                }
+                yield {
+                    "event": "done",
+                    "data": json.dumps({
+                        "response": _record_to_dict(refused.response_record),
+                        "retrieved_indices": [],
+                        "truncated": False,
+                        "refused": True,
+                    }),
+                }
+                return
 
-    Implementation note: the LLM call sits between two chain-write halves
-    that need to share state (the observation, the context, the prompt).
-    We use `Agent.prepare_turn` -> LLM -> `Agent.score_response` ->
-    `Agent.commit_response` so the streaming path goes through the same
-    PoQ scoring, quarantine routing, and observation-indexing order as
-    `Agent.turn()`. An earlier version of this endpoint inlined its own
-    hand-rolled copy of those steps and diverged from `turn()` in three
-    ways: (1) it indexed the observation BEFORE retrieval so the prompt
-    could include the user's own just-asked question as "relevant
-    memory"; (2) it skipped PoQ entirely so an injection that the REPL
-    would quarantine became ordinary memory through the web UI; (3) the
-    SSE producer thread had no cancellation path, so a disconnect leaked
-    the running LLM call. All three are fixed here.
-    """
-    _require_session(request)
-    user_input = input.strip()
-    if not user_input:
-        raise HTTPException(400, "empty input")
+        # 1. Pre-LLM half: commit observation, retrieve, build prompt.
+        # `prepare_turn` is the SAME method `Agent.turn` uses, so the
+        # streaming path can never silently diverge in metadata or
+        # quarantine handling. It does NOT index the observation —
+        # that waits until after retrieval, so the just-asked question
+        # cannot be retrieved as context for its own prompt.
+        prep = agent.prepare_turn(
+            user_input, retrieve_k=SEMANTIC_K, n_recent=RECENT_N
+        )
+        obs = prep.observation_record
 
-    async def event_source():
-        # Acquire the chain lock for the whole turn — single-writer guarantee.
-        async with state.lock:
-            agent = state.agent
-            chain = state.chain
+        # Now safe to index — retrieval has already run against the
+        # pre-existing chain. The browser can still see the obs
+        # index immediately via the SSE event below.
+        state.index.index_record(obs)
 
-            # 0. Immune screen FIRST — parity with Agent.turn(). The
-            # non-streaming /turn path gets this for free (it calls
-            # agent.turn()); the streaming path composes the steps by hand, so
-            # it must screen here too or it would silently diverge. A blocked
-            # input is refused at the membrane: an honest refusal is sealed (no
-            # LLM call), emitted, and the turn ends.
-            if agent.immune is not None:
-                _screen = agent.immune.screen(user_input)
-                if _screen.get("blocked"):
-                    refused = agent._refused_turn(user_input, _screen)
-                    state.index.index_record(refused.observation_record)
-                    state.index.index_record(refused.response_record)
-                    yield {
-                        "event": "observation",
-                        "data": json.dumps(_record_to_dict(refused.observation_record)),
-                    }
-                    yield {
-                        "event": "done",
-                        "data": json.dumps({
-                            "response": _record_to_dict(refused.response_record),
-                            "retrieved_indices": [],
-                            "truncated": False,
-                            "refused": True,
-                        }),
-                    }
-                    return
+        yield {
+            "event": "observation",
+            "data": json.dumps(_record_to_dict(obs)),
+        }
 
-            # 1. Pre-LLM half: commit observation, retrieve, build prompt.
-            # `prepare_turn` is the SAME method `Agent.turn` uses, so the
-            # streaming path can never silently diverge in metadata or
-            # quarantine handling. It does NOT index the observation —
-            # that waits until after retrieval, so the just-asked question
-            # cannot be retrieved as context for its own prompt.
-            prep = agent.prepare_turn(
-                user_input, retrieve_k=SEMANTIC_K, n_recent=RECENT_N
-            )
-            obs = prep.observation_record
+        # 2. Call the model — via inner helpers, because the tool loop
+        # below re-calls the LLM once per round and every round must
+        # stream identically. Each blocking network call runs in a
+        # thread; chain ops stay on the main thread.
+        import threading
+        llm = agent.llm
 
-            # Now safe to index — retrieval has already run against the
-            # pre-existing chain. The browser can still see the obs
-            # index immediately via the SSE event below.
-            state.index.index_record(obs)
+        class _StreamFailed(Exception):
+            """The LLM stream raised; message is client-ready."""
 
-            yield {
-                "event": "observation",
-                "data": json.dumps(_record_to_dict(obs)),
-            }
+        async def stream_one_call(call_prompt: str, call_kwargs: dict):
+            """Yield text chunks for ONE LLM call.
 
-            # 2. Call the model. THIS is what needs the thread — it's a
-            # blocking network call that can take seconds. Chain ops
-            # before and after stay on the main thread.
-            full_text_parts: list[str] = []
-            llm = agent.llm
-
-            # Cancellation: the producer thread checks this event after
-            # every chunk it tries to enqueue. If the consumer's `finally`
-            # fires (browser disconnect, request cancelled), we set the
-            # event so the producer stops iterating the LLM stream
-            # instead of generating tokens nobody reads. Without this the
-            # producer thread leaks for the rest of the LLM call's
-            # natural lifetime — including the API cost of every
-            # generated-but-unread token.
-            import threading
+            Cancellation: the producer thread checks cancel_event after
+            every chunk it tries to enqueue. If the consumer's `finally`
+            fires, the producer stops iterating the LLM stream instead of
+            generating tokens nobody reads. Since turns moved to a
+            server-owned background task, the only consumer is
+            `_drive_turn` — so this now fires only at server shutdown,
+            never on a browser disconnect (a disconnect detaches a
+            `_follow_turn` subscriber and the turn keeps generating).
+            """
             cancel_event = threading.Event()
-
             try:
                 if _llm_supports_streaming(llm):
                     queue: asyncio.Queue = asyncio.Queue()
@@ -1113,7 +1181,8 @@ async def turn_stream(request: Request, input: str, session: str):
 
                     def producer():
                         try:
-                            for chunk in llm.stream(prep.prompt, **prep.llm_kwargs):
+                            for chunk in llm.stream(call_prompt,
+                                                    **call_kwargs):
                                 if cancel_event.is_set():
                                     return
                                 asyncio.run_coroutine_threadsafe(
@@ -1122,7 +1191,9 @@ async def turn_stream(request: Request, input: str, session: str):
                         except Exception as e:
                             if not cancel_event.is_set():
                                 asyncio.run_coroutine_threadsafe(
-                                    queue.put(("error", f"{type(e).__name__}: {e}")),
+                                    queue.put(
+                                        ("error",
+                                         f"{type(e).__name__}: {e}")),
                                     loop,
                                 )
                         finally:
@@ -1136,117 +1207,623 @@ async def turn_stream(request: Request, input: str, session: str):
                                 # Loop is gone — nothing more to do.
                                 pass
 
-                    loop.run_in_executor(None, producer)
+                    producer_future = loop.run_in_executor(None, producer)
                     while True:
-                        kind, payload = await queue.get()
+                        # Never wait unboundedly on the queue: if the
+                        # producer thread dies without enqueueing its
+                        # 'end' marker (e.g. the loop was closing when
+                        # its finally ran), a bare queue.get() would
+                        # hang this stream forever. Poll with a timeout
+                        # and exit once the producer is gone and the
+                        # queue is drained.
+                        try:
+                            kind, payload = await asyncio.wait_for(
+                                queue.get(), timeout=1.0)
+                        except asyncio.TimeoutError:
+                            if producer_future.done() and queue.empty():
+                                break
+                            continue
                         if kind == "chunk":
-                            full_text_parts.append(payload)
-                            yield {"event": "token",
-                                   "data": json.dumps({"text": payload})}
+                            yield payload
                         elif kind == "error":
-                            yield {"event": "error",
-                                   "data": json.dumps({"message": payload})}
-                            return
+                            raise _StreamFailed(payload)
                         else:  # end
                             break
                 else:
-                    # Fallback: non-streaming client. Run the LLM call in
-                    # a thread so the event loop can keep serving other
-                    # requests while we wait.
-                    if prep.llm_kwargs:
-                        full_text = await asyncio.to_thread(
-                            llm, prep.prompt, **prep.llm_kwargs)
-                    else:
-                        full_text = await asyncio.to_thread(llm, prep.prompt)
-                    full_text_parts.append(full_text)
-                    yield {"event": "token",
-                           "data": json.dumps({"text": full_text})}
+                    # Fallback: non-streaming client. Run the LLM call
+                    # in a thread so the event loop can keep serving
+                    # other requests while we wait. Failures are wrapped
+                    # in _StreamFailed so run_llm_round's handler converts
+                    # them into a committed turn, exactly like a streaming
+                    # failure — a raw exception here would escape the
+                    # whole generator and skip the guaranteed commit.
+                    try:
+                        if call_kwargs:
+                            full_text = await asyncio.to_thread(
+                                llm, call_prompt, **call_kwargs)
+                        else:
+                            full_text = await asyncio.to_thread(
+                                llm, call_prompt)
+                    except Exception as e:
+                        raise _StreamFailed(
+                            f"{type(e).__name__}: {e}") from e
+                    yield full_text
             finally:
                 # Always signal cancel on the way out — covers both
                 # normal completion (already-set is a no-op) and
                 # asyncio.CancelledError from a disconnect.
                 cancel_event.set()
 
-            response_text = "".join(full_text_parts)
+        # One LLM round: stream tokens as SSE events, leave the full
+        # text in holder["text"] (None when the stream errored). On
+        # failure the error message lands in holder["error"] — the turn
+        # must STILL commit (a sealed observation with no paired response
+        # strands the chain and makes the turn invisible to memory, the
+        # "I don't see the prior turn" failure), so callers fall through
+        # to commit whatever prose completed rather than returning.
+        holder: dict = {"text": None, "error": None}
 
-            # Did the model hit its max_tokens ceiling? Read the finish
-            # reason before any later call overwrites it.
-            from llm_clients import was_truncated
-            response_was_truncated = was_truncated(llm)
+        async def run_llm_round(call_prompt: str, call_kwargs: dict):
+            parts: list[str] = []
+            holder["text"] = None
+            holder["error"] = None
+            try:
+                async for chunk in stream_one_call(call_prompt,
+                                                   call_kwargs):
+                    parts.append(chunk)
+                    yield {"event": "token",
+                           "data": json.dumps({"text": chunk})}
+            except _StreamFailed as e:
+                holder["error"] = str(e)
+                yield {"event": "error",
+                       "data": json.dumps({"message": str(e)})}
+                return
+            holder["text"] = "".join(parts)
 
-            # 3. Post-LLM half: PoQ scoring + commit. score_response
-            # produces the response `_meta` dict (including PoQ block and
-            # quarantine exposure when warranted); commit_response writes
-            # the record. Both come from Agent so the streaming path
-            # cannot diverge from `Agent.turn`.
-            poq_result, response_meta_kwargs = agent.score_response(
-                user_input, response_text, prep.context
-            )
-            # Persist the truncation flag on the response record so a
-            # later "continue" turn can detect it. Mirrors `Agent.turn`;
-            # see `_format_prompt`'s continuation-after-truncation logic.
-            if response_was_truncated:
-                response_meta_kwargs["truncated"] = True
-            response = agent.commit_response(
-                prep, response_text, response_meta_kwargs
-            )
-            state.index.index_record(response)
-            state.turns_since_reflect += 1
-            state.turns_since_cambium += 1
+        # Tool setup — parity with Agent.turn_with_tools: the Tier-2
+        # pin never leaks across turns, and the tool schemas ride the
+        # system prompt as TEXT for this call only.
+        import tools as tools_mod
+        tools_on = TOOLS_ENABLED and state.tool_ctx is not None
+        llm_kwargs = dict(prep.llm_kwargs)
+        if tools_on:
+            state.tool_ctx.pinned_path = None
+            base_system = llm_kwargs.get("system") or ""
+            llm_kwargs["system"] = (
+                base_system + "\n\n" + tools_mod.tools_prompt()
+                + tools_mod.workspace_prompt(state.tool_ctx)).strip()
 
-            done_payload = {
-                "response": _record_to_dict(response),
-                "retrieved_indices": [r.index for r in prep.context],
-                "truncated": response_was_truncated,
-            }
-            # Tell the browser if PoQ quarantined this turn — same signal
-            # the REPL prints, so the operator knows the response was
-            # shown but the memory was routed off the belief path.
-            if poq_result is not None:
-                done_payload["poq"] = poq_result.to_meta()
-                if poq_result.action == "quarantine":
-                    done_payload["quarantined"] = True
+        prompt = prep.prompt
+        stream_failed = False
+        async for ev in run_llm_round(prompt, llm_kwargs):
+            yield ev
+        if holder["text"] is None:
+            # First-round stream failure: still commit (an empty response
+            # carrying the error note) so the observation is paired.
+            stream_failed = True
+            response_text = ""
+        else:
+            response_text = holder["text"]
 
-            # Run auto-reflection and auto-Cambium BEFORE emitting `done`: the
-            # browser closes the EventSource on `done`, which cancels this
-            # generator, so anything yielded (or even run) after `done` can be
-            # skipped — diverging from the REPL / non-streaming path. Do it now.
+        # 2b. The tool loop — the async twin of Agent.turn_with_tools.
+        # Parsing, validation, execution, and escaping all come from
+        # tools.py (the SINGLE shared driver), so the Tier-2/Tier-3
+        # safety gates cannot drift between the REPL and the web. Only
+        # how the LLM is awaited and how output is emitted differ.
+        # The round budget is read fresh from tools.DEFAULT_MAX_TOOL_ROUNDS
+        # — the same call-time read the REPL loop does.
+        # Prose that accompanied tool-call rounds (parity with
+        # turn_with_tools): the committed response is ALL of it plus the
+        # final answer, matching what streamed to the browser.
+        prose_segments: list = []
+        rounds = 0
+        reflected = False
+        budget_exhausted = False
+        max_tool_rounds = tools_mod.DEFAULT_MAX_TOOL_ROUNDS
+        while tools_on and not stream_failed and rounds < max_tool_rounds:
+            # Mitigation 1: ONLY the fresh model segment is scanned —
+            # never the accumulated prompt, whose tool results and file
+            # content are escaped on entry (mitigation 2).
+            calls, parse_errors = tools_mod.extract_tool_calls(
+                response_text)
+            if not calls:
+                if (not reflected
+                        and (parse_errors
+                             or tools_mod.looks_like_intended_tool_call(
+                                 response_text))):
+                    # Mitigation 5: ONE reflective retry when the model
+                    # clearly intended a tool call that failed to parse.
+                    reflected = True
+                    prompt += ("\n" + response_text
+                               + tools_mod.tool_retry_prompt(parse_errors))
+                    async for ev in run_llm_round(prompt, llm_kwargs):
+                        yield ev
+                    if holder["text"] is None:
+                        # Retry-round stream failure: same rule as the
+                        # mid-loop handler below — never drop the turn.
+                        # Break to the commit path so the prose from
+                        # completed rounds is sealed and paired.
+                        stream_failed = True
+                        break
+                    response_text = holder["text"]
+                    continue
+                break    # a final answer — leave the loop
+            rounds += 1
+            prompt += "\n" + response_text
+            prose = tools_mod.strip_tool_markup(response_text)
+            if prose:
+                prose_segments.append(prose)
+            for call in calls:
+                name = call.get("name", "?")
+                if (isinstance(name, str)
+                        and tools_mod.requires_confirmation(
+                            name, call.get("arguments", {}),
+                            state.tool_ctx)):
+                    # No inline confirm hook over SSE — defer the call as
+                    # a pending op instead of dead-ending it: the UI pops
+                    # the approve/reject card (pending_op event below) and
+                    # ONLY the user-only approve path can execute it.
+                    # (Covers CONFIRM_TOOLS and a task_open whose
+                    # source_root would expand the read boundary.)
+                    result = tools_mod.defer_tool_call(call, state.tool_ctx)
+                else:
+                    # Run in a worker thread: an unconfirmed task_open on
+                    # the current workspace walks, seals, and embeds an
+                    # entire source tree — inline it would park the event
+                    # loop (frozen SSE, stalled endpoints) for the
+                    # duration. The chain/index connections are opened
+                    # with check_same_thread=False and all access stays
+                    # serialized under state.lock, so the thread hop is
+                    # safe.
+                    result = await asyncio.to_thread(
+                        tools_mod.execute_tool, call, state.tool_ctx)
+                yield {
+                    "event": "tool_result",
+                    "data": json.dumps({
+                        "tool": name,
+                        "round": rounds,
+                        "result": (result if len(result) <= 4000
+                                   else result[:4000] + "…"),
+                    }),
+                }
+                # Surface a freshly created pending op (a write_file
+                # proposal OR a deferred confirmation-gated tool call) so
+                # the UI can pop its approve/reject dialog immediately.
+                try:
+                    parsed = json.loads(result)
+                    if (isinstance(parsed, dict) and parsed.get(
+                            "status") == "confirmation_required"):
+                        yield {"event": "pending_op",
+                               "data": json.dumps(parsed)}
+                except (ValueError, TypeError):
+                    pass
+                prompt += tools_mod.format_tool_result(name, result)
+            if rounds >= max_tool_rounds:
+                # The next LLM call is the last one this turn gets — tell
+                # it so, or it spends the call emitting tool calls that
+                # will be silently dropped instead of an answer.
+                prompt += tools_mod.TOOL_BUDGET_NUDGE
+            async for ev in run_llm_round(prompt, llm_kwargs):
+                yield ev
+            if holder["text"] is None:
+                # Mid-loop stream failure: DON'T drop the turn. Break to
+                # the commit path so the prose from completed rounds is
+                # sealed (paired with the observation) instead of lost.
+                stream_failed = True
+                break
+            response_text = holder["text"]
+        else:
+            if tools_on and not stream_failed:
+                # Round cap hit: surface it rather than silently
+                # truncating work (parity with turn_with_tools). The
+                # notice is also STREAMED — it is appended after the
+                # token stream ended, so without this yield the browser
+                # never sees why the turn stopped.
+                budget_exhausted = True
+                cap_note = tools_mod.tool_cap_note(max_tool_rounds)
+                response_text += cap_note
+                yield {"event": "token",
+                       "data": json.dumps({"text": cap_note})}
 
-            # Auto-reflection. The reflect() call makes an LLM call internally,
-            # so it blocks the loop briefly; acceptable, and mirrors the REPL.
-            if AUTO_REFLECT_EVERY > 0 and state.turns_since_reflect >= AUTO_REFLECT_EVERY:
-                reflection_rec = agent.reflect()
-                if reflection_rec is not None:
-                    state.index.index_record(reflection_rec)
-                    yield {
-                        "event": "reflection",
-                        "data": json.dumps(_record_to_dict(reflection_rec)),
-                    }
-                state.turns_since_reflect = 0
+        # The committed response is everything the user saw: prose from
+        # every tool round plus the final answer (parity with
+        # turn_with_tools — only the last fragment would otherwise be
+        # sealed and reload out of context). The final round is stripped
+        # too: echoed <tool_result> walls must not reach the chain.
+        final = tools_mod.strip_tool_markup(response_text)
+        response_text = "\n\n".join(prose_segments
+                                    + ([final] if final else []))
 
-            # 5. Auto-Cambium on its own separate, longer cadence (mirrors
-            # run.py's AUTO_CAMBIUM_EVERY). Unlike reflection, the Cambium
-            # scan is LLM-free, so it does not block on the network.
-            if AUTO_CAMBIUM_EVERY > 0 and state.turns_since_cambium >= AUTO_CAMBIUM_EVERY:
-                result = agent.run_cambium(max_records=MAX_CAMBIUM_RECORDS)
-                for group in ("proposals", "recurrences", "escalations"):
-                    for rec in result.get(group, []):
-                        state.index.index_record(rec)
-                summary = _cambium_result_to_dict(result)
-                if (summary["proposals"] or summary["recurrences"]
-                        or summary["escalations"]):
-                    yield {
-                        "event": "cambium",
-                        "data": json.dumps(summary),
-                    }
-                state.turns_since_cambium = 0
+        # A stream that failed mid-turn still commits — with an honest note
+        # so the record (and the next turn's memory) shows the turn was cut
+        # short rather than silently losing it. Streamed to the browser too.
+        if stream_failed:
+            err = holder.get("error") or "the model stream failed"
+            note = (f"\n\n[stream error] this turn was cut short before "
+                    f"completing: {err}")
+            response_text = (response_text + note).strip()
+            yield {"event": "token", "data": json.dumps({"text": note})}
 
-            # `done` is the LAST event — the client closes the stream on it, so
-            # everything above (response commit, reflection, cambium) is already
-            # committed and streamed by the time the browser disconnects.
-            yield {"event": "done", "data": json.dumps(done_payload)}
+        # Did the model hit its max_tokens ceiling? Read the finish
+        # reason before any later call overwrites it.
+        from llm_clients import was_truncated
+        response_was_truncated = was_truncated(llm)
 
-    return EventSourceResponse(event_source())
+        # 3. Post-LLM half: PoQ scoring + commit. score_response
+        # produces the response `_meta` dict (including PoQ block and
+        # quarantine exposure when warranted); commit_response writes
+        # the record. Both come from Agent so the streaming path
+        # cannot diverge from `Agent.turn`.
+        poq_result, response_meta_kwargs = agent.score_response(
+            user_input, response_text, prep.context
+        )
+        # Persist the truncation flag on the response record so a
+        # later "continue" turn can detect it. Mirrors `Agent.turn`;
+        # see `_format_prompt`'s continuation-after-truncation logic.
+        if response_was_truncated:
+            response_meta_kwargs["truncated"] = True
+        # Same persistence rule for the tool-budget flag: a later
+        # "continue" resumes the task with a fresh budget (see
+        # _format_prompt's continue-after-budget handling).
+        if budget_exhausted:
+            response_meta_kwargs["tool_budget_exhausted"] = True
+        response = agent.commit_response(
+            prep, response_text, response_meta_kwargs
+        )
+        state.index.index_record(response)
+        state.turns_since_reflect += 1
+        state.turns_since_cambium += 1
+
+        done_payload = {
+            "response": _record_to_dict(response),
+            "retrieved_indices": [r.index for r in prep.context],
+            "truncated": response_was_truncated,
+            "tool_budget_exhausted": budget_exhausted,
+        }
+        # Tell the browser if PoQ quarantined this turn — same signal
+        # the REPL prints, so the operator knows the response was
+        # shown but the memory was routed off the belief path.
+        if poq_result is not None:
+            done_payload["poq"] = poq_result.to_meta()
+            if poq_result.action == "quarantine":
+                done_payload["quarantined"] = True
+
+        # Run auto-reflection and auto-Cambium BEFORE emitting `done`: the
+        # browser closes the EventSource on `done`, which cancels this
+        # generator, so anything yielded (or even run) after `done` can be
+        # skipped — diverging from the REPL / non-streaming path. Do it now.
+
+        # Auto-reflection. The reflect() call makes an LLM call internally,
+        # so it blocks the loop briefly; acceptable, and mirrors the REPL.
+        if AUTO_REFLECT_EVERY > 0 and state.turns_since_reflect >= AUTO_REFLECT_EVERY:
+            reflection_rec = agent.reflect()
+            if reflection_rec is not None:
+                state.index.index_record(reflection_rec)
+                yield {
+                    "event": "reflection",
+                    "data": json.dumps(_record_to_dict(reflection_rec)),
+                }
+            state.turns_since_reflect = 0
+
+        # 5. Auto-Cambium on its own separate, longer cadence (mirrors
+        # run.py's AUTO_CAMBIUM_EVERY). Unlike reflection, the Cambium
+        # scan is LLM-free, so it does not block on the network.
+        if AUTO_CAMBIUM_EVERY > 0 and state.turns_since_cambium >= AUTO_CAMBIUM_EVERY:
+            result = agent.run_cambium(max_records=MAX_CAMBIUM_RECORDS)
+            for group in ("proposals", "recurrences", "escalations"):
+                for rec in result.get(group, []):
+                    state.index.index_record(rec)
+            summary = _cambium_result_to_dict(result)
+            if (summary["proposals"] or summary["recurrences"]
+                    or summary["escalations"]):
+                yield {
+                    "event": "cambium",
+                    "data": json.dumps(summary),
+                }
+            state.turns_since_cambium = 0
+
+        # `done` is the LAST event — the client closes the stream on it, so
+        # everything above (response commit, reflection, cambium) is already
+        # committed and streamed by the time the browser disconnects.
+        yield {"event": "done", "data": json.dumps(done_payload)}
+
+
+@app.get("/api/turn/stream")
+async def turn_stream(request: Request, input: str = "", session: str = "",
+                      attach: str = ""):
+    """
+    Streaming turn via Server-Sent Events — a VIEWER onto a background turn.
+
+    The turn itself runs in a server-owned task (`_drive_turn`); this
+    endpoint only subscribes to its event buffer. That split is what makes
+    the chat survive navigation: closing the EventSource (audit tab,
+    reload, network blip) detaches the subscriber, while the turn runs to
+    completion and commits. An earlier version drove the whole turn inside
+    this response's generator, so leaving the page cancelled the turn
+    mid-flight and stranded the sealed observation with no paired response.
+
+    Modes:
+      - `input=...` (no Last-Event-ID): start a new background turn and
+        follow it. 409 if one is already running — except an identical
+        re-issue of the running turn's input, which re-attaches (an
+        EventSource auto-reconnect replays the same URL).
+      - `attach=1`: follow the active turn without starting one (the chat
+        page reattaching after navigation; 404 when there is none).
+      - Last-Event-ID header present: always a reconnect — resume the
+        active run past the already-delivered events, and NEVER start a
+        fresh turn from a stale start-URL.
+
+    Implementation note: the LLM call sits between two chain-write halves
+    that need to share state (the observation, the context, the prompt).
+    `_turn_events` uses `Agent.prepare_turn` -> LLM -> `Agent.score_response`
+    -> `Agent.commit_response` so the streaming path goes through the same
+    PoQ scoring, quarantine routing, and observation-indexing order as
+    `Agent.turn()`.
+    """
+    _require_session(request)
+    run = getattr(state, "active_turn", None)
+    last_seq = _last_event_seq(request)
+
+    if attach:
+        if run is None:
+            raise HTTPException(404, "no turn to attach to")
+        return EventSourceResponse(_follow_turn(run, after=last_seq))
+
+    user_input = input.strip()
+    if not user_input:
+        raise HTTPException(400, "empty input")
+
+    if run is not None and not run.done:
+        if user_input == run.input:
+            # Idempotent re-issue of the running turn (EventSource
+            # auto-reconnect repeats the start URL) — re-attach, never
+            # start a duplicate.
+            return EventSourceResponse(_follow_turn(run, after=last_seq))
+        raise HTTPException(status_code=409, detail=_TURN_IN_PROGRESS)
+
+    if last_seq:
+        # A reconnect that outlived its turn: replay the tail (which ends
+        # with `done`) when it matches, otherwise report it gone. A
+        # reconnect must never START a turn — the input in the URL was
+        # already consumed by the run it belongs to.
+        if run is not None and user_input == run.input:
+            return EventSourceResponse(_follow_turn(run, after=last_seq))
+        raise HTTPException(404, "that turn already finished")
+
+    run = _start_turn(user_input)
+    return EventSourceResponse(_follow_turn(run))
+
+
+
+# ---------------------------------------------------------------------------
+# Pending write operations — the durable write gate (Tier 3). The model only
+# ever CREATES a PendingOperation (via write_file); these endpoints are how
+# the USER approves or rejects it. They are never called autonomously.
+# ---------------------------------------------------------------------------
+
+def _require_tools() -> None:
+    if not (TOOLS_ENABLED and state.tool_ctx is not None):
+        raise HTTPException(404, "tools are disabled")
+
+
+def _pending_op_to_dict(op) -> dict:
+    """Session-holder's view of a PendingOperation. Includes the proposed
+    content — the approval dialog must show the user exactly what will be
+    written (capped at 1MB by PendingOpStore.create) — or, for a deferred
+    tool call, the exact tool name and arguments that would run."""
+    out = {
+        "id": op.id,
+        "kind": getattr(op, "kind", "write"),
+        "status": op.status,
+        "task": op.task_name or "(no active task)",
+        "file": op.file_path,
+        "change": op.change_summary,
+        "new_file": not op.target_existed,
+        "content_chars": len(op.proposed_content),
+        "proposed_content": op.proposed_content,
+        "expired": op.expired(),
+        "expires_at": op.expires_at,
+    }
+    if out["kind"] == "tool_call":
+        out["tool"] = op.tool_name
+        try:
+            out["arguments"] = json.loads(op.tool_args_json)
+        except (ValueError, TypeError):
+            out["arguments"] = {}
+    return out
+
+
+@app.get("/api/workspace")
+async def workspace_get(request: Request):
+    """Current workspace + selector suggestions (task source_roots and
+    recent choices — never a directory listing, so the web session cannot
+    enumerate the server's filesystem)."""
+    _require_session(request)
+    _require_tools()
+    import tools as tools_mod
+    async with state.lock:
+        ctx = state.tool_ctx
+        return {"current": str(ctx.workspace_root),
+                "suggestions": tools_mod.workspace_suggestions(ctx)}
+
+
+@app.post("/api/workspace")
+async def workspace_set(request: Request):
+    """USER-only workspace switch — the selector is the user's hand on the
+    read/write boundary, which is exactly why the model has no tool for
+    it. A pure boundary move: nothing is created, sealed, or ingested."""
+    _require_session(request)
+    _require_tools()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="body must be valid JSON")
+    path = body.get("path") if isinstance(body, dict) else None
+    if not isinstance(path, str) or not path:
+        raise HTTPException(status_code=400, detail="missing 'path' string")
+    import tools as tools_mod
+    async with state.lock:
+        try:
+            current = tools_mod.set_workspace(state.tool_ctx, path)
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "current": current}
+
+
+@app.get("/api/pending-ops")
+async def pending_ops_list(request: Request):
+    _require_session(request)
+    _require_tools()
+    async with state.lock:
+        ops = []
+        for op_id in state.tool_ctx.pending_ops.list_ids():
+            op = state.tool_ctx.pending_ops.load(op_id)
+            if op is not None:
+                ops.append(_pending_op_to_dict(op))
+    return {"pending": ops}
+
+
+async def _pending_op_action(request: Request, op_id: str,
+                             action: str) -> dict:
+    _require_session(request)
+    _require_tools()
+    import tools as tools_mod
+    # The lock is held for the whole approve (atomic write + idempotent
+    # ingest + audit) — same single-writer guarantee the REPL gets for
+    # free. The execution itself runs in a worker thread: write approvals
+    # are milliseconds, but an approved DEFERRED tool call can be a
+    # task_reembed or a full-tree task_open ingest (minutes to hours) —
+    # run inline it would freeze the event loop, killing SSE heartbeats
+    # and every other endpoint for the duration. Other turns still queue
+    # behind the lock, but the server stays responsive.
+    async with state.lock:
+        ok, result = await asyncio.to_thread(
+            tools_mod.run_user_action,
+            action, {"pending_op_id": op_id}, state.tool_ctx)
+    return {"ok": ok, "result": result}
+
+
+@app.post("/api/pending-ops/{op_id}/approve")
+async def pending_op_approve(request: Request, op_id: str):
+    return await _pending_op_action(request, op_id, "approve_write")
+
+
+@app.post("/api/pending-ops/{op_id}/reject")
+async def pending_op_reject(request: Request, op_id: str):
+    return await _pending_op_action(request, op_id, "reject_write")
+
+
+# ---------------------------------------------------------------------------
+# Content ingestion (Phase 14) — the upload path, rebuilt on ingest_blob.
+# USER-triggered (attach button / drag-drop); routes by context exactly like
+# the model-callable tool: active task -> task chain + workspace, otherwise
+# identity-chain attachment + content-addressed blob.
+# ---------------------------------------------------------------------------
+
+@app.get("/api/tasks/active")
+async def tasks_active(request: Request):
+    """The session's task cursor — the UI uses it to offer (never assume)
+    routing an upload into the active task. The reserved artifacts task is
+    never reported: it is the default destination, not a user task."""
+    _require_session(request)
+    import tools as tools_mod
+    active = None
+    if state.tool_ctx is not None:
+        active = state.tool_ctx.active_task
+        if active == tools_mod.ARTIFACTS_TASK_NAME:
+            active = None
+    return {"active": active}
+
+
+@app.post("/api/upload")
+async def upload(request: Request, file: UploadFile = File(...),
+                 task: str = Form("")):
+    """`task` (optional form field): explicitly seal the upload into that
+    open task's chain + workspace. Default (empty) routes to the reserved
+    artifacts chain — an active task never captures uploads silently."""
+    _require_session(request)
+    _require_tools()
+    import base64
+    import tools as tools_mod
+    # Enforce the ingest cap BEFORE buffering the whole upload: read at most
+    # cap+1 bytes and reject on overflow, so an oversized upload can't
+    # exhaust memory just to be refused afterwards.
+    cap = tools_mod.INGEST_BLOB_MAX_BYTES
+    data = await file.read(cap + 1)
+    if len(data) > cap:
+        raise HTTPException(
+            413, f"upload exceeds the {cap}-byte ingest cap")
+    async with state.lock:
+        # Worker thread: ingest hashes, extracts, and embeds the upload —
+        # blocking work that must not park the event loop (same rule as
+        # tool execution; connections are check_same_thread=False and
+        # serialized under the lock).
+        ingest_kwargs = {
+            "content": base64.b64encode(data).decode("ascii"),
+            "name": file.filename or "upload.bin",
+            "mime_type": file.content_type or "application/octet-stream",
+            "encoding": "base64",
+        }
+        if task.strip():
+            ingest_kwargs["task_name"] = task.strip()
+        result = await asyncio.to_thread(
+            tools_mod.execute_ingest_blob, ingest_kwargs, state.tool_ctx,
+        )
+        if tools_mod.is_error_result(result):
+            raise HTTPException(400, result)
+        # Identity-route ingests seal an attachment record the UI can render;
+        # task-route ingests land in the task chain (no identity record).
+        rec_dict = None
+        head = state.chain.head()
+        if head is not None and head.type == "attachment":
+            state.index.index_record(head)
+            rec_dict = _record_to_dict(head)
+    return {"record": rec_dict, "result": result}
+
+
+@app.get("/blobs/{sha}")
+async def serve_blob(sha: str, session: Optional[str] = None,
+                     request: Request = None):
+    """Serve a content-addressed blob (identity-route ingest_blob storage).
+
+    Requires the active session token — passed as a `?session=` query
+    parameter so `<img src>` tags can carry it, or as the x-session-token
+    header. The rest of the API is single-session-locked; without this,
+    anyone with reach to the port could pull every ingested blob by
+    guessing or harvesting sha values.
+    """
+    token = (session
+             or (request.headers.get("x-session-token") if request else None))
+    if not token or state.active_token != token:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "session_inactive",
+                    "message": "blob access requires the active session token"},
+        )
+    if not all(c in "0123456789abcdef" for c in sha) or len(sha) != 64:
+        raise HTTPException(400, "not a blob hash")
+    # resolve_blob_path knows both layouts: sharded (current ingest_blob)
+    # and legacy flat (the removed file_ingest pipeline) — pre-existing
+    # data dirs keep serving their old images/PDFs.
+    import tools as tools_mod
+    path = tools_mod.resolve_blob_path(DATA_DIR / "blobs", sha)
+    if path is None:
+        raise HTTPException(404, "no such blob")
+    # Recover the MIME type from the record that sealed this blob: indexed
+    # O(1) via blob_index (which covers file AND attachment records), with a
+    # linear-scan fallback for attachments sealed before the index covered
+    # the attachment type.
+    media_type = "application/octet-stream"
+    rec = state.chain.find_file_by_sha(sha) if state.chain is not None else None
+    if rec is None and state.chain is not None:
+        for r in state.chain.iter_records():
+            if (r.type == "attachment" and isinstance(r.content, dict)
+                    and r.content.get("blob_sha256") == sha):
+                rec = r
+                break
+    if rec is not None and isinstance(rec.content, dict):
+        media_type = rec.content.get("mime_type") or media_type
+    return FileResponse(path, media_type=media_type)
 
 
 @app.get("/api/migrate/stream")
@@ -1300,26 +1877,58 @@ async def audit_page():
     return _serve_page("audit.html")
 
 
+def _audit_chain_for(task: Optional[str]):
+    """Resolve which chain the audit endpoints read: the identity chain
+    (no `task` param), or a per-task continuum chain by registry name.
+    Task chains and the identity chain share the Chain class, so the
+    whole audit pipeline works on either."""
+    if not task:
+        return state.chain
+    if state.tool_ctx is None:
+        raise HTTPException(400, "tools are disabled — no task chains")
+    if state.tool_ctx.registry.get(task) is None:
+        raise HTTPException(404, f"no such task: {task}")
+    return state.tool_ctx.get_task_chain(task)
+
+
 @app.get("/api/audit")
-async def api_audit():
-    """Read-only audit snapshot for the dashboard. Ungated, like
-    /api/chain/status — it exposes the same chain summary data, no writes."""
+async def api_audit(request: Request, task: Optional[str] = None):
+    """Read-only audit snapshot for the dashboard. Session-gated like
+    /api/chain/* — the ring list carries record summaries (memory content).
+    The audit page reads the token index.html stored in localStorage.
+    Pass ?task=<name> to audit a task chain instead of the identity
+    chain; the response always lists the available task chains so the
+    dashboard can render its chain selector."""
+    _require_session(request)
     import audit as _audit
     from pathlib import Path as _Path
-    ok, _msg = state.chain.verify()
+    chain = _audit_chain_for(task)
+    ok, _msg = chain.verify()
     faculty_dir = _Path(__file__).resolve().parent.parent / "faculties"
-    blob_dir = DATA_DIR / "blobs"
-    result = _audit.compute(state.chain, faculty_dir, blob_dir=blob_dir, integrity=ok)
+    # blob storage was removed with file_ingest (v1.4); audit's
+    # blockspace section degrades gracefully without a blob_dir.
+    result = _audit.compute(chain, faculty_dir, integrity=ok)
     result["data_dir"] = str(DATA_DIR)
+    result["viewing"] = task or ""
+    result["task_chains"] = ([
+        {"name": name, "status": t.get("status", "?"),
+         "items_done": t.get("items_done", 0),
+         "items_total": t.get("items_total", 0),
+         "source_root": t.get("source_root", "")}
+        for name, t in state.tool_ctx.registry.list_all()
+    ] if state.tool_ctx is not None else [])
     return result
 
 
 @app.get("/api/audit/ring/{idx}")
-async def api_audit_ring(idx: int):
+async def api_audit_ring(idx: int, request: Request,
+                         task: Optional[str] = None):
     """Full contents of one ring, for the audit dashboard's detail pane. The
     /api/audit ring list carries only truncated summaries (to keep that payload
-    small); this returns the complete record on demand."""
-    rec = state.chain.get(idx)
+    small); this returns the complete record on demand. Same ?task= rule
+    as /api/audit."""
+    _require_session(request)
+    rec = _audit_chain_for(task).get(idx)
     if rec is None:
         raise HTTPException(404, "no such ring")
     import ring_compat as _rc

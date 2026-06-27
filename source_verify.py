@@ -3,8 +3,8 @@ source_verify — re-check an ingested `file` record against the live file on
 disk, with git awareness. Ported from cypher-tempre-self-model's
 `recall.verify_source`, keyed off this repo's `file` records.
 
-The repo ingests files (`file_ingest.py`) and stores `blob_sha256` + the
-extracted text, but never re-checks that a recalled file record still matches
+The repo seals `file` records carrying source coordinates (`source_path`,
+`file_content_hash`), but never re-checks that a recalled file record still matches
 what is on disk now. Acting on stale ingested code is a real failure mode;
 this module catches it. It is read-only and additive — it adds no record
 types and changes no storage.
@@ -66,9 +66,79 @@ def current_git_info(path: str | Path) -> dict:
     if branch:
         info["branch"] = branch
     status = _git("status", "--porcelain")
-    # `status` is "" (clean) or a non-empty listing (dirty); None on error.
-    info["dirty"] = bool(status)
+    # `status` is "" (clean) or a non-empty listing (dirty); None on ERROR —
+    # which must stay distinguishable from clean (dirty=None, not False), or
+    # a failed `git status` would read as a clean worktree downstream.
+    info["dirty"] = bool(status) if status is not None else None
     return info
+
+
+def verify_live_file(path: str | Path, stored_hashes,
+                     stored_commit: Optional[str] = None,
+                     repo_path: str | Path | None = None,
+                     include_text_hash: bool = False) -> dict:
+    """The SHARED live-side verification ladder: path resolution → missing
+    file → content-hash compare → git dirty/drift/unverifiable. Both
+    verify_file_record (identity `file` records) and recall.Recall
+    .verify_source (continuum blocks) verify through here, so a verdict
+    or dirty-semantics change can never drift between them.
+
+    `stored_hashes`: any one matching the live content passes (falsy
+    entries ignored; no stored hash → no content check).
+    `include_text_hash`: also compare/expose a hash of the file's TEXT
+    decoded as utf-8 (continuum stores sha256_text of possibly-redacted
+    text, so byte-hash equality alone would false-alarm).
+
+    Returns a dict always carrying `verdict` and `source_path`, plus
+    `live_sha256` (and `live_text_sha256` when requested) once the file
+    was read, and the git fields once a stored commit was checked.
+    """
+    out: dict = {}
+    live = Path(path)
+    if not live.is_absolute() and repo_path is not None:
+        live = Path(repo_path) / live
+    out["source_path"] = str(live)
+    if not live.is_file():
+        out["verdict"] = "missing-source-file"
+        return out
+
+    raw = live.read_bytes()
+    live_sha = hashlib.sha256(raw).hexdigest()
+    out["live_sha256"] = live_sha
+    live_hashes = [live_sha]
+    if include_text_hash:
+        text_sha = hashlib.sha256(
+            raw.decode("utf-8", errors="replace").encode("utf-8")
+        ).hexdigest()
+        out["live_text_sha256"] = text_sha
+        live_hashes.append(text_sha)
+    stored = [h for h in (stored_hashes or []) if h]
+    if stored and not any(h in live_hashes for h in stored):
+        out["verdict"] = "source-mismatch"
+        return out
+
+    # Git awareness: only meaningful if the record captured git coords.
+    if stored_commit:
+        git = current_git_info(live)
+        out["stored_git_commit"] = stored_commit
+        out["live_git_commit"] = git.get("commit")
+        if git.get("dirty"):
+            out["verdict"] = "dirty-worktree"
+            return out
+        if git.get("commit") and git["commit"] != stored_commit:
+            out["verdict"] = "revision-drift"
+            return out
+        if not git.get("commit") or git.get("dirty") is None:
+            # The record pinned a commit but the live side can't be checked
+            # (git missing, errored, or the dir is no longer a work tree).
+            # The CONTENT hash above did match — say that, but never claim
+            # full verification on a comparison that didn't run.
+            out["content_match"] = True
+            out["verdict"] = "git-unverifiable"
+            return out
+
+    out["verdict"] = "verified"
+    return out
 
 
 def _get_record(chain, index: int):
@@ -112,35 +182,12 @@ def verify_file_record(chain, record_index: int, repo_path: str | Path | None = 
         result["verdict"] = "no-source-path"
         return result
 
-    live = Path(source_path)
-    if not live.is_absolute() and repo_path is not None:
-        live = Path(repo_path) / live
-    if not live.is_file():
-        result["verdict"] = "missing-source-file"
-        result["source_path"] = str(live)
-        return result
-
-    # Content check: live bytes vs ingested bytes.
-    live_sha = hashlib.sha256(live.read_bytes()).hexdigest()
-    result["source_path"] = str(live)
     result["stored_sha256"] = stored_sha
-    result["live_sha256"] = live_sha
-    if stored_sha and live_sha != stored_sha:
-        result["verdict"] = "source-mismatch"
-        return result
-
-    # Git awareness: only meaningful if the record captured git coords.
-    stored_commit = content.get("git_commit")
-    if stored_commit:
-        git = current_git_info(live)
-        result["stored_git_commit"] = stored_commit
-        result["live_git_commit"] = git.get("commit")
-        if git.get("dirty"):
-            result["verdict"] = "dirty-worktree"
-            return result
-        if git.get("commit") and git["commit"] != stored_commit:
-            result["verdict"] = "revision-drift"
-            return result
-
-    result["verdict"] = "verified"
+    result.update(verify_live_file(
+        source_path, [stored_sha], content.get("git_commit"),
+        repo_path=repo_path))
+    if result["verdict"] == "missing-source-file":
+        # Parity with the historical shape: a missing file never carried
+        # the hash keys (it was never read).
+        result.pop("stored_sha256", None)
     return result

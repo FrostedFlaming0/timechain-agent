@@ -7,6 +7,11 @@ Retriever), unlike the numpy-free test_cypher_port.py. Run: `python3 test_cypher
 
 from __future__ import annotations
 
+# Standalone script, not a pytest suite (see test_cypher_port.py): this flag
+# stops pytest collecting it even when the file is named explicitly, which
+# bypasses conftest.py's collect_ignore.
+__test__ = False
+
 import shutil
 import tempfile
 from pathlib import Path

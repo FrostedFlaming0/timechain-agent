@@ -5,7 +5,7 @@ Thanks for considering a contribution. This is a prototype, so the bar for
 the integrity guarantees of the chain" is high. Most of the rules below are
 aimed at that distinction.
 
-This document tracks the current codebase (v1.3.0). For the release-by-release
+This document tracks the current codebase (v1.4.0). For the release-by-release
 history — what each version added and why — see `CHANGELOG.md`. If you're
 working from an older mental model of the project, start there.
 
@@ -26,8 +26,12 @@ For a quick orientation:
 | Storage | `chain.py` | SQLite, Ed25519, hashes, Merkle batches |
 | Metadata schema | `metadata.py` | `_meta` block layout, source enum, salience defaults, half-lives, v1-fallback reader |
 | Retrieval | `retrieval.py` | embeddings, similarity, salience, recency, revision-aware demotion |
-| Agent | `agent.py` | turn loop, reflection, revision, prompt formatting, metadata writes |
-| Ingestion | `file_ingest.py` | file readers, blob store |
+| Agent | `agent.py` | turn loop, tool loop, reflection, revision, prompt formatting, metadata writes |
+| Tools | `tools.py` | tool schemas + executors, path gates, `AgentContext`, ingest/artifacts routing |
+| Task registry | `task_registry.py` | per-task chain registry (slug-validated, atomic saves) |
+| Write gate | `pending_ops.py` | durable pending operations, user-only approval, crash recovery |
+| Long-horizon tasks | `continuum.py` | data-height chunking, task state refresh, source coordinates |
+| Extraction | `extractors.py` | format-aware text extraction (pdf/docx/xlsx/pptx/csv, image metadata) |
 | LLM clients | `llm_clients.py` | provider adapters |
 | Entry point | `run.py` | configuration, REPL |
 | Web UI | `timechain_web/webapp.py` + `static/index.html` | FastAPI server, SSE streaming, frontend |
@@ -45,25 +49,26 @@ pip install pytest
 Run the tests to confirm everything works before you change anything:
 
 ```bash
-pytest test_timechain.py -v
+pytest test_timechain.py test_tools.py -v
+python selftest.py                      # end-to-end smoke, ~2 seconds
 ```
 
 If you can't install pytest in your environment, `python run_tests.py` is a
-standalone fallback. Both should pass on a clean checkout.
+standalone fallback. All should pass on a clean checkout.
 
-The v1 and v1.1 test suites pass unchanged on v1.11; if you're upgrading an
-existing fork to v1.11 and a previously-passing test fails, that's a
-regression, not expected
-behavior.
+Previously-passing tests are expected to keep passing across versions; if
+you're upgrading an existing fork and one fails, that's a regression, not
+expected behavior.
 
 ## What kinds of contributions are welcome
 
 In rough order of how easy they are to land:
 
 - **Bug fixes** with a failing test that turns green. Almost always merged.
-- **New file extractors** in `file_ingest.py`. Add the extension to the
-  appropriate `*_EXTS` set, write an `_extract_*` function that returns
-  `(text, method)`, and add a test. Self-contained, low risk.
+- **New file extractors** in `extractors.py`. Add a dispatch branch in
+  `extract_text`, write an `_extract_*` function that returns
+  `(text, method)` with the format library imported lazily, and add a
+  test. Self-contained, low risk.
 - **New LLM providers** in `llm_clients.py`. Follow the existing
   `make_*_client` pattern. Keep the dependency optional (import inside the
   factory, not at module top).
@@ -180,7 +185,7 @@ the LLM sees on every turn — so a PR that retunes them should include:
 The codebase has a consistent feel; please match it.
 
 - **Module docstrings explain what the file is for and how it fits in.**
-  Look at the top of `metadata.py`, `file_ingest.py`, or `retrieval.py`
+  Look at the top of `metadata.py`, `extractors.py`, or `retrieval.py`
   for examples. New modules should do the same.
 - **Comments explain *why*, not *what*.** If a line of code is non-obvious,
   the comment should answer "why is this here" rather than restate the
@@ -190,12 +195,13 @@ The codebase has a consistent feel; please match it.
 - **Dataclasses for structured returns.** See `IngestResult`, `RetrievalHit`,
   `Record`, `RecordMeta`. Tuples are fine for two-element returns; past
   that, use a dataclass.
-- **No bare `except:`.** Catch specific exceptions. The one place we catch
-  broad `Exception` is in `_extract_text`, and that's documented as a
-  fallback path that records the failure on the chain rather than crashing.
+- **No bare `except:`.** Catch specific exceptions. Where broad `Exception`
+  is caught (e.g. `extractors.extract_text`, best-effort embedding after a
+  seal), it's documented as a deliberate fallback path that records the
+  failure rather than crashing.
 - **Optional dependencies are imported inside the function that needs them**,
   not at module top. See the `_extract_pdf`, `_extract_docx` etc. pattern in
-  `file_ingest.py`. This keeps `pip install -r requirements.txt` lean for
+  `extractors.py`. This keeps `pip install -r requirements.txt` lean for
   users who don't need every extractor.
 - **No new top-level dependencies without a strong reason.** If you need a
   library for one optional feature, add it as an optional dep (commented in
@@ -220,15 +226,13 @@ Conventions:
 - If you add a new fixture, also teach `run_tests.py`'s `build_fixtures`
   about it, otherwise the standalone runner will skip your tests.
 - Keep tests deterministic. The `HashingEmbedder` (trigram-bag) is used in
-  tests precisely because it has no model or network dependency. Note that
-  it hashes trigrams with the builtin `hash()`, which is salted by
-  `PYTHONHASHSEED` — so the exact ranking of near-tied results is not stable
-  across interpreter runs. (v1.1 had a known flake here in
-  `test_search_returns_results`; v1.11 fixed it by querying with a
-  substantive phrase the embedder can represent stably rather than a single
-  word.) If you write a new retrieval test, query with enough text to embed
-  meaningfully, and prefer asserting "expected record is in top-k" over
-  "expected record is at index 0" whenever scores could be close.
+  tests precisely because it has no model or network dependency. It hashes
+  trigrams with BLAKE2b (deterministic across processes — it once used the
+  builtin `hash()`, salted by `PYTHONHASHSEED`, which caused ranking
+  flakes; v1.2.1 fixed that). Still: if you write a new retrieval test,
+  query with enough text to embed meaningfully, and prefer asserting
+  "expected record is in top-k" over "expected record is at index 0"
+  whenever scores could be close.
 - The v1.11 `TestEmbedderFallback` group assumes no Ollama server is running
   (true in CI and sandboxes). If you add embedder tests, don't make them
   depend on a reachable Ollama server — the suite must pass offline.
@@ -243,7 +247,7 @@ Conventions:
 Run the full suite before opening a PR:
 
 ```bash
-pytest test_timechain.py -v
+pytest test_timechain.py test_tools.py -v
 ```
 
 And for a sanity check of the standalone runner:

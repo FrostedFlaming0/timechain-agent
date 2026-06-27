@@ -23,6 +23,10 @@
         <h1 class="page">Timechain Audit</h1>
       </div>
       <div style="display:flex;gap:10px;align-items:center;">
+        <select id="chainsel" title="which chain to audit"
+                style="border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:6px 10px;border-radius:6px;font:inherit;cursor:pointer;">
+          <option value="">identity chain</option>
+        </select>
         <span class="path-badge" id="pathbadge">—</span>
         <button id="refresh" style="border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:6px 12px;border-radius:6px;cursor:pointer;font:inherit;">refresh</button>
       </div>
@@ -64,22 +68,57 @@
     const metricsEl=$('metrics'), domainsEl=$('domains'), facModEl=$('facmod'),
           facSenseEl=$('facsense'), ringListEl=$('ringlist'), detailEl=$('detail'),
           blockEl=$('block'), searchEl=$('search'), typeEl=$('typefilter'),
-          errEl=$('err'), pathEl=$('pathbadge');
+          errEl=$('err'), pathEl=$('pathbadge'), chainEl=$('chainsel');
     let DATA = null, SELECTED = null;
+    // Which chain we're auditing: '' = identity, else a task name. Task
+    // chains are the per-task continuum ledgers (ingested source blocks,
+    // approved-write ingests); the selector is filled from the API.
+    let CHAIN = '';
+    function chainQuery(){ return CHAIN ? ('?task='+encodeURIComponent(CHAIN)) : ''; }
 
     function esc(s){ return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
     function fmtSize(n){ if(n<1024)return n+' B'; if(n<1048576)return (n/1024).toFixed(1)+' KB'; return (n/1048576).toFixed(1)+' MB'; }
 
+    // The audit API is session-gated. This page never claims its own
+    // session (that would bump the main chat tab off the single-session
+    // lock); it reads the token the main page stored in localStorage.
+    function sessionHeaders(){
+      let t = null;
+      try { t = localStorage.getItem('tc_session'); } catch(e) {}
+      return t ? { 'x-session-token': t } : {};
+    }
+
     async function load(){
       errEl.textContent='loading…';
       try{
-        const r = await fetch('/api/audit');
+        const r = await fetch('/api/audit'+chainQuery(), { headers: sessionHeaders() });
+        if(r.status===409){ errEl.textContent='no active session — open the main page first (it claims the session this dashboard reuses)'; return; }
         if(!r.ok){ errEl.textContent='failed to load audit ('+r.status+')'; return; }
         DATA = await r.json();
         errEl.textContent='';
         typeEl.dataset.filled=''; SELECTED=null;
+        renderChainSelector();
         render();
       }catch(e){ errEl.textContent='failed to load audit: '+e.message; }
+    }
+
+    function renderChainSelector(){
+      const tasks = DATA.task_chains;
+      let opts = '<option value="">identity chain</option>';
+      if (tasks === undefined) {
+        // The page is newer than the running server: static HTML is read
+        // from disk per request, but the API handlers are the Python
+        // loaded at process start. Say so instead of silently showing an
+        // identity-only selector.
+        opts += '<option value="" disabled>(task chains require a webapp restart — server is running older code)</option>';
+      } else if (!tasks.length) {
+        opts += '<option value="" disabled>(no task chains yet — open a task first)</option>';
+      } else {
+        opts += tasks.map(t=>`<option value="${esc(t.name)}" ${t.name===CHAIN?'selected':''}>`+
+          `task: ${esc(t.name)} (${t.items_done}/${t.items_total||'?'} items, ${esc(t.status)})</option>`).join('');
+      }
+      chainEl.innerHTML = opts;
+      chainEl.value = CHAIN;
     }
 
     function metric(label,value,cls=''){
@@ -169,7 +208,7 @@
       detailEl.innerHTML = detailHead(r) + '<pre>loading…</pre>';
       let full;
       try{
-        const resp = await fetch('/api/audit/ring/'+r.index);
+        const resp = await fetch('/api/audit/ring/'+r.index+chainQuery(), { headers: sessionHeaders() });
         if(!resp.ok) throw new Error('HTTP '+resp.status);
         full = await resp.json();
       }catch(e){
@@ -236,6 +275,7 @@
 
     searchEl.addEventListener('input', renderRings);
     typeEl.addEventListener('change', ()=>{ renderRings(); });
+    chainEl.addEventListener('change', ()=>{ CHAIN = chainEl.value; load(); });
     $('refresh').addEventListener('click', load);
     load();
   </script>

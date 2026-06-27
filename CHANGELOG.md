@@ -12,6 +12,721 @@ disk. Append-only means append-only, including for schema migrations.
 
 ---
 
+## v1.4.0
+
+The code-working agent release: the agent can now read, write, and audit
+code through a text-parsed tool-calling loop — in the REPL and the web UI —
+with per-task continuum chains as durable memory, a three-tier safety model,
+self-defense wired into the automatic turn loop, and continuum-based content
+ingestion with dedicated artifacts routing. The whole batch was hardened by
+a multi-angle pre-release review (19 confirmed findings, all fixed before
+release — summarized at the end of this section). The cryptographic core is
+untouched; old chains read and verify unchanged. **490 pytest tests pass;
+136 standalone tests (106 port + 30 integration); `python3 selftest.py`
+exits 0.**
+
+### Added — tool-calling agent
+
+- `tools.py` — tool schemas + executors + the SINGLE shared text-tool driver:
+  tolerant extractor (fences, trailing commas, multiple blocks), strict
+  JSON-Schema validator (unknown tools/params/types rejected), result escaper
+  (`<tool_call>` in file content can never forge a call), 64KB result cap.
+  `AgentContext` carries the registry, lazy per-task chains/recalls/
+  continuums/embedding-indexes, and session state (`active_task`,
+  `pinned_path` — reset every turn).
+- `agent.turn_with_tools()` — same immune/PoQ/commit discipline as `turn()`
+  (shared `_finish_turn` tail, so the gates cannot drift), plus a bounded
+  parse→execute→re-call loop with ONE reflective retry on malformed calls
+  and sanitized `tool_use` audit records (hashes, never content).
+- `task_registry.py` — slug-validated, atomically-saved task registry with
+  `repair()`; `resolve_task()` returns exact/ambiguous/not-found and NEVER
+  auto-selects a fuzzy match (Safety Tier 1).
+
+### Added — durable write gate
+
+- `pending_ops.py` — `write_file` never writes; it creates a 0600-permission
+  PendingOperation (1MB cap, 300s TTL on the pending state only). The USER
+  approves via `/approve` (REPL) or the web endpoints below — never the
+  model. Approval verifies the pre-write hash (TOCTOU), writes atomically
+  (tmp + `os.replace`, mode preserved), ingests into the task chain
+  idempotently (`operation_id` + `continuum.find_by_operation_id`), audits
+  the ingested block against live source, and deletes the pending-op file.
+  Crash recovery resumes deterministically from `writing`/`written`/
+  `ingest_failed`.
+
+### Added — task-chain recall
+
+- `Recall.from_chain_db()` / `from_task_root()` — recall against any task chain.
+- `Recall.retrieve_path_aware()` — the task-chain ARBITER (the identity-chain
+  `retrieve()` pre-filter is unchanged): blended semantic + path-proximity +
+  chronological scoring, hard role/language/ext/top-dir/exclude-dir filters,
+  test/docs/vendor noise penalty, neighbor chunks. `Recall.find_by_path()`
+  for path-based audits.
+- `continuum.walk()` returns a `WalkResult` (files, results, sealed, state) —
+  still unpackable as the legacy `(files, results)` tuple — so per-task
+  `EmbeddingIndex` population is walk → seal → `index_record`. The dead
+  `embed=` parameter was removed.
+
+### REPL and Web UI tool loop
+
+- Default turn path is `turn_with_tools` (set `TOOLS_ENABLED = False` in
+  run.py to revert). New commands: `/task list|open|ingest|resume|validate|
+  audit`, `/approve <id>`, `/reject <id>`, `/pending`. Tools in
+  `CONFIRM_TOOLS` (e.g. `task_ingest_file`) prompt the operator inline in
+  the REPL and are refused over SSE (the safe headless default).
+- `/api/turn/stream` runs the async twin of `Agent.turn_with_tools`:
+  per-round token streaming, `tool_result` SSE events, ONE reflective retry,
+  10-round cap. Parsing/validation/execution/escaping all come from tools.py
+  (the single shared driver) so the safety tiers cannot drift between REPL
+  and web. `/api/turn` (non-streaming) uses `turn_with_tools` directly; the
+  webapp boots a `tools.AgentContext` mirroring run.py.
+- Pending-write endpoints: `GET /api/pending-ops`,
+  `POST /api/pending-ops/{id}/approve|reject` — user-triggered only. A
+  `write_file` during a stream emits a `pending_op` SSE event; the frontend
+  renders an approve/reject card showing exactly what would be written.
+- `think_collapse` tool wraps the existing
+  `ChronosynapticTree.collapse_explicit_notes` — the model supplies
+  perspectives + PoQ scores, the winner is sealed, rejected forks preserved.
+
+### Self-defense loop integration
+
+- `Quorum.is_initialized()` (cfg-only check — requiring attestations.jsonl
+  too would deadlock auto-attest). `Agent` holds a `consensus` handle by
+  default and auto-attests every `commit_response` once a quorum is
+  initialized; attestation failure never blocks a turn. Opt out with
+  `enable_consensus=False`.
+- `immune.rollback(grow_antibody=True, faculty_dir=…)` offers the scar
+  vector to `FacultyGarden.grow(kind_override="sense")` — the REPL
+  `/rollback` does this automatically and reports the antibody.
+- `task_audit_source` accepts a `path` (audits every block of that file via
+  `recall.find_by_path`) as well as `block_index`.
+- New read-only `defense_status` tool: chain integrity, immune posture,
+  quorum health, antibody count.
+
+### Changed — content ingestion rebuilt (file_ingest.py → ingest_blob + extractors.py)
+
+- `file_ingest.py` and the `/file` command are gone; `chain.py`'s
+  blob_index stays — old chains with `file` records read fine, and legacy
+  flat-layout blobs (`blobs/<sha>`) still serve via the shared
+  `tools.resolve_blob_path` (which also knows the new sharded layout).
+- The replacement is the `ingest_blob` tool (utf8 or base64, 8MB cap,
+  traversal-safe names). Format-aware text extraction lives in
+  `extractors.py` (pdf/docx/xlsx/pptx/csv/tsv + image metadata + encoding
+  detection); every format library is optional (`pip install
+  "timechain-agent[ingest]"`) and degrades to a placeholder when missing.
+  Ingesting never creates a NORMAL task chain — the reserved artifacts
+  chain (below) is the one lazy exception.
+- Multimodal attachments still reach the LLM: `Agent._collect_attachments`
+  (sha-addressed, LRU-cached) ships image/PDF bytes from the blob store to
+  vision-capable providers for any `file`/`attachment` record in retrieval
+  context.
+- `continuum.ingest()` passes custom metadata keys through to the sealed
+  block (mime_type, workspace_path, source, approx_bytes).
+- The webapp upload rides the new path: `POST /api/upload` routes through
+  `execute_ingest_blob`; `GET /blobs/{sha}` serves identity blobs with the
+  recorded MIME type — session-gated like the rest of the API (`?session=`
+  query parameter, since `<img src>` can't send headers), with the MIME
+  lookup indexed via `blob_index`, which is now maintained for `attachment`
+  records as well as `file` records. The attach button and drag-drop still
+  work.
+
+### Added — user-selected workspace + lazy task chains
+
+The working directory is now the USER's pick, not wherever the process
+happened to start (inspired by the Claude Code / Codex working-directory
+selectors). Selection is user-only — the model has no tool for it — so a
+chosen workspace is inherently confirmed: reads, writes, and task_opens
+inside it run without confirmation ceremony.
+
+- `tools.set_workspace` / `restore_workspace`: validate the directory
+  server-side, reset the active task and pin (a task bound to the old
+  boundary must not absorb work from the new one), persist the choice in
+  `<DATA_DIR>/workspace.json` (with a recents list) so restarts keep it.
+- Web: `GET /api/workspace` (current + suggestions — task source roots
+  and recents, never a directory listing, so the session cannot enumerate
+  the filesystem) and user-only `POST /api/workspace`; a folder chip above
+  the composer shows the current workspace and opens a path field with
+  suggestions. REPL: `/workspace [path]`.
+- The per-turn system prompt now carries `Current workspace: <path>` in
+  both loops, so the model knows its repo instead of guessing at
+  ~-expansions.
+- **Switching creates nothing.** A task chain appears lazily at the first
+  action needing durable task state: `tools.ensure_workspace_task` (called
+  by `write_file` when no task is active) mints a chain named after the
+  workspace directory (slug-derived, collision-suffixed), reusing any
+  active task already bound to that root. Read-only poking around and
+  unrelated questions leave zero registry state — code-enforced, not
+  model-judged.
+
+### Fixed — strip_tool_markup no longer eats prose that mentions the tags
+
+When the agent audits THIS codebase it writes prose about the tool-call
+machinery — "a forged `` `<tool_call>` `` in any text" — and the
+destructive tail-strip (which suppresses an unclosed tag to end-of-segment
+to stop half-file echoes) treated that inline mention as a real opener and
+deleted the rest of the sentence. `strip_tool_markup` and the live JS
+mirror now mask inline-code spans (`` `...` ``) before stripping: a tag
+inside backticks is always prose (real calls and echoed results are raw,
+never backtick-fenced), so it survives, while bare structural markup is
+still removed. (Note: this addressed the visible mangling in the report;
+the underlying repetition loop in that turn was DeepSeek output
+degeneration on a large self-referential prompt — a model failure mode,
+not fixed here.)
+
+### Fixed — a mid-turn stream failure no longer strands the observation
+
+A stream error on any tool round made the web loop `return` immediately —
+but the user observation was already sealed at turn start, so the chain
+was left with a user message and NO response. The next turn couldn't
+retrieve a reply that was never committed ("I don't see the prior turn"),
+and the turn froze mid-stream with nothing written. The larger context
+budget + batched-read guidance made later-round prompts big enough to
+trip provider timeouts, so this surfaced on long review turns. Now a
+stream failure (first round OR mid-loop) falls through to the commit
+path: the prose from completed rounds is sealed, paired with the
+observation, with an honest `[stream error] this turn was cut short`
+note (also streamed to the browser). No more orphaned observations.
+
+### Changed — skill-style identity chain: two rings per turn + resolutions
+
+The identity chain is now a low-noise stream of experience, matching the
+cypher-tempre skill's design:
+
+- **No per-call `tool_use` records.** A 33-call turn used to seal 35
+  rings and evict the entire conversation from the 15-record recent
+  window (pure recency, no type weighting). Now: ONE observation + ONE
+  response per turn — the response is the self-written, PoQ-gated
+  narrative of the turn's work (prose accumulation already carries it),
+  and tool EFFECTS live on the per-task continuum chains as ingest
+  blocks. `_log_tool_use` / `sanitize_audit` / `TOOL_AUDIT_FIELDS`
+  removed; old chains containing `tool_use` records still read fine
+  (metadata defaults kept). The tools prompt now tells the model its
+  final answer is the only memory of the turn's work — make it
+  self-contained.
+- **Approval outcomes join the stream.** The user approving or rejecting
+  a pending operation seals a `resolution` record on the identity chain
+  (source=user, epistemic=known, salience 0.60): outcome, op id, kind,
+  file/tool, bounded result. Approval was an out-of-band event the model
+  never witnessed — its last sealed knowledge said "pending" forever,
+  which is exactly the gap behind the field confabulation ("never
+  approved, so never ingested"). Best-effort: a sealing failure never
+  undoes an executed decision.
+
+### Added — task chains in the audit dashboard + honesty guidance
+
+- `/api/audit` and `/api/audit/ring/{idx}` accept `?task=<name>` to read
+  a per-task continuum chain instead of the identity chain; the snapshot
+  always lists available task chains, and the audit page gained a chain
+  selector (identity / each task with progress + status) — so "is that
+  file actually in the task chain?" is answerable by looking, block by
+  block, signatures and all.
+- New TASK-CHAIN STATE prompt guidance (after a field confabulation: the
+  model claimed it deleted a file — it has no delete tool — and that an
+  approved write "was never ingested"): never assert chain state from
+  memory; check task_audit_source / task_validate first; approved writes
+  are ingested by the approval itself; never claim to have deleted
+  anything.
+
+### Changed — one approval surface, bigger workspace chip, stray closers
+
+- The in-transcript pending-op card is gone: two approve prompts for one
+  operation (card + banner) read as two decisions. The banner above the
+  composer is the single approval surface; the collapsed 🔧 tool_result
+  card still carries the operation's details in the transcript.
+- The workspace chip is ~1.7× bigger (16px text, larger padding/target),
+  with the path editor scaled to match.
+- `strip_tool_markup` (and the live JS mirror) also remove stray
+  `</tool_call>` / `</tool_result>` closing tags — orphan echo fragments
+  that rendered as literal markup lines in the agent bubble.
+
+### Changed — budgets sized for long tasks on million-token models
+
+Fewer turns for long tasks, by raising the right levers and not the
+wrong one:
+
+- `LLM_MAX_TOKENS` 4,096 → **16,384**: a ceiling, not a target — short
+  replies cost the same, but audits/plans stop tripping the truncation
+  flow, and `write_file` can propose document-sized files in one shot.
+- `CONTEXT_BUDGET_CHARS` 150,000 → **400,000** (~100k tokens):
+  deliberately NOT the full million-token window — retrieval stays
+  selective (relevance realization, not context stuffing), ~100k tokens
+  is where long-context quality holds, and inside a tool turn the prompt
+  is re-sent every round, so context is paid once per round.
+- The round cap stays at 24 — rounds are the quadratic resource (the
+  loop re-sends the accumulated prompt each round). Instead rounds got
+  FATTER: `tools_prompt` now instructs the model to BATCH independent
+  reads/retrievals as multiple `<tool_call>` blocks per response, and
+  `task_retrieve`'s default `max_blocks` went 8 → 16.
+
+### Fixed — tool budget: bigger, final-round warning, visible cap notice
+
+A plan-writing turn burned all 10 tool rounds exploring the repo, then
+the model's 11th response — full of tool calls — was silently dropped:
+no answer, no file, and in the web UI no explanation (the cap notice was
+appended after the token stream ended). Three changes:
+
+- `tools.DEFAULT_MAX_TOOL_ROUNDS = 24`, shared by both loops (the web
+  loop's local `MAX_TOOL_ROUNDS = 10` is now a module-level constant
+  reading the shared default, overridable for tests/operators).
+- **Final-round nudge** (`tools.TOOL_BUDGET_NUDGE`): when the budget is
+  spent, the prompt tells the model its next response is the last and
+  must be the answer — so a capped turn ends with a real wrap-up from
+  what it already read, not a batch of dropped calls.
+- The web loop now **streams** the "[tool loop] Stopped after N tool
+  rounds." notice as a token event, so the browser shows why the turn
+  ended instead of just stopping.
+- **"continue" resumes a capped task** (mirroring the max_tokens
+  truncation flow): the nudge now asks for the answer only if completable
+  — otherwise a progress checkpoint (done / remaining / next step) — and
+  the sealed response carries `tool_budget_exhausted: true` in `_meta`
+  (same absent-unless-True rule as `truncated`). Both UIs show a "type
+  'continue' to give it a fresh budget" notice, and `_format_prompt`
+  recognizes a "continue" against a budget-exhausted response with a
+  mid-TASK resume directive (re-orient from the checkpoint, go straight
+  back to tools) — distinct from the mid-sentence truncation directive.
+  Never auto-continues: each budget grant is the user's.
+
+### Fixed — the approval flow is discoverable (no more dead /approve)
+
+Field-tested write flow had three papercuts: the model asked "Proceed?"
+(a question chat text can't answer), suggested `/approve <id>` which the
+web chat rejected as an unknown command, and the approval card could sit
+off-screen above the answer. Now:
+
+- **`/approve <id>` and `/reject <id>` work in the web chat box** —
+  routed through the same user-only path as the card buttons, so the
+  model's instructions are true in both interfaces.
+- **A pending-operations banner sits directly above the composer**
+  whenever anything awaits approval — listed with approve/reject buttons,
+  refreshed on pending_op events, at turn end, after any action, and at
+  boot (an op left pending last session resurfaces). An approval can no
+  longer hide off-screen.
+- **The write guidance stops the model asking "Proceed?"**: write_file's
+  card IS the question; the model now describes the pending change in one
+  short message and waits. (The 20–30s "pause" was the extra LLM round
+  the old ask-then-explain guidance produced.)
+
+### Fixed — echoed tool results no longer stream at the user
+
+Transcript-continuation models (DeepSeek) sometimes echo the
+`<tool_result>` blocks they were fed — re-streaming entire files into the
+visible answer. Three layers now stop that:
+
+- `tools.strip_tool_markup` also removes `<tool_result>` blocks and any
+  unclosed/truncated tool marker (suppressed to end-of-segment), and both
+  loops now strip the FINAL round before commit — echoes reach neither
+  the user nor the chain. The real results are unaffected: they render as
+  collapsed 🔧 cards and seal as `tool_use` records.
+- The web UI renders a live-filtered view of the streaming buffer
+  (mirroring the server strip), holding back partially-streamed markers —
+  file contents never flash on screen mid-stream.
+- `tools_prompt` now tells the model never to write `<tool_result>`
+  blocks or repeat their contents verbatim.
+
+### Changed — live tool cards render above the answer
+
+During a streaming turn, tool-result and pending-op cards used to append
+below the agent's bubble, leaving the 🔧 cards stranded under the final
+answer. They now anchor ABOVE the streaming bubble — the work shows
+before the answer it produced, matching the order the chain seals
+(tool_use records before the response record).
+
+### Added — turn-progress indicator
+
+A spinner-plus-elapsed-time line (`✻ working for 1m 23s`) renders below
+the live agent bubble for the whole turn. The three-dot typing indicator
+only covers the wait for the FIRST token; this one covers tool-call
+pauses mid-turn, when streaming stops but the turn is in progress —
+previously indistinguishable from a stall. It names the current activity
+(`✻ running read_file for 12s`): there is no "tool started" event, but
+the raw token buffer carries the display-stripped `<tool_call>` JSON, so
+the client parses this round's tool names as they finish streaming and
+each `tool_result` advances the label to the next call. Removed on
+`done` or stream close.
+
+### Fixed — uploads are fetchable again (full sha in the prompt)
+
+The prompt rendered attachment/file hashes truncated to 12 chars
+(`sha256 c884391d726e...`), but that rendered line is the model's ONLY
+handle for `build_attachment(blob_sha256)` — so on a text-only provider
+(DeepSeek ignores image attachments by design) an upload was visible but
+unfetchable: "I can't retrieve that screenshot. The SHA-256 hash in the
+record is truncated." Three-part fix: the prompt now renders the FULL
+hash; pointer rings with no inline text say where the content lives
+(artifact path + how to fetch); and `build_attachment` resolves a unique
+hash prefix (8+ hex chars, via the new `Chain.find_file_by_sha_prefix`)
+so hashes quoted from older truncated displays still work.
+
+### Fixed — one task_open ring per task
+
+`continuum.walk()` called `open_task()` unconditionally, so every
+open-with-auto-ingest (and every later walk into the same task) sealed a
+redundant `task_open` ring a second after the real one and RESET the
+progress metrics. walk() now reuses an already-open task's state —
+extending `items_total` cumulatively; every sealed block carries the
+refresh — and only opens the task itself on a never-opened chain
+(standalone continuum use).
+
+### Changed — task_open ingests in the same call
+
+Setting up a task chain used to cost two turns (open, then ingest).
+`task_open` now walks and ingests the source tree in the same tool call —
+default extensions `.py`/`.md`, overridable via `extensions`, skippable
+via `ingest=false`. The walk shares `tools._walk_and_index` with
+`task_ingest_path` (one implementation, so the embed-once discipline
+cannot drift), an ingest failure leaves a usable open task with a clear
+"run task_ingest_path manually" note, and `task_ingest_path` remains for
+re-ingestion (`changed_only`) and ingesting additional trees.
+
+### Fixed — tool-round prose is no longer discarded (the disappearing reply)
+
+When a response mixed prose with a tool call ("Hello! Let me check…" +
+`<tool_call>`), the web UI deliberately wiped the streamed bubble on
+`tool_result` (to hide raw tool-call JSON), and BOTH tool loops committed
+only the final round's text — so the visible reply vanished mid-turn and
+the chain sealed an out-of-context fragment that reloaded the same way.
+
+- New `tools.strip_tool_markup()`: a model segment's prose with its
+  `<tool_call>` blocks removed (one shared implementation, loops can't
+  drift).
+- `agent.turn_with_tools` and the webapp loop accumulate each tool round's
+  non-empty prose and commit it joined with the final answer — PoQ scores
+  and the chain seals what the user actually saw. The prompt-side
+  accumulation (what the model sees of its own rounds) is unchanged.
+- `index.html` strips the markup from the live buffer on `tool_result`
+  but KEEPS the prose, with later rounds streaming on after a paragraph
+  break — text the user already read never disappears, and the raw-JSON
+  problem the old clearing solved stays solved.
+
+### Fixed — confirmation-gated tools are approvable from the web UI
+
+In the web UI, any confirmation-gated call (a `task_open` outside the
+workspace, `task_ingest_file`, `task_reembed`) was a dead end: the SSE loop
+has no inline confirm hook, so the gate refused unconditionally — and no
+chat phrasing could ever satisfy it, leaving the model to confabulate
+remedies (`/approve` only applied to writes). Confirmation-gated calls now
+defer instead of dying:
+
+- `PendingOperation` grows `kind="tool_call"` (back-compatible defaults;
+  old on-disk write ops load unchanged): the exact tool name + canonical
+  arguments, pinned by hash, same TTL and 0600 discipline as writes.
+  `tools.defer_tool_call()` creates the op and returns
+  `status=confirmation_required` to the model so it explains the real flow
+  instead of guessing.
+- The web loop surfaces the existing `pending_op` SSE event for ANY
+  confirmation-required result (writes and tool calls); the UI card shows
+  the tool name + arguments with the same approve/reject buttons, and the
+  `/api/pending-ops` endpoints handle both kinds — approval executes the
+  call through the user-only path (`pending_ops._approve_tool_call`,
+  single-shot: a crash mid-execution reads as already-processed rather
+  than risking a double run of a non-idempotent tool). REPL `/approve
+  <id>` works for tool-call ops too; the inline REPL prompt and headless
+  refusal are unchanged.
+- The system prompt's tool guidance now states that confirmation is an
+  interface mechanism chat text cannot satisfy, and describes the
+  per-interface flow — so the model stops inventing magic confirmation
+  phrases.
+- **Eager validation** (`tools.precheck_gated_call`): a gated call that
+  cannot possibly succeed — `task_open` on a directory that doesn't exist
+  on this machine, `task_ingest_file` on an unknown task / missing file /
+  out-of-bounds path, `task_reembed` on an unknown task — errors back to
+  the model immediately instead of minting a pending op the user can only
+  approve into a failure. The executors still validate at approval time
+  for everything a precheck can't rule out (e.g. the file vanishing
+  between deferral and approve).
+
+### Fixed — task ingest no longer blocks on slow embedding (the hour-long ingest)
+
+A full-repo `task_ingest_path` that walked and sealed 399 blocks in 10
+seconds then spent **2h13m** embedding them: every chunk went through a
+CPU-bound Ollama `nomic-embed-text` at ~3–5s each, and every record was
+embedded TWICE (the index was opened after the walk, so the first-open
+backfill embedded the just-sealed records and the post-walk pass embedded
+them again). Three changes, measured back to **~7s** end-to-end:
+
+- **Task stores default to the instant `HashingEmbedder`** regardless of
+  the session embedder (`AgentContext._task_embedder`). Character-trigram
+  vectors are adequate for code retrieval — queries share identifiers with
+  their targets — and `retrieve_path_aware` blends path/role/recency signals
+  on top. The session embedder (e.g. Ollama) is opt-in per task, below.
+- **The double-embed is structurally gone**: all ingest paths
+  (`task_ingest_path`, `task_ingest`, task-scoped `ingest_blob`) open the
+  task index BEFORE sealing new blocks; `execute_task_ingest_path` indexes
+  via `index_chain` (which only touches records missing from the store), so
+  the walk's out-of-band `task_open` state record is covered too — each
+  record embedded exactly once.
+- **`task_reembed` (new tool, Tier-3 confirmed)** rebuilds a task's derived
+  store with the session embedder for true semantic recall, batched through
+  the newer Ollama `/api/embed` endpoint (`OllamaEmbedder.embed_batch`, one
+  request per 64 chunks — measured ~12% over sequential; the forward pass
+  dominates on CPU, so this stays a deliberate, user-confirmed operation)
+  with per-batch progress and no partial chunk sets on failure
+  (`EmbeddingIndex.index_records_batched`). The choice persists as
+  `task["embedder"] = "session"` in `tasks.json`
+  (`TaskRegistry.set_embedder`), so later sessions reopen the store with
+  the same embedder instead of mismatch-deleting an expensive re-embed.
+
+### Added — unified selftest
+
+- `selftest.py` — every mechanism end-to-end on a throwaway chain in ~2s:
+  timechain, PoQ, faculties growth, continuum + cartography (redaction,
+  changed-only), path-aware + embedding recall, chronosynaptic collapse,
+  consensus (incl. is_initialized), immune screen/scan/lockdown/rollback
+  (incl. antibody), resolve_task, the write gate (approve/reject/TOCTOU
+  discipline), defense_status, and ingest_blob routing. Exit 0 = green.
+
+### Hardening (security review)
+
+- Reads are bounded like writes: `read_file`, `task_ingest_path`, and
+  `task_ingest_file` resolve through the same allowed roots (workspace,
+  task source roots, task workspaces) with symlink-escape protection, and
+  refuse chain databases and key files — the model can no longer read
+  `operator.key` or walk `/etc` into a chain.
+- `POST /api/upload` enforces the ingest cap while reading the request,
+  not after buffering the whole file.
+- Pending-op failures are machine-detectable: every non-success return
+  from approve/reject starts with `ERROR:`, the web endpoints report
+  `ok: false` for them (expired / not-found / TOCTOU included), and the
+  UI re-enables the approve/reject buttons so a recoverable failure can
+  be retried.
+- The SSE consumer never waits unboundedly on its producer thread: a
+  bounded poll exits cleanly if the producer dies without an end marker,
+  and the webapp tool-loop tests run under hard timeouts.
+
+### Hardening (second security review)
+
+- **task_open can no longer expand the filesystem boundary on its own.**
+  A model-chosen `source_root` becomes an allowed read/ingest root, so
+  `tools.requires_confirmation()` (the one Tier-3 policy both the REPL
+  and web loops call) now gates any task_open whose source_root resolves
+  outside the workspace: confirmed inline in the REPL, refused headless.
+  Workspace-rooted task_opens run as before. `execute_task_open` also
+  requires an existing directory and stores the symlink-resolved path,
+  so the boundary the user confirmed is the boundary enforced.
+- **Every chain-reading endpoint is session-gated.** `/api/chain/status`,
+  `/api/chain/recent`, `/api/chain/records`, `/api/chain/sidebar`,
+  `/api/audit`, and `/api/audit/ring/{idx}` now demand the active session
+  token like the rest of the API (record contents are the agent's
+  memory). `/api/chain/recent` clamps `n` to [1, 200] — SQLite treats a
+  negative LIMIT as unlimited, so `?n=-1` used to return the whole chain.
+  The audit dashboard reuses the main page's token via localStorage
+  instead of claiming its own session (which would bump the chat tab).
+- **A corrupt tasks.json fails loudly instead of vanishing.** Treating
+  unparseable registry JSON as "no tasks" meant the next save overwrote
+  it; TaskRegistry now refuses to load over a corrupt file, leaves the
+  bytes in place, and says how to repair.
+- **Git verdicts are never optimistic.** A failed `git status` no longer
+  reads as a clean worktree, and when a record pinned a commit that the
+  live side can't check (git missing/errored/not a work tree any more)
+  `source_verify.verify_file_record` and `recall.verify_source` return
+  `git-unverifiable` (with `content_match: true` when the hash matched)
+  instead of `verified`.
+- **The non-streaming web turn no longer parks the event loop.** The SSE
+  generator was extracted to `_turn_events()`; `/api/turn` drains it and
+  returns the legacy JSON shape, so both transports share one turn
+  implementation and every LLM call runs in a worker thread while chain
+  and index writes stay on the loop thread.
+
+### Added — embedding-store rebuild policy
+
+- `retrieval.open_or_rebuild_index()` — single shared open-or-rebuild path
+  for embedding stores, used by run.py, the webapp, and per-task indexes
+  (which now also backfill old blocks). A store built by the cheap lexical
+  HashingEmbedder is rebuilt automatically when the embedder changes (the
+  "Ollama got installed" upgrade path); a mismatched SEMANTIC store refuses
+  to boot with instructions instead of silently destroying hours of
+  embedding work (the active embedder may be a transient fallback — e.g.
+  the Ollama daemon down at boot). `force_rebuild=True` is the explicit
+  wipe `task_reembed` uses.
+
+### Added — artifacts routing (uploads & pastes)
+
+Uploaded and pasted content gets a home of its own: the reserved
+`artifacts` task chain plus a user-browsable folder on disk. The
+alternatives both fail in practice — sealing uploads into whatever task
+happens to be active pollutes unrelated, append-only task chains, and
+sealing full extracted text on the identity chain lets big documents crowd
+retrieval and drown more relevant rings.
+
+- `ingest_blob` (and `/api/upload`) defaults to the reserved
+  `artifacts` task chain, lazily created on first upload:
+  - **Bytes** → the content-addressed blob store (canonical: the vision
+    path and `/blobs/<sha>` resolve by sha) **plus** a named, browsable
+    copy in `ARTIFACTS_DIR` (env-configurable, default `~/.artifacts`;
+    name collisions with different content get a short-sha suffix).
+  - **Content** → chunked, self-labeled continuum blocks in the artifacts
+    chain, embedded in its OWN store — artifact text never enters
+    identity retrieval.
+  - **Identity chain** → ONE tiny pointer ring per upload (filename,
+    mime, sha, artifact ring refs — no extracted text), so the
+    conversation shows the upload, the UI renders its card, and the
+    pointer can surface in retrieval without crowding anything.
+- `ARTIFACTS_DIR` is the artifacts task's source_root, so the named
+  copies are readable through the normal path gates (`read_file`).
+- `build_attachment` follows pointer rings into the artifacts chain to
+  return content on demand; `task_open` refuses the reserved name.
+
+- An active task NEVER captures uploads implicitly. Routing into a task
+  is explicit: the model passes `task_name`, and the web UI shows an
+  "ingest uploads into task *name*" toggle (default off) whenever a task
+  is active (`GET /api/tasks/active`). An upload never moves the
+  session's task cursor.
+- Identity-chain `attachment` records carry NO `extracted_text` — content
+  lives in the artifacts chain; the pointer ring keeps identity retrieval
+  lean.
+
+### Pre-release review hardening
+
+A full multi-angle review of the v1.4 batch surfaced 19 confirmed
+findings; all were fixed before release. For the record:
+
+#### Fixed — turn integrity (web)
+
+- Three stream-failure paths ended a web turn without the guaranteed
+  response commit, stranding a sealed observation with no paired response
+  (the "I don't see the prior turn" failure class): `/api/turn` raised 502
+  mid-drain and abandoned the generator (also leaving `state.lock` held
+  until GC); the reflective-retry branch bare-`return`ed on a failed retry
+  stream; the non-streaming LLM fallback let provider exceptions escape
+  `_StreamFailed` entirely. All three now fall through to the commit path;
+  the endpoint drains to completion and reports `stream_error` alongside
+  the committed result.
+- The non-SSE `/api/turn` response now carries `tool_budget_exhausted`
+  (parity with the SSE `done` event) and no longer JSON-parses the
+  thousands of token events it discards.
+
+#### Fixed — server responsiveness
+
+- Long-running tool executions no longer run on the event loop: approving
+  a deferred `task_reembed` (minutes to hours) or an unconfirmed
+  `task_open` full-tree ingest froze every endpoint — SSE heartbeats,
+  session claims, chat — for the duration. Tool execution, pending-op
+  approval, and upload ingestion now run via `asyncio.to_thread`;
+  `Chain`/`EmbeddingIndex` connections are opened `check_same_thread=False`
+  (safe: all access stays serialized under the web lock / single-threaded
+  REPL).
+- `continuum.find_by_operation_id` (the approve-write idempotency check,
+  which runs under the web lock) is now an SQL `json_extract` lookup
+  instead of materializing the entire task chain per approval.
+- `build_attachment` uses the indexed `Chain.find_file_by_sha` instead of
+  a full-chain linear scan.
+
+#### Fixed — security / correctness
+
+- `task_open` resolved its `source_root` against the process cwd, not the
+  workspace: the REPL `/task open` hardcoded `Path.cwd()`, and a relative
+  `source_root` from the model resolved wherever the server was launched —
+  binding, auto-ingesting, and granting read authority over the wrong
+  tree after a `/workspace` switch. Both now resolve through the shared
+  `resolve_source_root` (workspace-anchored, symlinks flattened).
+- A mismatched **semantic** embedding store is no longer silently deleted
+  and re-embedded: if the active embedder is a transient fallback (e.g.
+  the Ollama daemon is down at boot), startup refuses with instructions
+  instead of destroying hours of embedding work. Hashing-built stores
+  still rebuild automatically (the "Ollama got installed" upgrade path),
+  and `task_reembed` wipes explicitly via the new
+  `open_or_rebuild_index(force_rebuild=True)`.
+- All text-mode file I/O in the write gate and task registry pins
+  `encoding="utf-8"` (hashes were already computed over utf-8 bytes; a
+  non-utf-8 locale could strand an approval in `status='writing'` or
+  produce unfixable hash mismatches).
+- Executor result classification lives in ONE place
+  (`tools.is_error_result` / `run_user_action`): scattered prefix checks
+  had already drifted — a caller checking only `"ERROR"` passed
+  `"TOOL ERROR"` results as success.
+
+#### Fixed — v1.3 ingestion capabilities, rebuilt on the new pipeline
+
+- Multimodal attachments reach the LLM again: `Agent._collect_attachments`
+  is back (now sha-addressed, covering legacy `file` and new `attachment`
+  records) and both entry points pass `blob_dir`. `attachments=[]` had
+  been hardcoded with no replacement, so image/PDF bytes never reached
+  vision-capable providers.
+- Document text extraction is back (`extractors.py`, resurrected from the
+  removed `file_ingest.py`): PDFs, docx, xlsx, pptx, csv/tsv uploads seal
+  their extracted text (searchable, embedded) instead of becoming opaque
+  blobs. All format libraries remain optional (`pip install
+  "timechain-agent[ingest]"`); missing ones degrade to a placeholder.
+- Legacy flat-layout blobs (`blobs/<sha>`) serve again: blob resolution
+  goes through the shared `tools.resolve_blob_path`, which knows the
+  sharded layout and the v1.3 flat fallback.
+- `attachment` records render as file/image cards after a page reload
+  (renderHistoryRecord), embed by filename+text like `file` records
+  (instead of as raw JSON including the sha hex), and get the same
+  prompt-rendering treatment.
+- The stale `/file` command was removed from the web UI hint (uploads
+  replaced it).
+
+#### Changed — defaults and the resume flow
+
+- `LLM_PROVIDER` is read from the environment (default `claude`, matching
+  the README); a personal provider choice no longer lives in the source.
+- The tool-budget continuation directive keys off the persisted
+  `truncated`/`tool_budget_exhausted` flags on the last response for ANY
+  next input — "resume", "keep working", or any phrasing now works — with
+  the strongest wording reserved for explicit continue-phrases. Previously
+  a seven-phrase whitelist silently restarted the task on any other
+  wording.
+
+#### Internal — deduplication
+
+- The reflective-retry prompt and round-cap notice are shared constants
+  (`tools.tool_retry_prompt` / `tool_cap_note`) used by both loops; the
+  webapp's import-time-frozen `MAX_TOOL_ROUNDS` alias is gone (the budget
+  is read from `tools.DEFAULT_MAX_TOOL_ROUNDS` at call time in both
+  transports).
+- One `sha256_text` (pending_ops owns it; continuum re-exports), one
+  live-file verification ladder (`source_verify.verify_live_file`, shared
+  by `verify_file_record` and `recall.Recall.verify_source`), one
+  ingest-size literal (`INGEST_BLOB_MAX_BYTES = MAX_INGEST_FILE_BYTES`).
+- Removed dead code: `Recall.from_chain_db`/`from_task_root` (no callers,
+  third copy of the task-dir layout) and `WalkResult.__iter__` (legacy
+  tuple-unpack shim with no live consumer).
+
+### Changed — Claude default model is Fable 5; provider default restored to claude
+
+- `make_claude_client` defaults to `claude-fable-5` (Anthropic's flagship,
+  replacing `claude-opus-4-7`) and adapts to Fable 5's API surface:
+  `temperature` is no longer sent (sampling parameters return a 400 on
+  Fable 5; other models simply use their default sampling), the default
+  timeout rises from 60s to 10 minutes (thinking is always on and hard
+  turns can run for minutes), and a classifier decline
+  (`stop_reason: "refusal"`, an HTTP 200 with empty or partial content) is
+  surfaced as an honest `[refusal]` note instead of a silent empty
+  response. Note Fable 5's new tokenizer counts ~30% more tokens for the
+  same content than Opus-tier models — context budgets are unchanged here,
+  but cost baselines shift. The OpenRouter client's default
+  (`anthropic/claude-opus-4.7`) is untouched.
+
+### Fixed — switching tabs no longer cuts off a running turn
+
+A web turn used to be driven entirely inside its SSE connection's
+generator, so navigating to the audit tab (or reloading) mid-turn closed
+the EventSource, cancelled the turn, and stranded the sealed observation
+with no paired response — the agent simply never answered. Turns now run
+in a server-owned background task (`TurnRun` / `_drive_turn`) that drains
+`_turn_events` into a per-turn event buffer; the SSE endpoint is only a
+VIEWER (`_follow_turn`: replay the buffer, then follow live):
+
+- Closing the page detaches the subscriber; the turn runs to completion
+  and commits. Coming back, the chat page probes `GET /api/turn/active`
+  and reattaches (`/api/turn/stream?attach=1`), replaying everything it
+  missed — tokens, tool cards, pending-op prompts — then following live.
+- Events carry 1-based SSE ids, so an EventSource auto-reconnect (which
+  re-issues the start URL with `Last-Event-ID`) resumes the SAME run past
+  what it already saw. A reconnect can never start a duplicate turn; a
+  genuinely new input while one is running gets a 409.
+- The non-streaming `POST /api/turn` rides the same background runner, so
+  a dropped HTTP connection can no longer cancel a half-done turn there
+  either. One turn implementation, two transports, one driver task.
+- `index.html` dedupes by record index (history paging vs. replayed
+  streams), renders the user's own message from the replay when history
+  missed it, and drops the live bubble when the committed response is
+  already on screen — a turn that finished while the user was away
+  arrives exactly once, via history.
+
+---
+
 ## v1.3.0
 
 A layer of cognitive self-model faculties, adapted to this repo's signed
