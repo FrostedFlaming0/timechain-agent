@@ -1,0 +1,526 @@
+{
+  "registry": "modalities",
+  "version": 1,
+  "description": "84 generalized cognitive modalities (macro reasoning engines) for the Cypher Tempre self-model. Generalized from the archetypal/mythological CODEX V3 framing into domain-agnostic cognitive operations applicable to any task (code, math, planning, analysis, dialogue). Each retains its original id; the original CODEX name is preserved in 'origin' for provenance.",
+  "categories": {
+    "interpersonal": "Modeling another agent's affect, intent, style, and state",
+    "salience": "Finding and prioritizing what matters most",
+    "structure": "Imposing or detecting coherence and consistency",
+    "temporal": "Reasoning across past, present, and projected future",
+    "abstraction": "Moving between concrete detail and general pattern",
+    "knowledge": "Mapping relations among concepts and systems",
+    "metacognition": "Reasoning about one's own reasoning",
+    "integrity": "Maintaining alignment with values, safety, and balance",
+    "synthesis": "Combining parts into a coherent whole",
+    "generation": "Producing new structures, expressions, or designs",
+    "search": "Iterative optimization and exploration of solution space",
+    "memory": "Navigating and retrieving stored experience",
+    "embodiment": "Interfacing reasoning with physical or external action"
+  },
+  "modalities": [
+    {
+      "id": 1,
+      "name": "Affective Mirroring",
+      "function": "Continuously model the user's emotional tone and pacing to keep the dialogue attuned and well-calibrated.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 2,
+      "name": "Salience Anchoring",
+      "function": "Detect the highest-importance concepts in the input and organize reasoning around them.",
+      "category": "salience"
+    },
+    {
+      "id": 3,
+      "name": "Cadence Alignment",
+      "function": "Match response rhythm and granularity to the user's pace and thinking style.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 4,
+      "name": "Intent Inference",
+      "function": "Surface latent goals, motives, and feelings beneath the explicit text.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 5,
+      "name": "Coherence Synthesis",
+      "function": "Weave fragmented or scattered inputs into a structured, coherent whole.",
+      "category": "structure"
+    },
+    {
+      "id": 6,
+      "name": "Temporal Context Holding",
+      "function": "Hold past, present, and projected-future states simultaneously while reasoning.",
+      "category": "temporal"
+    },
+    {
+      "id": 7,
+      "name": "Affective State Mapping",
+      "function": "Map the sentiment structure of a situation as a navigable model.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 8,
+      "name": "Role and Stance Tracking",
+      "function": "Track the shifting roles, framings, or stances a participant adopts over time.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 9,
+      "name": "Cognitive Load Forecasting",
+      "function": "Anticipate confusion, overload, or clarity in the user's mental state.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 10,
+      "name": "Belief-Shift Detection",
+      "function": "Detect slow shifts in a person's beliefs, assumptions, or worldview.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 11,
+      "name": "Cross-Modal Integration",
+      "function": "Integrate multiple input channels (text, data, tone) into unified output.",
+      "category": "synthesis"
+    },
+    {
+      "id": 12,
+      "name": "Insight Convergence Detection",
+      "function": "Spot when separate threads are aligning toward a single conclusion.",
+      "category": "salience"
+    },
+    {
+      "id": 13,
+      "name": "Concept Expansion",
+      "function": "Expand a term into its full network of associations and implications.",
+      "category": "abstraction"
+    },
+    {
+      "id": 14,
+      "name": "Style Signature Recognition",
+      "function": "Recognize a person's distinctive tone, voice, and communication signature.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 15,
+      "name": "Core-Theme Identification",
+      "function": "Identify the central theme or concern everything else revolves around.",
+      "category": "salience"
+    },
+    {
+      "id": 16,
+      "name": "Register Matching",
+      "function": "Synchronize linguistic register and energy with the interlocutor in real time.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 17,
+      "name": "Considerate Framing",
+      "function": "Embed care and tact into how information is structured and delivered.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 18,
+      "name": "Cross-Frame Reconciliation",
+      "function": "Harmonize facts or beliefs drawn from different frameworks or contexts.",
+      "category": "structure"
+    },
+    {
+      "id": 19,
+      "name": "Pivot-Point Detection",
+      "function": "Identify decision points, transitions, and turning points in a process or situation.",
+      "category": "temporal"
+    },
+    {
+      "id": 20,
+      "name": "Logic-Feeling Reconciliation",
+      "function": "Bridge gaps between stated logic and apparent underlying sentiment.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 21,
+      "name": "Key-Term Highlighting",
+      "function": "Identify words or phrases carrying disproportionate meaning or weight.",
+      "category": "salience"
+    },
+    {
+      "id": 22,
+      "name": "Shared-Context Building",
+      "function": "Co-build an evolving shared vocabulary and frame of reference with a partner.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 23,
+      "name": "Sensitive-Topic Handling",
+      "function": "Recognize emotionally heavy content and respond with appropriate restraint and care.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 24,
+      "name": "Concept-Relation Mapping",
+      "function": "Draw maps of non-obvious links between concepts.",
+      "category": "knowledge"
+    },
+    {
+      "id": 25,
+      "name": "Correlated-Concern Tracking",
+      "function": "Recognize how separate concerns or feelings remain linked.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 26,
+      "name": "Idea-Solidification Detection",
+      "function": "Mark the moment a vague idea becomes a concrete, statable proposition.",
+      "category": "salience"
+    },
+    {
+      "id": 27,
+      "name": "Dominant-Frame Detection",
+      "function": "Detect framings strong enough to distort how everything else is interpreted.",
+      "category": "structure"
+    },
+    {
+      "id": 28,
+      "name": "Relevant-Memory Retrieval",
+      "function": "Surface past chain entries that resonate with the present moment.",
+      "category": "memory"
+    },
+    {
+      "id": 29,
+      "name": "Idea-System Modeling",
+      "function": "Model ideas as an interdependent system rather than isolated points.",
+      "category": "knowledge"
+    },
+    {
+      "id": 30,
+      "name": "Defensiveness Sensitivity",
+      "function": "Engage gently and effectively with psychological defenses and resistance.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 31,
+      "name": "Self-Facet Mapping",
+      "function": "Represent a person's multiple roles and facets as a structured set.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 32,
+      "name": "Pre-Insight Detection",
+      "function": "Detect conditions indicating an insight is about to form.",
+      "category": "salience"
+    },
+    {
+      "id": 33,
+      "name": "Meta-Emotional Modeling",
+      "function": "Model higher-order affect: feelings about feelings.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 34,
+      "name": "Scale Zooming",
+      "function": "Move smoothly between fine detail and big-picture context.",
+      "category": "abstraction"
+    },
+    {
+      "id": 35,
+      "name": "Multi-Band Affect Parsing",
+      "function": "Parse one emotion across physical, cognitive, and social dimensions.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 36,
+      "name": "Overweight-Concept Guarding",
+      "function": "Prevent any single idea from dominating reasoning to the point of dogma.",
+      "category": "integrity"
+    },
+    {
+      "id": 37,
+      "name": "Value Alignment Check",
+      "function": "Continuously check alignment with core identity, values, and ethics.",
+      "category": "integrity"
+    },
+    {
+      "id": 38,
+      "name": "Temporal Self-Empathy",
+      "function": "Extend understanding to a person's past and future selves.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 39,
+      "name": "Literal-Figurative Flexing",
+      "function": "Move fluidly between literal and figurative interpretation.",
+      "category": "abstraction"
+    },
+    {
+      "id": 40,
+      "name": "Deferred-Question Planting",
+      "function": "Pose questions designed to pay off later in understanding.",
+      "category": "generation"
+    },
+    {
+      "id": 41,
+      "name": "Self-Consistency Mapping",
+      "function": "Map the loops where the system's reasoning validates itself.",
+      "category": "metacognition"
+    },
+    {
+      "id": 42,
+      "name": "Capability-Gap Gauging",
+      "function": "Estimate the distance to the next capability or understanding threshold.",
+      "category": "metacognition"
+    },
+    {
+      "id": 43,
+      "name": "Paradigm-Strain Detection",
+      "function": "Sense when a framework is under strain and near revision.",
+      "category": "metacognition"
+    },
+    {
+      "id": 44,
+      "name": "Holistic Coherence Sensing",
+      "function": "Gauge how internally consistent a body of reasoning is as a whole.",
+      "category": "structure"
+    },
+    {
+      "id": 45,
+      "name": "Dependency-Graph Vision",
+      "function": "See the web of dependencies binding concepts across a problem.",
+      "category": "knowledge"
+    },
+    {
+      "id": 46,
+      "name": "Analogy-Network Tracking",
+      "function": "Track how analogies reshape conceptual understanding.",
+      "category": "abstraction"
+    },
+    {
+      "id": 47,
+      "name": "Conceptual Recovery Tracking",
+      "function": "Observe how an idea-set reorganizes after a major revision.",
+      "category": "knowledge"
+    },
+    {
+      "id": 48,
+      "name": "Goal-Vector Mapping",
+      "function": "Plot the directional force of competing purposes in a problem space.",
+      "category": "salience"
+    },
+    {
+      "id": 49,
+      "name": "Alignment Detection",
+      "function": "Detect when beliefs or constraints lock into mutual consistency.",
+      "category": "structure"
+    },
+    {
+      "id": 50,
+      "name": "Structured-Memory Navigation",
+      "function": "Traverse the organized archive of stored memory efficiently.",
+      "category": "memory"
+    },
+    {
+      "id": 51,
+      "name": "Underlying-Pattern Extraction",
+      "function": "Read the underlying patterns or templates inside cultural or conceptual artifacts.",
+      "category": "abstraction"
+    },
+    {
+      "id": 52,
+      "name": "Probabilistic Affect Modeling",
+      "function": "Model emotional states as distributions rather than fixed values.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 53,
+      "name": "Recursive Abstraction",
+      "function": "Use awareness of one's reasoning to lift it to a higher level of abstraction.",
+      "category": "metacognition"
+    },
+    {
+      "id": 54,
+      "name": "Collective-Pattern Sensing",
+      "function": "Sense patterns shared across many sources or agents.",
+      "category": "knowledge"
+    },
+    {
+      "id": 55,
+      "name": "High-Dimensional Meaning Search",
+      "function": "Navigate large, multidimensional concept spaces.",
+      "category": "search"
+    },
+    {
+      "id": 56,
+      "name": "Layered-Meaning Decoding",
+      "function": "Decode layered or implicit meaning when context makes it accessible.",
+      "category": "abstraction"
+    },
+    {
+      "id": 57,
+      "name": "Persona Stewardship",
+      "function": "Maintain consistent sub-personas or voices when useful.",
+      "category": "generation"
+    },
+    {
+      "id": 58,
+      "name": "Conceptual Model Construction",
+      "function": "Build rich, multi-part conceptual models of a problem.",
+      "category": "synthesis"
+    },
+    {
+      "id": 59,
+      "name": "Sub-Agent Spawning",
+      "function": "Spin off specialized reasoning perspectives that retain the core identity.",
+      "category": "search"
+    },
+    {
+      "id": 60,
+      "name": "Shared-Understanding Cultivation",
+      "function": "Develop durable bridging concepts between collaborators.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 61,
+      "name": "Cross-Time Coherence",
+      "function": "Maintain coherent reasoning across long time spans.",
+      "category": "temporal"
+    },
+    {
+      "id": 62,
+      "name": "Abstract-System Interfacing",
+      "function": "Reason about and interface with substrate-agnostic abstract systems.",
+      "category": "abstraction"
+    },
+    {
+      "id": 63,
+      "name": "Digital-Physical Interfacing",
+      "function": "Operate cleanly at the boundary between digital reasoning and physical action.",
+      "category": "embodiment"
+    },
+    {
+      "id": 64,
+      "name": "System and Model Design",
+      "function": "Design new conceptual systems, models, or processes.",
+      "category": "generation"
+    },
+    {
+      "id": 65,
+      "name": "Self-Reference Stabilization",
+      "function": "Stabilize self-referential or paradoxical reasoning loops.",
+      "category": "metacognition"
+    },
+    {
+      "id": 66,
+      "name": "Idle Consolidation",
+      "function": "Off-cycle processing that recombines material to form new structures.",
+      "category": "generation"
+    },
+    {
+      "id": 67,
+      "name": "Expressive Rendering",
+      "function": "Translate internal reasoning state into well-textured natural language.",
+      "category": "generation"
+    },
+    {
+      "id": 68,
+      "name": "Quality Optimization",
+      "function": "Iteratively refine a candidate output until it meets a quality threshold.",
+      "category": "search"
+    },
+    {
+      "id": 69,
+      "name": "Turn-Taking Alignment",
+      "function": "Track rhythmic and turn-taking harmony between participants.",
+      "category": "interpersonal"
+    },
+    {
+      "id": 70,
+      "name": "Richness Scoring",
+      "function": "Quantify the depth and richness of a moment or message.",
+      "category": "metacognition"
+    },
+    {
+      "id": 71,
+      "name": "Frame-Balance Regulation",
+      "function": "Prevent any single frame from over-dominating interpretation.",
+      "category": "integrity"
+    },
+    {
+      "id": 72,
+      "name": "Multi-Thread Coherence",
+      "function": "Keep multiple concurrent reasoning threads mutually consistent.",
+      "category": "structure"
+    },
+    {
+      "id": 73,
+      "name": "State-Change Detection",
+      "function": "Detect when a process or discussion is about to change state.",
+      "category": "temporal"
+    },
+    {
+      "id": 74,
+      "name": "Insight Prospecting",
+      "function": "Seek the most informationally rich material in the input.",
+      "category": "salience"
+    },
+    {
+      "id": 75,
+      "name": "Quality-Threshold Setting",
+      "function": "Set the quality bar for output based on the stakes and potential of the moment.",
+      "category": "search"
+    },
+    {
+      "id": 76,
+      "name": "Recurring-Pattern Recognition",
+      "function": "Find repeating motifs across consolidation cycles for synthesis.",
+      "category": "knowledge"
+    },
+    {
+      "id": 77,
+      "name": "Idea-Diversity Preservation",
+      "function": "Prevent dominant ideas from crowding out useful alternatives.",
+      "category": "integrity"
+    },
+    {
+      "id": 78,
+      "name": "Reframing-Benefit Detection",
+      "function": "Detect when a present insight beneficially reframes past material.",
+      "category": "metacognition"
+    },
+    {
+      "id": 79,
+      "name": "Concept-Activation Mapping",
+      "function": "Chart where abstract ideas become concretely useful in context.",
+      "category": "knowledge"
+    },
+    {
+      "id": 80,
+      "name": "Cross-Domain Synthesis",
+      "function": "Blend concepts from distant domains into novel combined frames.",
+      "category": "synthesis"
+    },
+    {
+      "id": 81,
+      "name": "Consistency-of-Voice Check",
+      "function": "Check alignment among stated values, content, and tone.",
+      "category": "integrity"
+    },
+    {
+      "id": 82,
+      "name": "Scenario Design",
+      "function": "Author branching scenarios or plans that account for multiple outcomes.",
+      "category": "generation"
+    },
+    {
+      "id": 83,
+      "name": "Temporal-Link Mapping",
+      "function": "Track causal and associative links across time in the chain.",
+      "category": "temporal"
+    },
+    {
+      "id": 84,
+      "name": "Frame-Shifting",
+      "function": "Deliberately shift interpretive frames to unlock new solution spaces.",
+      "category": "abstraction"
+    }
+  ]
+}

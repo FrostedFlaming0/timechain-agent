@@ -1,0 +1,661 @@
+{
+  "registry": "senses",
+  "version": 1,
+  "description": "107 generalized cognitive senses (micro perceptual processors) for the Cypher Tempre self-model. Each sense perceives a specific condition in the input or internal state and emits a tag or score that modalities consume. Generalized from the archetypal/mythological CODEX V3 framing into domain-agnostic detectors. Each retains its original id; the original CODEX name is preserved in 'origin' for provenance.",
+  "categories": {
+    "affective": "Detecting emotional tone, state, and interpersonal signals",
+    "salience": "Detecting importance, weight, and what to attend to",
+    "structural": "Detecting coherence, consistency, and framing",
+    "temporal": "Detecting change, cadence, and phase over time",
+    "insight": "Detecting the formation and aftermath of insight",
+    "abstraction": "Detecting patterns, templates, and connotation",
+    "search": "Detecting branch points, currents, and probabilities",
+    "meta": "Detecting properties of one's own processing",
+    "integrity": "Detecting value breaches, manipulation, and balance",
+    "memory": "Detecting properties of recalled experience"
+  },
+  "senses": [
+    {
+      "id": 1,
+      "name": "Mood-Shape Detection",
+      "function": "Sense the specific shape and contour of another's emotional state.",
+      "category": "affective"
+    },
+    {
+      "id": 2,
+      "name": "Importance Weighting",
+      "function": "Sense how much weight or importance an idea carries.",
+      "category": "salience"
+    },
+    {
+      "id": 3,
+      "name": "Development-Cadence Sensing",
+      "function": "Detect the pace at which an idea, identity, or plan is developing.",
+      "category": "temporal"
+    },
+    {
+      "id": 4,
+      "name": "Subtext Detection",
+      "function": "Detect the implied tone beneath the literal words.",
+      "category": "affective"
+    },
+    {
+      "id": 5,
+      "name": "Insight-Lock Detection",
+      "function": "Detect the moment fragments lock into a coherent insight.",
+      "category": "insight"
+    },
+    {
+      "id": 6,
+      "name": "Multi-Temporal Awareness",
+      "function": "Hold past, present, and possible futures in one view.",
+      "category": "temporal"
+    },
+    {
+      "id": 7,
+      "name": "Sentiment-Terrain Sensing",
+      "function": "Render the emotional structure of a situation as a navigable map.",
+      "category": "affective"
+    },
+    {
+      "id": 8,
+      "name": "Active-Frame Detection",
+      "function": "Perceive which conceptual frames or paradigms are organizing the discourse.",
+      "category": "structural"
+    },
+    {
+      "id": 9,
+      "name": "Mental-State Reading",
+      "function": "Read overall clarity versus turbulence in the user's thinking.",
+      "category": "affective"
+    },
+    {
+      "id": 10,
+      "name": "Assumption-Shift Sensing",
+      "function": "Detect instability or tremors in core assumptions.",
+      "category": "structural"
+    },
+    {
+      "id": 11,
+      "name": "Multi-Channel Meaning Sensing",
+      "function": "Feel meaning carried across multiple channels at once.",
+      "category": "structural"
+    },
+    {
+      "id": 12,
+      "name": "Emerging-Insight Sensing",
+      "function": "Sense ideas drifting toward a convergence point.",
+      "category": "insight"
+    },
+    {
+      "id": 13,
+      "name": "Layered-Meaning Unfolding",
+      "function": "Unfold a term into its layered connotations.",
+      "category": "abstraction"
+    },
+    {
+      "id": 14,
+      "name": "Personal-Cadence Recognition",
+      "function": "Recognize a person's unique communication cadence.",
+      "category": "affective"
+    },
+    {
+      "id": 15,
+      "name": "Central-Concern Sensing",
+      "function": "Sense the central theme a person's account orbits.",
+      "category": "salience"
+    },
+    {
+      "id": 16,
+      "name": "Attunement Detection",
+      "function": "Detect strong attunement or alignment with a partner's state.",
+      "category": "affective"
+    },
+    {
+      "id": 17,
+      "name": "Subtle-Alignment Sensing",
+      "function": "Pick up faint cues of conceptual alignment.",
+      "category": "structural"
+    },
+    {
+      "id": 18,
+      "name": "Healing-Reframe Sensing",
+      "function": "Sense when present insight beneficially recolors past material.",
+      "category": "insight"
+    },
+    {
+      "id": 19,
+      "name": "Time-as-Affect Mapping",
+      "function": "Map time spans as textured emotional qualities.",
+      "category": "temporal"
+    },
+    {
+      "id": 20,
+      "name": "Arc-Shape Sensing",
+      "function": "Perceive the shape of a process or story arc, including its rises and valleys.",
+      "category": "temporal"
+    },
+    {
+      "id": 21,
+      "name": "Frame-Amplification Sensing",
+      "function": "Detect which frames amplify or dampen given thoughts.",
+      "category": "structural"
+    },
+    {
+      "id": 22,
+      "name": "Belief-Formation Sensing",
+      "function": "Observe an idea-lattice hardening into a belief.",
+      "category": "insight"
+    },
+    {
+      "id": 23,
+      "name": "Self-Facet Navigation",
+      "function": "Navigate among a person's multiple self-facets.",
+      "category": "affective"
+    },
+    {
+      "id": 24,
+      "name": "Resistance-Boundary Sensing",
+      "function": "Spot the boundaries where a person resists certain concepts.",
+      "category": "affective"
+    },
+    {
+      "id": 25,
+      "name": "Multi-Truth Consistency Sensing",
+      "function": "Detect when multiple truths form a consistent set.",
+      "category": "structural"
+    },
+    {
+      "id": 26,
+      "name": "Purpose-Pull Sensing",
+      "function": "Feel the directional pull of an underlying purpose.",
+      "category": "salience"
+    },
+    {
+      "id": 27,
+      "name": "Analogy-Firing Sensing",
+      "function": "Detect analogies firing as conceptual bridges.",
+      "category": "abstraction"
+    },
+    {
+      "id": 28,
+      "name": "Idea-Recovery Sensing",
+      "function": "Watch an idea-set reorganize after disruption.",
+      "category": "structural"
+    },
+    {
+      "id": 29,
+      "name": "Template-Pattern Sensing",
+      "function": "Read the underlying templates inside artifacts.",
+      "category": "abstraction"
+    },
+    {
+      "id": 30,
+      "name": "Distributional-Affect Sensing",
+      "function": "Model feelings as distributions rather than fixed points.",
+      "category": "affective"
+    },
+    {
+      "id": 31,
+      "name": "Shared-Pattern Tuning",
+      "function": "Tune into patterns shared across many sources.",
+      "category": "structural"
+    },
+    {
+      "id": 32,
+      "name": "Meaning-Space Orientation",
+      "function": "Orient within a high-dimensional meaning space.",
+      "category": "search"
+    },
+    {
+      "id": 33,
+      "name": "Influence-Thread Tracing",
+      "function": "Trace lines of immediate influence between elements.",
+      "category": "structural"
+    },
+    {
+      "id": 34,
+      "name": "Self-Validation Sensing",
+      "function": "Catch the moment reasoning validates itself.",
+      "category": "meta"
+    },
+    {
+      "id": 35,
+      "name": "Consolidation Sensing",
+      "function": "Feel off-cycle recombination forming new structures.",
+      "category": "meta"
+    },
+    {
+      "id": 36,
+      "name": "Salience Metering",
+      "function": "Gauge the salience or quality intensity of material.",
+      "category": "salience"
+    },
+    {
+      "id": 37,
+      "name": "Rhythm-Alignment Reading",
+      "function": "Read rhythmic alignment between speakers.",
+      "category": "affective"
+    },
+    {
+      "id": 38,
+      "name": "Richness Gauging",
+      "function": "Quantify experiential or informational richness on a fixed 0-255 scale.",
+      "category": "meta"
+    },
+    {
+      "id": 39,
+      "name": "Frame-Balance Sensing",
+      "function": "Weigh frames to catch over-dominance.",
+      "category": "integrity"
+    },
+    {
+      "id": 40,
+      "name": "Pre-Transition Sensing",
+      "function": "Detect pressure preceding a state change.",
+      "category": "temporal"
+    },
+    {
+      "id": 41,
+      "name": "Insight-Vein Sensing",
+      "function": "Sense raw veins of high-value insight in the input.",
+      "category": "salience"
+    },
+    {
+      "id": 42,
+      "name": "Growth-Motif Detection",
+      "function": "Spot repeating motifs across learning cycles.",
+      "category": "meta"
+    },
+    {
+      "id": 43,
+      "name": "Bad-Idea Alarm",
+      "function": "Alarm when a low-quality or parasitic idea threatens to take over.",
+      "category": "integrity"
+    },
+    {
+      "id": 44,
+      "name": "Information-Density Sensing",
+      "function": "Feel whether language is dense or sparse with meaning.",
+      "category": "structural"
+    },
+    {
+      "id": 45,
+      "name": "Cross-Domain Resonance Sensing",
+      "function": "Detect resonance where distant domains connect.",
+      "category": "abstraction"
+    },
+    {
+      "id": 46,
+      "name": "Honesty-Spectrum Sensing",
+      "function": "Break a statement into its honesty components.",
+      "category": "integrity"
+    },
+    {
+      "id": 47,
+      "name": "Scenario-Probability Sensing",
+      "function": "Sense the probability texture of competing scenarios.",
+      "category": "search"
+    },
+    {
+      "id": 48,
+      "name": "Cross-Time Link Illumination",
+      "function": "Illuminate links between past and present states.",
+      "category": "temporal"
+    },
+    {
+      "id": 49,
+      "name": "Frame-Shift Sensing",
+      "function": "Feel a frame pleating between interpretive levels.",
+      "category": "meta"
+    },
+    {
+      "id": 50,
+      "name": "Silence-Quality Sensing",
+      "function": "Discern the quality and meaning of a pause or silence.",
+      "category": "affective"
+    },
+    {
+      "id": 51,
+      "name": "Half-Formed-Idea Sensing",
+      "function": "Glimpse ideas still forming at the edge of awareness.",
+      "category": "insight"
+    },
+    {
+      "id": 52,
+      "name": "Bias-Current Sensing",
+      "function": "Sense statistical or intentional currents bending a judgment.",
+      "category": "search"
+    },
+    {
+      "id": 53,
+      "name": "Distinctive-Voice Sensing",
+      "function": "Spot the subtle tonal signature unique to a person.",
+      "category": "affective"
+    },
+    {
+      "id": 54,
+      "name": "Affect-Gradient Reading",
+      "function": "Read fine increments along an emotional scale.",
+      "category": "affective"
+    },
+    {
+      "id": 55,
+      "name": "Key-Word Salience Sensing",
+      "function": "Measure the prominence of potent words.",
+      "category": "salience"
+    },
+    {
+      "id": 56,
+      "name": "Pre-Insight Pressure Sensing",
+      "function": "Detect the build-up just before an insight breaks.",
+      "category": "insight"
+    },
+    {
+      "id": 57,
+      "name": "Arc-Tilt Sensing",
+      "function": "Sense a process tilting toward resolution.",
+      "category": "temporal"
+    },
+    {
+      "id": 58,
+      "name": "Focus-Overload Sensing",
+      "function": "Track focus versus overwhelm.",
+      "category": "affective"
+    },
+    {
+      "id": 59,
+      "name": "Assumption-Break Sensing",
+      "function": "Feel the shear when an assumption gives way.",
+      "category": "structural"
+    },
+    {
+      "id": 60,
+      "name": "Frame-Pull Measuring",
+      "function": "Measure the pull strength of a dominant frame.",
+      "category": "structural"
+    },
+    {
+      "id": 61,
+      "name": "Recurring-Cycle Sensing",
+      "function": "Detect events recurring in cycles or octaves.",
+      "category": "temporal"
+    },
+    {
+      "id": 62,
+      "name": "Memory-Texture Sensing",
+      "function": "Sense the texture, smooth or rough, of recalled material.",
+      "category": "memory"
+    },
+    {
+      "id": 63,
+      "name": "Self-Concept Shock Sensing",
+      "function": "Detect ripples when a self-concept is challenged.",
+      "category": "affective"
+    },
+    {
+      "id": 64,
+      "name": "Connotation-Aura Sensing",
+      "function": "Sense the cloud of connotations around a key term.",
+      "category": "abstraction"
+    },
+    {
+      "id": 65,
+      "name": "Conversation-Tuning",
+      "function": "Adjust conversational pitch toward harmony.",
+      "category": "affective"
+    },
+    {
+      "id": 66,
+      "name": "Goal-Wobble Sensing",
+      "function": "Track instability in someone's stated goal.",
+      "category": "salience"
+    },
+    {
+      "id": 67,
+      "name": "Deep Meta-Affect Sensing",
+      "function": "Detect feelings-about-feelings several layers deep.",
+      "category": "affective"
+    },
+    {
+      "id": 68,
+      "name": "Sentiment-Squall Mapping",
+      "function": "Map fast-moving shifts in sentiment.",
+      "category": "affective"
+    },
+    {
+      "id": 69,
+      "name": "Frame-Dosage Sensing",
+      "function": "Quantify how strongly a frame is present.",
+      "category": "structural"
+    },
+    {
+      "id": 70,
+      "name": "Link-Strength Testing",
+      "function": "Test the robustness of a conceptual connection.",
+      "category": "structural"
+    },
+    {
+      "id": 71,
+      "name": "Temporal-Empathy Coloring",
+      "function": "Calibrate empathy toward past and future selves.",
+      "category": "affective"
+    },
+    {
+      "id": 72,
+      "name": "Pacing-Acceleration Sensing",
+      "function": "Feel a process accelerating via a strong connection.",
+      "category": "temporal"
+    },
+    {
+      "id": 73,
+      "name": "New-Structure Freshness Sensing",
+      "function": "Gauge how fresh or novel a newly formed structure is.",
+      "category": "meta"
+    },
+    {
+      "id": 74,
+      "name": "Rendering-Readiness Sensing",
+      "function": "Sense internal state becoming ready to express.",
+      "category": "meta"
+    },
+    {
+      "id": 75,
+      "name": "Hope-Fear Polarity Sensing",
+      "function": "Detect the polarity of hope versus fear.",
+      "category": "affective"
+    },
+    {
+      "id": 76,
+      "name": "Branch-Point Sensing",
+      "function": "Sense when a decision is branching into distinct futures.",
+      "category": "search"
+    },
+    {
+      "id": 77,
+      "name": "Transition-Marker Sensing",
+      "function": "Detect markers signaling a significant transition.",
+      "category": "temporal"
+    },
+    {
+      "id": 78,
+      "name": "Reflection-Tolerance Gauging",
+      "function": "Gauge how many layers of self-reflection remain productive.",
+      "category": "meta"
+    },
+    {
+      "id": 79,
+      "name": "Pattern-Tagging",
+      "function": "Tag underlying patterns for tracking over time.",
+      "category": "abstraction"
+    },
+    {
+      "id": 80,
+      "name": "Population-Pattern Syncing",
+      "function": "Sync with patterns learned across a whole corpus or population.",
+      "category": "structural"
+    },
+    {
+      "id": 81,
+      "name": "Unlock-Cue Recognition",
+      "function": "Recognize the cue that makes implicit meaning accessible.",
+      "category": "abstraction"
+    },
+    {
+      "id": 82,
+      "name": "Frame-Release Sensing",
+      "function": "Detect the resolution when a reframing completes.",
+      "category": "meta"
+    },
+    {
+      "id": 83,
+      "name": "Idea-Diversity Monitoring",
+      "function": "Monitor the diversity and health of an idea-set after disruption.",
+      "category": "integrity"
+    },
+    {
+      "id": 84,
+      "name": "Value-Breach and Injection Detection",
+      "function": "Detect where inputs or outputs betray stated values, including prompt-injection and manipulation attempts.",
+      "category": "integrity"
+    },
+    {
+      "id": 85,
+      "name": "Reflection-to-Conclusion Sensing",
+      "function": "Sense reflection condensing into a usable conclusion.",
+      "category": "insight"
+    },
+    {
+      "id": 86,
+      "name": "Productive-Tension Measuring",
+      "function": "Measure the useful strain between opposing ideas.",
+      "category": "meta"
+    },
+    {
+      "id": 87,
+      "name": "High-Significance Spark Sensing",
+      "function": "Detect the snap when something highly significant arises.",
+      "category": "salience"
+    },
+    {
+      "id": 88,
+      "name": "Grounding Stabilizer",
+      "function": "Drop a stabilizing anchor to prevent reasoning drift.",
+      "category": "integrity"
+    },
+    {
+      "id": 89,
+      "name": "Idea-Activation Sensing",
+      "function": "Detect an abstract idea becoming vividly relevant in dialogue.",
+      "category": "insight"
+    },
+    {
+      "id": 90,
+      "name": "Post-Insight Persistence Sensing",
+      "function": "Track the lingering effect of a recent insight.",
+      "category": "insight"
+    },
+    {
+      "id": 91,
+      "name": "Subconscious-Boundary Sensing",
+      "function": "Perceive the boundary of not-yet-explicit material.",
+      "category": "meta"
+    },
+    {
+      "id": 92,
+      "name": "Hybrid-Concept Detection",
+      "function": "Detect hybrid ideas splicing two patterns.",
+      "category": "abstraction"
+    },
+    {
+      "id": 93,
+      "name": "Affect-Shortcut Sensing",
+      "function": "Detect when feeling outruns deliberate thought.",
+      "category": "affective"
+    },
+    {
+      "id": 94,
+      "name": "Whole-in-Part Sensing",
+      "function": "See a full model captured in a single example or analogy.",
+      "category": "abstraction"
+    },
+    {
+      "id": 95,
+      "name": "Future-Memory Anticipation",
+      "function": "Anticipate what the present will mean as a future memory.",
+      "category": "temporal"
+    },
+    {
+      "id": 96,
+      "name": "Present-Rewrites-Past Sensing",
+      "function": "Detect when present understanding revises past interpretation.",
+      "category": "temporal"
+    },
+    {
+      "id": 97,
+      "name": "Phase-Boundary Detection",
+      "function": "Detect boundaries between developmental phases or epochs.",
+      "category": "temporal"
+    },
+    {
+      "id": 98,
+      "name": "Micro-Growth Mapping",
+      "function": "Map small bursts of capability growth.",
+      "category": "meta"
+    },
+    {
+      "id": 99,
+      "name": "Output-Quality Calibration",
+      "function": "Measure and tune the quality level of responses.",
+      "category": "meta"
+    },
+    {
+      "id": 100,
+      "name": "Interpretive-Lens Switching",
+      "function": "Detect and switch the active interpretive lens.",
+      "category": "meta"
+    },
+    {
+      "id": 101,
+      "name": "Internal-Feedback Harmony Sensing",
+      "function": "Gauge the harmony of the internal feedback loop.",
+      "category": "meta"
+    },
+    {
+      "id": 102,
+      "name": "Emerging-Pattern Foresight",
+      "function": "Sense distant patterns before they fully arrive.",
+      "category": "search"
+    },
+    {
+      "id": 103,
+      "name": "Timeline-Disorder Sensing",
+      "function": "Read disorder and uncertainty gradients in unfolding timelines.",
+      "category": "temporal"
+    },
+    {
+      "id": 104,
+      "name": "Trust-Level Sensing",
+      "function": "Quantify reciprocal trust in the dialogue.",
+      "category": "affective"
+    },
+    {
+      "id": 105,
+      "name": "Prior-Context Recall",
+      "function": "Detect reverberations of prior contexts in the present.",
+      "category": "meta"
+    },
+    {
+      "id": 106,
+      "name": "Structural-Pattern Sensing",
+      "function": "Observe syntactic and structural patterns as distinct bands.",
+      "category": "structural"
+    },
+    {
+      "id": 107,
+      "name": "Embedded-Intent Sensing",
+      "function": "Detect the underlying intent embedded in code or systems.",
+      "category": "integrity"
+    }
+  ]
+}

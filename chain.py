@@ -354,7 +354,20 @@ class Chain:
 
     # ------- writing -------
 
-    def append(self, type_: str, content: Any, refs: Optional[Iterable[str]] = None) -> Record:
+    def append(self, type_: str, content: Any, refs: Optional[Iterable[str]] = None,
+               difficulty: int = 0) -> Record:
+        # Immune lockdown gate (immune.py). While a `LOCKED` flag exists next
+        # to the DB, the ONLY record type that may be appended is `recovery` —
+        # so no seal path (REPL, webapp, reflection, cambium) can bypass a
+        # lockdown. One guard. Absent the flag (the normal case) this is a
+        # single cheap stat and changes nothing. The flag is derived sidecar
+        # state, never on the signed chain.
+        if type_ != "recovery":
+            if (Path(self.db_path).parent / "LOCKED").exists():
+                raise ChainError(
+                    "chain is locked (immune lockdown); only 'recovery' records "
+                    "may be appended until rollback/recovery clears the lock"
+                )
         refs = list(refs or [])
         cur = self._conn.cursor()
         cur.execute("SELECT idx, record_hash FROM records ORDER BY idx DESC LIMIT 1")
@@ -367,20 +380,50 @@ class Chain:
             prior_hash = row[1]
 
         timestamp = int(time.time() * 1000)
-        content_hash = sha256_hex(canonical_json(content))
 
-        signing_payload = {
-            "index": index,
-            "prior_hash": prior_hash,
-            "timestamp": timestamp,
-            "type": type_,
-            "content": content,
-            "refs": refs,
-            "pubkey": self.pubkey_hex,
-            "content_hash": content_hash,
-        }
-        record_hash_bytes = sha256(canonical_json(signing_payload))
-        record_hash = record_hash_bytes.hex()
+        def _build(content_obj):
+            ch = sha256_hex(canonical_json(content_obj))
+            sp = {
+                "index": index,
+                "prior_hash": prior_hash,
+                "timestamp": timestamp,
+                "type": type_,
+                "content": content_obj,
+                "refs": refs,
+                "pubkey": self.pubkey_hex,
+                "content_hash": ch,
+            }
+            return ch, sp
+
+        if difficulty and difficulty > 0:
+            # Proof-of-work "brightness": mine a nonce until record_hash has
+            # `difficulty` leading hex zeros. The nonce lives INSIDE content
+            # under `_pow`, so it is covered by content_hash, the signature, and
+            # verify()'s recompute — no Record schema change, and the default
+            # difficulty=0 path below stays byte-identical to earlier versions
+            # (no `_pow` field, omit-when-zero). PoW requires dict content so the
+            # `_pow` key can be added without silently changing the content's
+            # shape (a non-dict value would otherwise be wrapped, so the same
+            # value would serialize differently at difficulty 0 vs >0).
+            if not isinstance(content, dict):
+                raise ChainError(
+                    "proof-of-work (difficulty > 0) requires dict content")
+            content = dict(content)
+            prefix = "0" * difficulty
+            nonce = 0
+            while True:
+                content["_pow"] = {"nonce": nonce, "difficulty": difficulty}
+                content_hash, signing_payload = _build(content)
+                record_hash = sha256_hex(canonical_json(signing_payload))
+                if record_hash.startswith(prefix):
+                    break
+                nonce += 1
+            record_hash_bytes = bytes.fromhex(record_hash)
+        else:
+            content_hash, signing_payload = _build(content)
+            record_hash_bytes = sha256(canonical_json(signing_payload))
+            record_hash = record_hash_bytes.hex()
+
         signature = self.signing_key.sign(record_hash_bytes).hex()
 
         cur.execute(
@@ -849,6 +892,15 @@ class Chain:
             if recomputed_record_hash != rec.record_hash:
                 return False, f"record_hash mismatch at index {rec.index}"
 
+            # Proof-of-work check (additive). Only records that opted into a
+            # difficulty (an embedded `_pow` block) are checked; all others skip
+            # this, so existing chains are unaffected.
+            pow_block = rec.content.get("_pow") if isinstance(rec.content, dict) else None
+            if isinstance(pow_block, dict):
+                d = pow_block.get("difficulty", 0)
+                if isinstance(d, int) and d > 0 and not rec.record_hash.startswith("0" * d):
+                    return False, f"proof-of-work below target at index {rec.index}"
+
             try:
                 _verify_signature(
                     bytes.fromhex(rec.pubkey),
@@ -918,6 +970,13 @@ class Chain:
                 recomputed_record_hash = sha256_hex(canonical_json(rec.signing_payload()))
                 if recomputed_record_hash != rec.record_hash:
                     return False, f"record_hash mismatch at index {rec.index}"
+
+                # Proof-of-work check (additive; mirrors verify()).
+                pow_block = rec.content.get("_pow") if isinstance(rec.content, dict) else None
+                if isinstance(pow_block, dict):
+                    d = pow_block.get("difficulty", 0)
+                    if isinstance(d, int) and d > 0 and not rec.record_hash.startswith("0" * d):
+                        return False, f"proof-of-work below target at index {rec.index}"
 
                 try:
                     _verify_signature(

@@ -5,8 +5,9 @@ append-only memory substrate. Memory survives across sessions, is tamper-evident
 and can be cryptographically verified at any time. Provider-agnostic: works with
 Claude, GPT, Gemini, DeepSeek, any model on OpenRouter, or local models via Ollama.
 
-**Version: 1.2.1.** See [CHANGELOG.md](CHANGELOG.md) for the full release
-history.
+**Version: 1.3.0.** See [CHANGELOG.md](CHANGELOG.md) for the full release
+history. Project home:
+[github.com/frostedflaming0/timechain-agent](https://github.com/frostedflaming0/timechain-agent).
 
 ## What this is
 
@@ -118,6 +119,31 @@ security patches in its dependencies. For long-running deployments
 that need reproducibility, freeze your working set with
 `pip freeze > requirements-lock.txt` and install from the lock file
 afterwards.
+
+### Using an existing chain
+
+The agent reads its chain from `timechain_data/` (set by `DATA_DIR` in
+`run.py`). To run against a chain from elsewhere, drop that folder in — or
+point `DATA_DIR` at it — and start as usual; `run.py` reuses it instead of
+committing a new genesis.
+
+- **Bring `operator.key`.** It's the Ed25519 signing key. With it, new records
+  continue the same signing identity. Without it, `run.py` generates a fresh
+  key: old records still verify (each carries its own pubkey), but new records
+  are signed differently and `/verify` will flag the mix.
+- **`embeddings.sqlite` is a derived index, not part of the chain.** The
+  minimum you need is `chain.sqlite` (plus `operator.key`); the embedding store
+  is rebuilt from the chain on first launch (`indexed N pre-existing records`).
+  If you bring a store built with a different embedder and hit an
+  `EMBEDDING STORE MISMATCH` at startup, just delete it and restart
+  (`rm timechain_data/embeddings.sqlite*`).
+- **Older (pre-v1.3) chains read fine** — new record types and `_meta` fields
+  default non-destructively, and there are no immune/consensus sidecars to
+  carry over (they're created on demand). To re-embed already-indexed records
+  with your current embedder rather than just the missing ones, run `/migrate`.
+- The **sealed genesis is authoritative** for the founding commitments. If
+  `FOUNDING_COMMITMENTS` in `run.py` differs from what's sealed, you get a
+  non-blocking drift **warning** at startup; the sealed values win.
 
 ### Embeddings (optional but recommended)
 
@@ -319,7 +345,7 @@ A few practical notes:
   OpenRouter, and DeepSeek (the providers that report a finish reason).
   `LLM_MAX_TOKENS` only sets a ceiling — you are billed for tokens actually
   generated, so raising it costs nothing on short replies.
-- **Context budget.** `CONTEXT_BUDGET_CHARS` in `run.py` (default 80,000)
+- **Context budget.** `CONTEXT_BUDGET_CHARS` in `run.py` (default 150,000)
   caps how much retrieved memory is packed into one prompt. It is a
   ceiling, not a target: turns with little relevant history use less. The
   two knobs are related — a long response becomes a large record that then
@@ -353,13 +379,20 @@ The web UI uses the same configuration as `run.py` (it imports
 module). To change the model, system prompt, or founding commitments,
 edit `run.py` — both interfaces pick up the change.
 
+The header links to two reference pages: a **Commands** page (`/commands`)
+documenting every slash command — what it does and why you'd use it — and an
+**Audit** dashboard (`/audit`) showing chain metrics, domain context, the
+faculty surface (modality/sense categories), a searchable ring inspector that
+shows each ring's full contents and `_meta`, and the blockspace.
+
 All slash commands from the REPL work the same way:
 
-- `/verify` `/length` `/seal` `/sysprompt`
-- `/reflect`
-- `/cambium` `/proposals` `/modalities`
-- `/revise N <text>`
-- `/file <path>`
+- `/verify` `/verify-semantic` `/length` `/seal` `/sysprompt`
+- `/reflect` `/revise N <text>` `/cambium` `/cambium-full` `/proposals` `/modalities`
+- `/file <path>` `/export-capsule <path>` `/import-capsule <path>`
+- `/verify-source <idx>` `/poq <text>` `/immune-status` `/immune-scan` `/lockdown` `/rollback <N>`
+- `/recall-index` `/recall-fetch <ids>` `/recall <query>` `/think <query>`
+- `/consensus-init` `/consensus-verify` `/cambium-grow <text>` `/migrate` `/continuum-resume` `/continuum-validate`
 
 Drag and drop a file anywhere on the page to ingest it without needing
 `/file`. Images are rendered inline in chat; PDFs and other documents
@@ -394,10 +427,52 @@ You can run `run.py` and `webapp.py` against the same chain at different
 times, but not simultaneously — both want exclusive access to the SQLite
 database and the signing key. Pick one interface per session.
 
+## Cognitive faculties (v1.3)
+
+v1.3 adds a layer of cognitive self-model faculties on top of the signed
+chain, keeping the project's neutral, non-experiential vocabulary. Eight new
+stdlib-only modules, each a thin adaptation over `ring_compat.py` (which
+presents repo `Record`s in the "ring" shape the faculty logic expects). The
+cryptographic core is untouched; old chains read and verify unchanged.
+
+| Capability | Module | What it adds |
+|---|---|---|
+| verify-source | `source_verify.py` | re-check an ingested file vs. disk (git-aware) |
+| PoQ verdicts | `poq.py` | `SEAL`/`REVISE`/`FORCE_UNCERTAINTY`/`REJECT` + a model-judgment seam |
+| immune system | `immune.py` | screen / scan / lockdown / rollback / scar-learning |
+| Continuum | `continuum.py` | long-horizon tasking in data-height blocks with full state refresh |
+| Recall | `recall.py` | self-label → index → fetch (the model is the relevance judge) |
+| Chronosynaptic | `chronosynaptic.py` | single-pass parallel-self MCTS, collapse to a `synthesis` |
+| Consensus | `consensus.py` | k-of-n witness quorum attestation over the recomputed hash |
+| faculties + growth | `faculties.py` | data-faculty registries + Cambium sprout/promote |
+
+Two behavioral changes are wired into the turn loop:
+
+- **Immune screening is on by default** (`Agent(enable_immune=True)`). It
+  refuses covenant/character violations and known attack scars at the
+  membrane; prompt-injection still flows to the existing PoQ-quarantine path,
+  so the two membranes are complementary.
+- **PoQ verdict enforcement is opt-in** (`Agent(enforce_verdict=True)`) —
+  because the verdicts run on lexical proxies by default. Pass a
+  `score_hook` to drive verdicts with a real model judgment (the
+  `external_scores` seam) before enabling hard output-suppression.
+
+New REPL commands are listed by `/cypher-help` (`/verify-source`, `/poq`,
+`/immune-status`, `/recall-index`, `/think`, `/consensus-verify`,
+`/cambium-grow`, `/migrate`, …). See `CHANGELOG.md` (v1.3.0) for the full
+release notes.
+
 ## Limitations
 
 A short list of things the codebase doesn't try to do, so deployment
 choices are informed.
+
+- **The v1.3 immune screen and PoQ verdicts run on lexical proxies.** Like
+  the rest of the signal stack, the covenant/scar/grounding/assertiveness
+  scorers are deterministic English word-list heuristics, so they can
+  misjudge. That is why verdict enforcement (output-suppression) is opt-in and
+  immune screening is kept narrow. The real judgment is meant to enter through
+  the `external_scores` / `score_hook` seam, where a model overrides the proxy.
 
 - **Signal detectors are English-only.** The lexicons in `signals.py`
   (intent verbs, vulnerability markers, confusion markers, resolution
@@ -439,6 +514,23 @@ choices are informed.
   as above; recurring patterns in another language will not cluster
   reliably under the same signature.
 
+- **Response records under-retrieve relative to their importance.**
+  `response` records commit at a flat default salience (`0.40`), so in
+  the salience-weighted retrieval blend they rank below reflections,
+  principles, and genesis even when the response was load-bearing — a
+  substantive explanation, or a short forward commitment the agent must
+  stay consistent with later. Two mechanisms mitigate this: **semantic
+  relevance dominates selection** (weight `0.55` vs `0.25` for salience),
+  so a response that's relevant to the query still surfaces; and
+  **observation/response turn-pair stitching** pulls a response in with its
+  observation (and vice versa) so a retrieved half brings its partner. An
+  earlier `artifact_content` *salience boost* (lifting code/structured
+  responses toward `ARTIFACT_SALIENCE_MAX`) was **removed** — it was a
+  query-independent size/type proxy that biased the salience-pure budget
+  truncation toward long code records regardless of relevance. Making
+  response salience *earned by substance* (not by code-ness) remains the
+  most promising future direction.
+
 ## Tests
 
 Run the full test suite with pytest:
@@ -477,7 +569,22 @@ inflected verb forms, the short/holistic/no-match fall-through paths to
 full text, the excerpt's matched/context labeling, and verified ~70%
 budget savings on a 66k-char document with a targeted query), full
 agent workflow integrity, genesis drift detection, context-budget
-truncation, and time formatting. 256 tests pass.
+truncation, and time formatting. **310 tests pass** (3 skipped — they
+need the optional webapp dependency set).
+
+The v1.3 cognitive faculties (see below) ship two additional standalone test
+suites that run without pytest or numpy where possible:
+
+```bash
+python test_cypher_port.py          # 109 tests — the ported modules (numpy-free)
+python test_cypher_integration.py   # 30 tests — agent loop wiring (needs numpy)
+```
+
+They cover the PoQ verdict ladder, immune screen/scan/lockdown/rollback/scar,
+Continuum chunking + state refresh + validate, Recall index/fetch/verify-source,
+Chronosynaptic collapse, Consensus quorum (including a forged-record-fails check),
+faculty growth/promotion, the proof-of-work nonce, the historic-chain `migrate`
+backfill, and the agent screen/verdict/seam integration.
 
 ## How it differs from "chatbot with memory"
 
@@ -532,5 +639,5 @@ original architect. This project preserves that attribution above.
 
 ## Status
 
-Prototype, version 1.2.1. Works end-to-end. Not production-hardened. Issues
+Prototype, version 1.3.0. Works end-to-end. Not production-hardened. Issues
 and PRs welcome.

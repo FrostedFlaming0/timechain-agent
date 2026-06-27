@@ -528,6 +528,133 @@ async def chain_verify_semantic(request: Request):
     }
 
 
+# ---------------------------------------------------------------------------
+# Experience Capsules — signed export / verified import (issue #8)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/capsule/export")
+async def capsule_export(request: Request):
+    """
+    Export shareable history as a signed Experience Capsule (capsule.py).
+
+    Mirrors the `/export-capsule` REPL command. Exposure gating is enforced
+    in `capsule.export_capsule`: `private` and `quarantine` records never
+    leave; `summary`-exposed records export summary-only with a signed
+    summary commitment; `shared`/`public` export in full. The response is the
+    JSON capsule document — the caller saves it as a `.cphyx` file.
+
+    Optional query params narrow the selection (all optional):
+      - type: only records of this type
+      - min_salience: float floor
+      - after_ms / before_ms: timestamp window (ms since epoch)
+      - tags: comma-separated tag list
+
+    Requires a session token: an export crosses the agent's trust boundary
+    (it emits signed memory), so it must not be anonymous.
+
+    Returns 400 if the selection is empty after filtering (CapsuleError),
+    rather than writing a meaningless empty capsule.
+    """
+    _require_session(request)
+    import capsule as _capsule
+    qp = request.query_params
+    kwargs: dict = {"title": qp.get("title", "webapp export")}
+    if qp.get("type"):
+        kwargs["type_filter"] = qp.get("type")
+    if qp.get("min_salience"):
+        try:
+            kwargs["min_salience"] = float(qp.get("min_salience"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="min_salience must be a number")
+    for bound in ("after_ms", "before_ms"):
+        if qp.get(bound):
+            try:
+                kwargs[bound] = int(qp.get(bound))
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"{bound} must be an integer")
+    if qp.get("tags"):
+        kwargs["tags"] = [t.strip() for t in qp.get("tags").split(",") if t.strip()]
+    try:
+        cap = _capsule.export_capsule(state.chain, **kwargs)
+    except _capsule.CapsuleError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    ok, msg = _capsule.verify_capsule(cap)
+    return {
+        "ok": ok,
+        "message": msg,
+        "capsule_id": cap["capsule_id"],
+        "record_count": cap["header"]["record_count"],
+        "capsule": cap,
+    }
+
+
+@app.post("/api/capsule/import")
+async def capsule_import(request: Request):
+    """
+    Verify and import an Experience Capsule (capsule.py).
+
+    Mirrors the `/import-capsule` REPL command and keeps the same
+    verify-before-import discipline: the capsule is fully verified (every
+    record's origin signature, content hashes, record hashes, summary
+    commitments, the Merkle root, and the capsule id) BEFORE anything is
+    imported. A capsule that fails any check is rejected wholesale (400) —
+    never partially imported. Imported records are appended as
+    `imported_capsule`, attributed to the origin agent with `peer_agent`
+    source, recorded with a cautious epistemic class and forced-`private`
+    exposure, and deduplicated by `capsule_id`. Append-only — the local
+    chain's own `/verify` is unaffected.
+
+    Body: the capsule JSON, either as the raw capsule object or wrapped as
+    `{"capsule": {...}}` (the shape `/api/capsule/export` returns).
+
+    Requires a session token: import mutates the chain.
+    """
+    _require_session(request)
+    import capsule as _capsule
+    from metadata import build_meta as _build_meta
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="body must be valid JSON")
+    cap = body.get("capsule") if isinstance(body, dict) and "capsule" in body else body
+    if not isinstance(cap, dict):
+        raise HTTPException(status_code=400, detail="no capsule object in body")
+    ok, msg = _capsule.verify_capsule(cap)
+    if not ok:
+        # Verification failure is a client/data error, not a server fault.
+        raise HTTPException(status_code=400, detail=f"capsule did not verify: {msg}")
+    try:
+        # Run inline on the event-loop thread, NOT via asyncio.to_thread:
+        # import_capsule writes to `state.chain`, whose SQLite connection was
+        # opened with check_same_thread=True and cannot legally be used from a
+        # worker thread (the same reason the streaming turn does its
+        # commit_response on the loop thread while only the LLM call is
+        # offloaded). The expensive part — full cryptographic verification —
+        # already ran inline above via verify_capsule; the append loop here is
+        # cheap, so running it on the loop is fine.
+        res = _capsule.import_capsule(
+            state.chain, cap, build_meta_fn=_build_meta
+        )
+    except _capsule.CapsuleError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # Re-index any newly appended records so they are immediately retrievable.
+    if not res.get("skipped"):
+        try:
+            state.index.index_chain(state.chain)
+        except Exception:
+            # Indexing is best-effort here; the records are committed
+            # regardless and will be indexed on next boot if this fails.
+            pass
+    return {
+        "ok": True,
+        "verify_message": msg,
+        "imported_count": res["imported_count"],
+        "skipped": res["skipped"],
+        "reason": res["reason"],
+        "length": state.chain.length(),
+    }
+
+
 @app.get("/blobs/{sha}")
 async def serve_blob(sha: str, session: Optional[str] = None,
                      request: Request = None):
@@ -738,6 +865,26 @@ async def run_command(request: Request, body: dict):
             state.index.index_record(rec)
             return {"kind": "file", "record": _record_to_dict(rec)}
 
+        # cypher-tempre port commands (/verify-source, /poq, /immune-*,
+        # /recall-*, /think, /consensus-*, /cambium-grow, /migrate,
+        # /continuum-*, /cypher-help). One dispatcher (cypher_commands.py) is
+        # the single source of truth shared with the REPL; it prints its
+        # output, which we capture and hand back for the UI to render as a
+        # system message. Runs under state.lock, like every other command.
+        import io
+        import contextlib
+        import cypher_commands
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            handled = cypher_commands.dispatch(cmd, state.chain, state.agent)
+        if handled:
+            return {
+                "kind": "cypher",
+                "command": cmd.split()[0],
+                "output": buf.getvalue().rstrip() or "(no output)",
+            }
+
         raise HTTPException(400, f"unknown command: {cmd}")
 
 
@@ -748,8 +895,10 @@ async def run_command(request: Request, body: dict):
 @app.post("/api/upload")
 async def upload_file(request: Request, file: UploadFile = File(...)):
     _require_session(request)
-    # Save to a temp path that preserves the original filename so the
-    # ingest pipeline records the right .ext and metadata.
+    # Save to a temp path (basename is random), keeping the original suffix.
+    # The REAL filename is passed to ingest_file via original_name so the record
+    # stores "CHANGELOG.md", not the temp basename — the retriever embeds the
+    # filename, so the user must be able to search by the real name.
     suffix = Path(file.filename or "upload").suffix
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         data = await file.read()
@@ -758,7 +907,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     try:
         async with state.lock:
             try:
-                rec = state.agent.ingest_file(tmp_path)
+                rec = state.agent.ingest_file(tmp_path, original_name=file.filename)
             except (ValueError, OSError) as e:
                 raise HTTPException(400, str(e))
             except HTTPException:
@@ -891,6 +1040,33 @@ async def turn_stream(request: Request, input: str, session: str):
         async with state.lock:
             agent = state.agent
             chain = state.chain
+
+            # 0. Immune screen FIRST — parity with Agent.turn(). The
+            # non-streaming /turn path gets this for free (it calls
+            # agent.turn()); the streaming path composes the steps by hand, so
+            # it must screen here too or it would silently diverge. A blocked
+            # input is refused at the membrane: an honest refusal is sealed (no
+            # LLM call), emitted, and the turn ends.
+            if agent.immune is not None:
+                _screen = agent.immune.screen(user_input)
+                if _screen.get("blocked"):
+                    refused = agent._refused_turn(user_input, _screen)
+                    state.index.index_record(refused.observation_record)
+                    state.index.index_record(refused.response_record)
+                    yield {
+                        "event": "observation",
+                        "data": json.dumps(_record_to_dict(refused.observation_record)),
+                    }
+                    yield {
+                        "event": "done",
+                        "data": json.dumps({
+                            "response": _record_to_dict(refused.response_record),
+                            "retrieved_indices": [],
+                            "truncated": False,
+                            "refused": True,
+                        }),
+                    }
+                    return
 
             # 1. Pre-LLM half: commit observation, retrieve, build prompt.
             # `prepare_turn` is the SAME method `Agent.turn` uses, so the
@@ -1031,12 +1207,13 @@ async def turn_stream(request: Request, input: str, session: str):
                 if poq_result.action == "quarantine":
                     done_payload["quarantined"] = True
 
-            yield {"event": "done", "data": json.dumps(done_payload)}
+            # Run auto-reflection and auto-Cambium BEFORE emitting `done`: the
+            # browser closes the EventSource on `done`, which cancels this
+            # generator, so anything yielded (or even run) after `done` can be
+            # skipped — diverging from the REPL / non-streaming path. Do it now.
 
-            # 4. Auto-reflection. The reflect() call itself makes an LLM
-            # call internally, so it blocks the loop briefly. Acceptable
-            # for now; if it becomes an issue, refactor Agent.reflect to
-            # split the LLM call out the way we did above.
+            # Auto-reflection. The reflect() call makes an LLM call internally,
+            # so it blocks the loop briefly; acceptable, and mirrors the REPL.
             if AUTO_REFLECT_EVERY > 0 and state.turns_since_reflect >= AUTO_REFLECT_EVERY:
                 reflection_rec = agent.reflect()
                 if reflection_rec is not None:
@@ -1064,6 +1241,30 @@ async def turn_stream(request: Request, input: str, session: str):
                     }
                 state.turns_since_cambium = 0
 
+            # `done` is the LAST event — the client closes the stream on it, so
+            # everything above (response commit, reflection, cambium) is already
+            # committed and streamed by the time the browser disconnects.
+            yield {"event": "done", "data": json.dumps(done_payload)}
+
+    return EventSourceResponse(event_source())
+
+
+@app.get("/api/migrate/stream")
+async def migrate_stream(request: Request, session: str):
+    """Stream the historic-chain backfill (re-embed every record) as SSE, so a
+    long migration shows progress instead of looking frozen. Emits `start`,
+    periodic `progress`, and a final `done` event. The work runs on the chain
+    connection's own thread (SQLite is thread-affine); `await sleep(0)` between
+    batches flushes each event and lets the loop serve other requests."""
+    _require_session(request)
+    import migrate as _migrate
+
+    async def event_source():
+        async with state.lock:
+            for ev in _migrate.reindex_stream(state.chain, state.index):
+                yield {"event": ev["phase"], "data": json.dumps(ev)}
+                await asyncio.sleep(0)
+
     return EventSourceResponse(event_source())
 
 
@@ -1075,16 +1276,61 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+def _serve_page(name: str) -> HTMLResponse:
+    path = STATIC_DIR / name
+    if not path.exists():
+        return HTMLResponse(f"<h1>missing static/{name}</h1>", status_code=500)
+    return HTMLResponse(path.read_text(encoding="utf-8"))
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    index_path = STATIC_DIR / "index.html"
-    if not index_path.exists():
-        return HTMLResponse(
-            "<h1>missing static/index.html</h1>"
-            "<p>expected at: " + str(index_path) + "</p>",
-            status_code=500,
-        )
-    return HTMLResponse(index_path.read_text(encoding="utf-8"))
+    return _serve_page("index.html")
+
+
+@app.get("/commands", response_class=HTMLResponse)
+async def commands_page():
+    """Reference page: what each slash command does and why you'd use it."""
+    return _serve_page("commands.html")
+
+
+@app.get("/audit", response_class=HTMLResponse)
+async def audit_page():
+    """The audit dashboard page (data from /api/audit)."""
+    return _serve_page("audit.html")
+
+
+@app.get("/api/audit")
+async def api_audit():
+    """Read-only audit snapshot for the dashboard. Ungated, like
+    /api/chain/status — it exposes the same chain summary data, no writes."""
+    import audit as _audit
+    from pathlib import Path as _Path
+    ok, _msg = state.chain.verify()
+    faculty_dir = _Path(__file__).resolve().parent.parent / "faculties"
+    blob_dir = DATA_DIR / "blobs"
+    result = _audit.compute(state.chain, faculty_dir, blob_dir=blob_dir, integrity=ok)
+    result["data_dir"] = str(DATA_DIR)
+    return result
+
+
+@app.get("/api/audit/ring/{idx}")
+async def api_audit_ring(idx: int):
+    """Full contents of one ring, for the audit dashboard's detail pane. The
+    /api/audit ring list carries only truncated summaries (to keep that payload
+    small); this returns the complete record on demand."""
+    rec = state.chain.get(idx)
+    if rec is None:
+        raise HTTPException(404, "no such ring")
+    import ring_compat as _rc
+    import recall as _recall
+    # rec.to_dict() carries everything: content (incl. _meta), refs, and all the
+    # cryptographic fields (prior/content/record hashes, signature, pubkey).
+    d = rec.to_dict()
+    d["timestamp_iso"] = datetime.fromtimestamp(
+        rec.timestamp / 1000, tz=timezone.utc).isoformat()
+    d["text"] = _recall.block_text(_rc.record_to_ring(rec))
+    return d
 
 
 # ---------------------------------------------------------------------------

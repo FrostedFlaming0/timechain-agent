@@ -187,64 +187,40 @@ def salience_for_commit(
     derived from its PoQResult. Returns an explicit salience value, or
     None to mean "use the type default."
 
-    It composes two signals that the metadata layer's flat default can't
-    express on its own:
+    Today it applies one adjustment to the flat default:
 
-    1. **Light-log demotion.** PoQ's `action` enum had three values —
-       commit, light_log, quarantine — but originally only `quarantine`
-       changed how a record was stored. A `light_log` response (PoQ judged
-       it low quality but not malicious) is demoted below baseline so it
-       ranks under higher-quality responses and drops first under prompt-
-       budget pressure. It stays on the chain and remains retrievable;
-       memory should be honest that the exchange happened.
+    **Light-log demotion.** A `light_log` response (PoQ judged it low quality
+    but not malicious) is demoted below baseline so it ranks under higher-
+    quality responses and drops first under prompt-budget pressure. It stays on
+    the chain and remains retrievable — memory should be honest that the
+    exchange happened.
 
-    2. **Artifact boost.** The flat 0.40 default for responses encodes the
-       assumption that the agent's own output is its least load-bearing
-       evidence — true for conversational chatter, false for substantive
-       artifacts. A response that is largely code or structured data (high
-       `poq_result.artifact_score`, from the artifact_content modality) is
-       boosted toward ARTIFACT_SALIENCE_MAX so it ranks where its substance
-       warrants. This is what lets the agent retrieve code it produced
-       several turns ago instead of having it decay at conversational
-       baseline.
+    **Removed: the artifact boost.** Earlier versions also boosted artifact-
+    heavy (code/structured) responses toward `ARTIFACT_SALIENCE_MAX`. That was
+    removed: artifact-ness is a query-independent size/type proxy, and letting
+    it set write-time salience biased the salience-pure budget truncation toward
+    long code records regardless of their relevance to the current query —
+    crowding out shorter but more relevant records. Semantic relevance (which
+    dominates selection) and observation/response turn-pair stitching carry
+    substantive responses instead. `poq_result.artifact_score` is still computed
+    and recorded on the record; it just no longer drives salience.
 
-    **Composition rule.** Demotion wins over boost. A low-quality response
-    that happens to contain code is still low-quality — PoQ's quality
-    judgment is the stronger signal, so a `light_log` turn is demoted
-    regardless of artifact score. Only a normally-committed response gets
-    the artifact boost. The two never both apply, so they can't race or
-    contradict; this function resolves them in one place rather than
-    leaving competing `salience=` overrides in the agent.
+    `modalities_activated` is accepted for callers that pass it but is not read
+    here.
 
-    `modalities_activated` is accepted for callers that pass it but is not
-    read here — the artifact signal is taken from `poq_result.artifact_score`
-    (a precise [0,1] value), not from mere presence of the modality name.
-
-    Calibration note: both the 0.5 light-log multiplier and the artifact
-    boost range are starting guesses, not measured values. See the
-    constants below; a long-running deployment with PoQ telemetry should
-    re-tune from data (track the rate at which boosted/demoted records are
-    retrieved AND used in the reply that follows — present in its refs —
-    and adjust so neither class is starved nor floods the budget).
+    Calibration note: the 0.5 light-log multiplier is a starting guess, not a
+    measured value; a long-running deployment with PoQ telemetry should re-tune
+    it from data.
     """
     action = getattr(poq_result, "action", None)
 
-    # 1. Demotion takes precedence: a low-quality response is demoted even
-    #    if it contains artifacts.
+    # Light-log demotion: a low-quality (not malicious) response is demoted.
     if action == "light_log":
         return default_salience * LIGHT_LOG_SALIENCE_MULTIPLIER
 
-    # 2. Artifact boost for normally-committed responses. Linear from the
-    #    default (at artifact_score 0) up to ARTIFACT_SALIENCE_MAX (at 1.0).
-    artifact_score = float(getattr(poq_result, "artifact_score", 0.0) or 0.0)
-    if artifact_score > 0.0:
-        boosted = default_salience + artifact_score * (
-            ARTIFACT_SALIENCE_MAX - default_salience
-        )
-        # Clamp defensively; never below default, never above the cap.
-        return max(default_salience, min(ARTIFACT_SALIENCE_MAX, boosted))
-
-    # 3. Pure prose at full quality: use the type default.
+    # Otherwise use the type default. (The former artifact boost — code/
+    # structured responses lifted toward ARTIFACT_SALIENCE_MAX — was removed;
+    # see the docstring. artifact_score is still recorded, just not applied.)
     return None
 
 
@@ -253,13 +229,11 @@ def salience_for_commit(
 # calibration note in `salience_for_commit`.
 LIGHT_LOG_SALIENCE_MULTIPLIER = 0.5
 
-# Ceiling salience for a maximally artifact-heavy response (artifact_score
-# == 1.0). A near-total code dump lands here; a mixed code-and-prose
-# response lands proportionally between the response default and this cap.
-# 0.70 sits above the response/observation baseline (0.40) and below
-# reflections (0.85) and revisions (0.80) — substantive output should
-# outrank conversational chatter without outranking the agent's
-# consolidated judgments. Tunable.
+# RETIRED. Former ceiling salience for a maximally artifact-heavy response.
+# The artifact boost it parameterized was removed (see `salience_for_commit`):
+# tying write-time salience to code/structure biased the salience-pure budget
+# truncation toward long code records regardless of relevance. Kept defined for
+# reference and backward-compatible imports; no longer applied.
 ARTIFACT_SALIENCE_MAX = 0.70
 
 

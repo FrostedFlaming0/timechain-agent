@@ -1,0 +1,126 @@
+/* Shared light theme for the auxiliary pages (commands, audit).
+   Mirrors the palette in index.html so the whole app feels like one product. */
+:root {
+  --bg: #fafaf7;
+  --panel: #ffffff;
+  --ink: #1a1a1a;
+  --muted: #6b6b6b;
+  --line: #e5e5e0;
+  --accent: #2d5d4f;
+  --warn: #b15a3a;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  min-height: 100vh;
+}
+
+/* Top bar / nav (same look as the main page header) */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 18px; border-bottom: 1px solid var(--line);
+  background: var(--panel); font-size: 13px; color: var(--muted);
+  position: sticky; top: 0; z-index: 5;
+}
+.topbar strong { color: var(--ink); }
+.topbar .nav a, .topbar .nav button {
+  border: 1px solid var(--line); padding: 4px 10px; border-radius: 4px;
+  color: var(--ink); font-size: 12px; text-decoration: none; margin-left: 4px;
+  background: none; cursor: pointer; font-family: inherit;
+}
+.topbar .nav a:hover, .topbar .nav button:hover { background: var(--bg); }
+.topbar .nav a.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
+.wrap { max-width: 1100px; margin: 0 auto; padding: 24px 18px 64px; }
+.eyebrow { font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--muted); }
+h1.page { font-size: 34px; margin: 2px 0 6px; letter-spacing: -0.01em; }
+.lead { color: var(--muted); margin: 0 0 18px; max-width: 70ch; line-height: 1.5; }
+.path-badge {
+  font-family: var(--mono); font-size: 12px; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; background: var(--panel);
+}
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); }
+
+/* Metric cards */
+.metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 18px 0 28px; }
+.metric .label { font-size: 12px; color: var(--muted); }
+.metric .value { font-size: 28px; font-weight: 600; margin-top: 4px; }
+.metric .value.pass { color: var(--accent); }
+.metric .value.fail { color: var(--warn); }
+
+/* Two-column layout */
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
+@media (max-width: 860px) { .cols { grid-template-columns: 1fr; } }
+.section-head { display: flex; align-items: baseline; justify-content: space-between; margin: 8px 0 12px; }
+.section-head h2 { font-size: 17px; margin: 0; }
+.section-head .note { font-size: 12px; color: var(--muted); }
+
+/* Progress bar */
+.bar { height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; margin: 6px 0; }
+.bar > span { display: block; height: 100%; background: var(--accent); }
+
+/* Domain cards */
+.domain { margin-bottom: 14px; }
+.domain .row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+.domain .name { font-weight: 600; }
+.domain .meta { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.kw { font-size: 12px; color: var(--muted); margin-top: 4px; line-height: 1.6; }
+.kw b { color: var(--ink); font-weight: 600; }
+
+/* Faculty surface */
+.fac-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.fac h4 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.fac .frow { margin-bottom: 9px; }
+.fac .frow .lbl { display: flex; justify-content: space-between; font-size: 13px; }
+.fac .frow .lbl .ct { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+
+/* Rings */
+.toolbar { display: flex; gap: 10px; margin-bottom: 12px; }
+.toolbar input, .toolbar select {
+  font: inherit; padding: 8px 10px; border: 1px solid var(--line);
+  border-radius: 6px; background: var(--panel); color: var(--ink);
+}
+.toolbar input { flex: 1; }
+.ring-split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 860px) { .ring-split { grid-template-columns: 1fr; } }
+.ring-list { max-height: 540px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding-right: 4px; }
+.ring { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; cursor: pointer; background: var(--panel); }
+.ring:hover { background: var(--bg); }
+.ring.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.ring .rh { display: flex; justify-content: space-between; align-items: baseline; }
+.ring .idx { font-weight: 600; }
+.ring .idx .type { color: var(--muted); font-weight: 400; }
+.ring .b { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.ring .sum { font-size: 13px; color: #333; margin: 6px 0; line-height: 1.45; white-space: pre-wrap; }
+.ring .tags { font-size: 12px; color: var(--muted); }
+.detail { border: 1px solid var(--line); border-radius: 8px; padding: 16px; background: var(--panel); min-height: 220px; position: sticky; top: 70px; }
+.detail .empty { color: var(--muted); }
+.detail pre { white-space: pre-wrap; word-wrap: break-word; font-family: var(--mono); font-size: 12px; line-height: 1.5; }
+.det-section { margin-top: 16px; }
+.det-section h5 { margin: 0 0 7px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.kv { display: grid; grid-template-columns: 140px 1fr; gap: 4px 10px; font-size: 13px; }
+.kv .k { color: var(--muted); }
+.kv .v { word-break: break-word; }
+.kv .v.mono { font-family: var(--mono); font-size: 12px; }
+.chips span { display: inline-block; font-size: 12px; padding: 2px 8px; border: 1px solid var(--line); border-radius: 999px; margin: 2px 4px 2px 0; color: var(--ink); background: var(--panel); }
+
+/* Blockspace */
+.blob { display: flex; align-items: center; justify-content: space-between; border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; background: var(--panel); }
+.blob .bn { font-weight: 600; }
+.blob .bh { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+
+/* Command reference */
+.cmd-group { margin: 26px 0 8px; }
+.cmd-group h2 { font-size: 16px; margin: 0 0 4px; }
+.cmd-group .gnote { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
+.cmd { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; background: var(--panel); }
+.cmd .name { font-family: var(--mono); font-weight: 600; color: var(--accent); font-size: 14px; }
+.cmd .what { margin: 6px 0 0; line-height: 1.5; }
+.cmd .why { margin: 4px 0 0; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.cmd .why b { color: var(--ink); font-weight: 600; }

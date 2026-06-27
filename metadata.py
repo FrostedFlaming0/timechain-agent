@@ -73,8 +73,18 @@ SOURCE_USER = "user"            # something the user said, captured verbatim
 SOURCE_ASSISTANT = "assistant"  # something the agent said or concluded
 SOURCE_SYSTEM = "system"        # operator config — system prompt, genesis
 SOURCE_TOOL = "tool"            # output from a tool call (file ingest, etc.)
+SOURCE_PEER_AGENT = "peer_agent"  # another agent's memory, imported via a
+                                  # signed Experience Capsule (capsule.py).
+                                  # Distinct from `tool`: a tool is something
+                                  # THIS agent ran; a peer_agent record is a
+                                  # claim ANOTHER agent authored and signed.
+                                  # Build spec calls this provenance
+                                  # `imported_capsule`; we use the broader
+                                  # `peer_agent` so any future agent-to-agent
+                                  # provenance shares one source value.
 
-VALID_SOURCES = {SOURCE_USER, SOURCE_ASSISTANT, SOURCE_SYSTEM, SOURCE_TOOL}
+VALID_SOURCES = {SOURCE_USER, SOURCE_ASSISTANT, SOURCE_SYSTEM, SOURCE_TOOL,
+                 SOURCE_PEER_AGENT}
 
 
 # Default source by record type, used when a record doesn't declare one.
@@ -98,6 +108,29 @@ DEFAULT_SOURCE_BY_TYPE = {
     "proposal_recurrence": SOURCE_ASSISTANT,
     "proposal_status":     SOURCE_ASSISTANT,
     "sprout_status":       SOURCE_ASSISTANT,
+    # Imported Experience Capsule records (capsule.py). Provenance is another
+    # agent's signed claims; the origin identity is preserved inside the
+    # record content, and the source is `peer_agent` so retrieval and PoQ can
+    # treat imported memory as third-party by source as well as by epistemic
+    # class.
+    "imported_capsule":    SOURCE_PEER_AGENT,
+    # Immune self-defense records (immune.py). `recovery` re-anchors the clean
+    # lineage after a compromise; `quarantine_marker` records a molted range.
+    # Both are the agent's own defensive bookkeeping (system-authored).
+    "recovery":            SOURCE_SYSTEM,
+    "quarantine_marker":   SOURCE_SYSTEM,
+    # Continuum long-horizon-task records (continuum.py). Tool-derived work
+    # ledger: a `task_open` opens a task, each `continuum` block ingests one
+    # data-height chunk carrying a full state refresh.
+    "task_open":           SOURCE_TOOL,
+    "continuum":           SOURCE_TOOL,
+    # Chronosynaptic collapse (chronosynaptic.py): the agent's own synthesis of
+    # the highest-truth perspective path.
+    "synthesis":           SOURCE_ASSISTANT,
+    # Cambium faculty growth (faculties.py): the agent's own endogenous upgrades.
+    "faculty":             SOURCE_ASSISTANT,
+    "faculty_recur":       SOURCE_ASSISTANT,
+    "promotion":           SOURCE_ASSISTANT,
 }
 
 
@@ -137,6 +170,21 @@ DEFAULT_EPISTEMIC_BY_TYPE = {
     "system_prompt": EPISTEMIC_KNOWN,
     "genesis":       EPISTEMIC_KNOWN,
     "file":          EPISTEMIC_KNOWN,
+    # Imported claims are never the importer's ground truth — default to
+    # inferred (capsule.py demotes stronger origin classes to this ceiling).
+    "imported_capsule": EPISTEMIC_INFERRED,
+    # Immune records describe a defensive event the agent reasoned to.
+    "recovery":          EPISTEMIC_INFERRED,
+    "quarantine_marker": EPISTEMIC_INFERRED,
+    # Continuum blocks ingest verified source/data chunks (sha-anchored).
+    "task_open":         EPISTEMIC_KNOWN,
+    "continuum":         EPISTEMIC_KNOWN,
+    # A synthesis is reasoned conclusion, not ground truth.
+    "synthesis":         EPISTEMIC_INFERRED,
+    # Faculty growth is the agent's own inferred self-upgrade.
+    "faculty":           EPISTEMIC_INFERRED,
+    "faculty_recur":     EPISTEMIC_INFERRED,
+    "promotion":         EPISTEMIC_INFERRED,
 }
 
 
@@ -165,6 +213,10 @@ VALID_EXPOSURES = {
 DEFAULT_EXPOSURE_BY_TYPE = {
     "genesis":       EXPOSURE_SUMMARY,
     "system_prompt": EXPOSURE_SUMMARY,
+    # A recovery record is part of the agent's identity history (private, but
+    # readable); a quarantine_marker is, by definition, untrusted content.
+    "recovery":          EXPOSURE_PRIVATE,
+    "quarantine_marker": EXPOSURE_QUARANTINE,
 }
 
 
@@ -196,6 +248,19 @@ DEFAULT_SALIENCE_BY_TYPE = {
     "system_prompt": 0.55,
     "observation":   0.40,
     "response":      0.40,
+    "imported_capsule": 0.35,
+    # A recovery is a significant self-event; a quarantine_marker is bookkeeping.
+    "recovery":          0.85,
+    "quarantine_marker": 0.50,
+    # Continuum blocks are a derived work-ledger — mid baseline salience.
+    "task_open":         0.55,
+    "continuum":         0.55,
+    # A synthesis is a deliberate, high-value reasoning artifact.
+    "synthesis":         0.80,
+    # Faculty growth records are durable capability upgrades — high salience.
+    "faculty":           0.75,
+    "faculty_recur":     0.60,
+    "promotion":         0.85,
 }
 
 
@@ -232,6 +297,19 @@ DEFAULT_HALF_LIFE_DAYS_BY_TYPE = {
     "file":          90.0,     # ~3 months
     "observation":   14.0,     # ~2 weeks
     "response":      14.0,
+    "imported_capsule": 120.0,  # ~4 months — attributed third-party memory
+    # Immune records are durable identity — a recovery should never decay out.
+    "recovery":          NO_DECAY_DAYS,
+    "quarantine_marker": NO_DECAY_DAYS,
+    # Continuum blocks are task-scoped work; a few months is plenty.
+    "task_open":         120.0,
+    "continuum":         120.0,
+    # A synthesis is consolidated judgment — long memory, like a reflection.
+    "synthesis":         180.0,
+    # Faculty upgrades are part of identity — they should not decay out.
+    "faculty":           NO_DECAY_DAYS,
+    "faculty_recur":     NO_DECAY_DAYS,
+    "promotion":         NO_DECAY_DAYS,
 }
 
 

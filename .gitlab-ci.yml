@@ -1,0 +1,71 @@
+# GitLab CI — port of .github/workflows/tests.yml
+#
+# Runs the full test suite on every push and merge request, across the
+# same Python versions as the GitHub Actions workflow (3.10–3.13).
+#
+# 3.10 is the floor — the code uses `list[T]` / `tuple[T, ...]` generics
+# without `from __future__ import annotations` at the use site, which
+# lower versions reject at runtime in some contexts. 3.13 catches
+# deprecation warnings early.
+#
+# Each job mirrors the GitHub steps: install core deps + pytest, then run
+# both runners. run_tests.py is the no-pytest fallback harness — keeping
+# both green means CI catches any divergence between the two runners.
+
+stages:
+  - test
+
+# Shared definition reused by each Python-version job below. GitLab has no
+# direct "matrix" for the version-in-image case as cleanly as Actions, so
+# we use the official python images as the per-version axis via `extends`.
+.test_template:
+  stage: test
+  # Don't let one Python version failing cancel the others.
+  allow_failure: false
+  cache:
+    key: "$CI_JOB_NAME"
+    paths:
+      - .cache/pip
+  variables:
+    PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  before_script:
+    - python -m pip install --upgrade pip
+    # Core hard deps. Optional deps (file ingest, web UI) aren't needed by
+    # the tests proper, but pytest itself is needed for the parametrized
+    # tests.
+    - pip install -r requirements.txt
+    - pip install pytest
+  script:
+    - pytest test_timechain.py -v
+    # Parity check: the no-pytest harness must stay green alongside pytest.
+    - python run_tests.py
+
+test:3.10:
+  extends: .test_template
+  image: python:3.10
+
+test:3.11:
+  extends: .test_template
+  image: python:3.11
+
+test:3.12:
+  extends: .test_template
+  image: python:3.12
+
+test:3.13:
+  extends: .test_template
+  image: python:3.13
+
+# Notes on the translation from GitHub Actions:
+#   - Actions' job matrix becomes four sibling jobs (one per image tag).
+#     The `.test_template` hidden job (leading dot) holds the shared body;
+#     each version job `extends` it and only sets its own `image`.
+#   - `actions/checkout` has no equivalent — GitLab clones the repo into
+#     every job automatically.
+#   - `actions/setup-python` is unnecessary: the python:X.Y Docker image
+#     ships the interpreter, so the image tag *is* the version selector.
+#   - `cache: pip` in setup-python becomes the explicit `cache:` block
+#     plus PIP_CACHE_DIR above.
+#   - `on: [push, pull_request]` maps to GitLab's default behaviour: jobs
+#     run on every push and on merge requests. `workflow_dispatch` (manual
+#     runs) is available from the GitLab UI without extra config.

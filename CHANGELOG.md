@@ -12,6 +12,353 @@ disk. Append-only means append-only, including for schema migrations.
 
 ---
 
+## v1.3.0
+
+A layer of cognitive self-model faculties, adapted to this repo's signed
+SQLite chain and its neutral, non-experiential vocabulary. Eight new
+storage-independent modules plus their REPL/agent/webapp integration. The cryptographic core is untouched and old chains read and
+verify unchanged; every new `_meta` field is emit-only-when-non-empty so
+historical records keep byte-identical canonical JSON. **No schema bump:**
+`schema_version` stays 3 — the one new persisted field, the PoQ `verdict`,
+lives inside the existing `_meta.poq` block and is emitted only when it is not
+the default `seal`. **310 pytest tests pass (3 webapp-dep skips); 139
+additional standalone tests cover the ported modules (109) and agent
+integration (30).**
+
+The single adapter that unlocks the port is `ring_compat.py`: it presents repo
+`Record`s in the skill's "ring" shape and seals skill-style payloads back
+through `chain.append` + `build_meta`, so the storage-independent cognitive
+logic ports essentially verbatim.
+
+### Added — verify-source (catch acting on stale ingested code)
+
+- `source_verify.py` — `verify_file_record(chain, idx, repo)` re-checks an
+  ingested `file` record against the live file on disk with git awareness;
+  verdicts: `verified`, `source-mismatch`, `revision-drift`, `dirty-worktree`,
+  `missing-source-file`, `no-source-path`, `not-a-file-record`, `missing-ring`.
+- `file_ingest.py` now captures `source_path`, `file_content_hash`, and git
+  coordinates on each ingest (additive, emitted only when present). REPL:
+  `/verify-source <idx> [repo]`.
+
+### Added — Proof-of-Quality verdicts (a quality gate with teeth)
+
+- `poq.py` gained a verdict layer on top of the existing brightness `action`:
+  `SEAL` / `REVISE` / `FORCE_UNCERTAINTY` / `REJECT`, driven by two new
+  measures (`measure_grounding`, `measure_assertiveness`) and the existing
+  covenant/consistency dimensions, with thresholds in one `PoQ_THRESHOLDS`
+  dict. `action` (commit/light_log/quarantine) is unchanged, so no existing
+  behavior shifts; `verdict` is additive and persisted in `_meta.poq` only
+  when it is not `seal`.
+- The model-judgment **seam**: `evaluate(..., external_scores=...)` lets a
+  real model override any dimension / grounding / assertiveness / the verdict,
+  so the lexical proxies are a runnable fallback, not the arbiter. REPL:
+  `/poq <text>`.
+
+### Added — immune system (detect, lock down, roll back, learn)
+
+- `immune.py` — `screen` (refuse a covenant-violating or known-scar input at
+  the membrane), `scan` (detect a compromise already sealed, using the repo's
+  Ed25519 `chain.verify()` for the tamper check), `lockdown`, `rollback`
+  (seal a `recovery` record, molt the wound into a learned scar, lift the
+  lock), and `status`. Derived state lives in a sidecar (`immune.json` +
+  `LOCKED`), never on the signed chain.
+- `chain.append` gained a one-line **lockdown gate**: while a `LOCKED` flag
+  exists next to the DB, only `recovery` records may be appended — no seal
+  path (REPL, webapp, reflection, cambium) can bypass it. Absent the flag (the
+  normal case) it is a single cheap stat and changes nothing. REPL:
+  `/immune-status`, `/immune-scan [text]`, `/lockdown`, `/rollback <height>`.
+
+### Added — per-turn loop discipline (the membrane wired into the turn)
+
+- `Agent.turn()` screens each input through the immune membrane FIRST
+  (`enable_immune=True` by default). Screening is deliberately narrow — it
+  refuses covenant/character violations and learned scars only; prompt-
+  injection stays on the existing PoQ-quarantine path, so the two membranes
+  are complementary (no regression to injection handling). A refused turn
+  makes no LLM call, seals the input as a quarantine observation, and emits an
+  honest refusal.
+- Verdict enforcement is **opt-in** (`enforce_verdict=False` by default,
+  because the repo's PoQ runs lexical proxies): when enabled, `REJECT`
+  suppresses the candidate (emitting a refusal) and `FORCE_UNCERTAINTY`
+  triggers one hedged rewrite. Wire `Agent(score_hook=...)` to make a real
+  model the judge via the `external_scores` seam.
+- The webapp streaming path (`turn_stream`) got the same screen, so the REPL
+  and web UI cannot diverge.
+
+### Added — Continuum (long-horizon tasking)
+
+- `continuum.py` — work jobs larger than any context window as a chain of
+  bounded **data-height** blocks, each carrying a full task-state refresh.
+  `open_task` / `ingest` / `walk` (tree ingest with source coordinates +
+  secret redaction) / `resume` (re-hydrate from the head block alone) /
+  `validate` (monotonic-progress invariants on top of `chain.verify()`). Code
+  chunks keep line ranges, path roles, language, and git coordinates. REPL:
+  `/continuum-resume`, `/continuum-validate`.
+
+### Added — Recall (the model is the relevance judge)
+
+- `recall.py` — `label` (self-label via the repo's `signals.py` faculties),
+  `index` (the compact map of memory), `fetch` (budget-bounded full content of
+  the blocks the model chose), `retrieve` (a cheap pre-filter that delegates
+  to the existing `Retriever`, never the arbiter), and `verify_source` for
+  Continuum blocks. REPL: `/recall-index`, `/recall-fetch <ids>`,
+  `/recall <query>`.
+
+### Added — Chronosynaptic tree (single-pass parallel-self reasoning)
+
+- `chronosynaptic.py` — fork faculty-lens perspectives of the agent, run
+  in-process MCTS (no subagents), and collapse to the single highest-truth
+  path, sealed as a `synthesis` record with the rejected forks preserved in
+  the payload. Perspectives are drawn from the `signals.py` registries and
+  scored by the repo's PoQ. `collapse_explicit_notes` is the preferred path
+  for model-supplied perspectives. REPL: `/think <query>`.
+
+### Added — Consensus (k-of-n quorum attestation)
+
+- `consensus.py` — a quorum of HMAC witnesses attests every chain head over
+  the **recomputed** `record_hash`, so a forged record (even one re-signed
+  with the operator key) fails consensus because the witnesses pinned the
+  original. `verify` requires both the Ed25519 chain verification AND k-of-n
+  agreement (`hmac.compare_digest`); up to n-k faulty witnesses are tolerated.
+  Config + attestations live in a sidecar, never on the chain. Honest scope:
+  single host = an authenticated quorum; distribute the witnesses for true
+  BFT. REPL: `/consensus-init [n] [k]`, `/consensus-verify`.
+
+### Added — faculties as data + Cambium growth
+
+- `faculties/{modalities,senses,emergent}.json` — descriptive data faculties
+  (84 modalities + 107 senses) used for relevance/overlap scoring, alongside
+  the executable `signals.py` detectors. `faculties.py` `load_corpus` unifies
+  both (data faculties + a bridge over the signal registry names).
+- `FacultyGarden.grow` — endogenous growth: when an input's dissonance exceeds
+  the floor, fuse two close faculties or sprout a fresh one, spawn it into the
+  emergent registry, and seal a `faculty` record; on the 3rd recurrence of the
+  same gap, **promote** it into the canonical data registry and seal a
+  `promotion` record. REPL: `/cambium-grow <text>`.
+
+### Added — proof-of-work "brightness" nonce (optional)
+
+- `chain.append(..., difficulty=N)` mines a nonce (stored inside
+  `content["_pow"]`) until `record_hash` has `N` leading hex zeros; `verify`
+  checks the target. The nonce is covered by `content_hash`, the Ed25519
+  signature, and the verify recompute. Default `difficulty=0` writes no `_pow`
+  field and is byte-identical to before.
+
+### Added — historic-chain migration
+
+- `migrate.py` `reindex(chain, index)` — a one-time, idempotent, **off-chain**
+  backfill that re-embeds every record into the embedding index with the
+  current embedder, so records sealed before an embedder change retrieve as
+  richly as new ones. It touches only the derived `embeddings.sqlite`, never
+  the signed records, so `chain.verify()` is unaffected. REPL: `/migrate`.
+
+### Added — new record types
+
+- `metadata.py` registers `recovery`, `quarantine_marker`, `task_open`,
+  `continuum`, `synthesis`, `faculty`, `faculty_recur`, and `promotion` across
+  the source / epistemic / exposure / salience / half-life default tables, so
+  each carries appropriate defaults under non-destructive read migration.
+
+### Changed — retrieval tuning
+
+- **Observation/response turn-pair stitching.** An observation and the response
+  that answers it are a single Q&A unit; `build_context` now completes any
+  half-retrieved pair (pull the response for a retrieved observation, and vice
+  versa). Type-checked and refs-corroborated so only a genuine pair is
+  completed, quarantine-respecting, and budget-safe (both halves are pinned so
+  truncation keeps them together). Idempotent.
+- **Removed the artifact salience boost.** Code/structured responses were
+  previously lifted toward `ARTIFACT_SALIENCE_MAX = 0.70`; that boost is gone.
+  Artifact-ness is a query-independent size/type proxy, and tying write-time
+  salience to it biased the salience-pure budget truncation toward long code
+  records regardless of relevance — crowding out shorter, more relevant
+  records. Responses now commit at the flat default; the light-log demotion is
+  unchanged, and `artifact_score` is still detected and recorded (it just no
+  longer drives salience). The `0.60` file default is unchanged (file records
+  render chunk-aware excerpts, so they don't crowd the budget).
+
+### Added — web UI: commands reference + audit dashboard
+
+- All slash commands now work in the web UI, routed through the shared
+  `cypher_commands.dispatch` (single source of truth with the REPL).
+- New **Commands** page (`/commands`) documenting every command — what it does
+  and why — and a new **Audit** dashboard (`/audit`, backed by `audit.py` +
+  `/api/audit`): metric cards, domain context, the faculty surface, a
+  searchable ring inspector that shows each ring's full contents and `_meta`,
+  and the blockspace. Both pages match the main page's light theme.
+- `/migrate` streams progress over SSE (`/api/migrate/stream`) so a long
+  embedding backfill shows live progress instead of looking frozen.
+
+### Fixed
+
+- **Uploaded files keep their real name.** A browser upload was saved to a temp
+  file before ingest, so the `file` record stored the temp basename (e.g.
+  `tmpXXXX.md`) instead of the real name (`CHANGELOG.md`). Since the retriever
+  embeds file records as `[file <filename> <kind>] <text>`, that broke
+  retrieval-by-name. `file_ingest`/`agent.ingest_file` gained an `original_name`
+  argument that the upload endpoint supplies. (Append-only: this fixes new
+  ingests; re-ingest an already-sealed file to get a correctly-named record.)
+
+### Notes
+
+- **Naming discipline.** The faculties keep this repo's neutral,
+  non-experiential register (PoQ is Proof-of-Quality), and the faculty data
+  ships with experiential codenames stripped.
+- **The lexical proxies are a fallback, not the arbiter.** Immune screening
+  and PoQ verdicts ship with deterministic proxies so they are runnable with
+  zero new dependencies; real judgment enters through the `external_scores` /
+  `score_hook` seam.
+- New modules are stdlib + `cryptography` only (numpy-free); the agent/recall
+  integration uses the existing numpy retriever. `/cypher-help` lists the new
+  REPL commands.
+
+---
+
+## v1.2.2
+
+A feature release tracing back to the project's build specification,
+kept inside the project's existing discipline (explicit named score
+components, emit-only-when-non-empty canonical JSON, non-destructive read
+migration, and the injection scan as the one detector that must never be
+gated off). Three primary features (modality routing, epistemic-class
+weighting, Experience Capsules) plus a round of follow-up hardening on top of
+them. No schema-breaking on-disk changes to the chain; the cryptographic core
+is untouched and old chains read unchanged. The capsule exchange format is
+version 2 (capsules are transient exchange artifacts, not persistent chain
+state). **313 tests pass.**
+
+### Added — modality routing (build spec section 4.6)
+
+- `SignalAnalyzer` gained a `route` flag. With `route=True` (the default for
+  the agent's PoQ analyzer), each turn runs a routed subset of detectors — a
+  mandatory core plus a small discretionary budget selected by a cheap
+  keyword prior — rather than the full bank, implementing the spec's "3-7
+  relevant modalities per task." This makes `modalities_activated` a real
+  per-turn decision rather than an activation-floor artifact. **Security
+  detectors (`integrity_field`, `injection_scan`) are never routed off**, and
+  every detector feeding a PoQ axis is mandatory, so PoQ scoring is identical
+  whether routing is on or off. `route=False` preserves the historical "run
+  everything" behavior byte-for-byte. New `Agent(route_modalities=...)` knob
+  (default True).
+- The discretionary keyword prior is intentionally kept crude. Profiling
+  showed routing yields only a ~1.04x speedup (~6µs/analyze) — the detectors
+  are genuinely that cheap — so routing's value is signal quality
+  (`modalities_activated` as a per-turn decision), not performance. A heavier
+  relevance scorer is not justified by the measured benefit; the finding is
+  documented in `signals.py` so it isn't re-litigated.
+
+### Added — epistemic-class weighting (build spec 4.2/4.5/4.7)
+
+The `epistemic_class` field (recorded since v1.2's v3 schema but previously
+invisible to scoring) is now load-bearing:
+
+- *Retrieval*: an opt-in `epistemic_weighting` flag (default on via
+  `build_context`) scales a record's score by how well-grounded it is —
+  `known`/`user_context` full weight, `inferred` ~unchanged,
+  `speculative`/`disputed` discounted. A new `epistemic_factor` /
+  `epistemic_class` pair appears in `RetrievalHit.components`. Off restores
+  class-blind scoring exactly. Verified to compose without surprising
+  interaction with the additive modality-anchoring term under budget
+  pressure (locked in with regression tests).
+- *PoQ*: a candidate that contradicts the chain is penalized in proportion to
+  the *authority* of the context it contradicts — contradicting a user-stated
+  fact raises more risk than contradicting the agent's own past guess. The
+  penalty is computed **per specific retrieved record**:
+  `contradiction_activation * topic_overlap(candidate, record) *
+  authority(class)`, taking the max — so a negating candidate only raises
+  risk against a high-authority record it is actually on-topic with, not an
+  unrelated fact. Opt-in via a `retrieved_epistemic` argument to
+  `PoQEvaluator.evaluate`; falls back to scalar (and ultimately inert,
+  historical) behavior when retrieved texts/classes aren't supplied.
+- *Write-time*: a strongly hedged response (high `uncertainty`) commits as
+  `speculative` rather than the default `inferred`, so later retrieval and
+  PoQ treat it as the guess it was.
+
+### Added — Experience Capsules (`capsule.py`, build spec `.cphyx` exchange)
+
+A signed, portable, verifiable bundle of selected Rings that another agent
+can verify and import. Built only from primitives the chain already has
+(Ed25519, SHA-256, canonical JSON, Merkle roots) — no network, no tokens, no
+consensus. Full format spec in `CAPSULE.md`.
+
+- *Export* gates records by `_meta.exposure` (the read-side of the
+  protected-zone membrane, now finally load-bearing): `private`/`quarantine`
+  never leave; `summary` exports summary-only (flagged `redacted`);
+  `shared`/`public` export in full. Commits a Merkle root and a
+  content-binding `capsule_id`. Selection can be narrowed by index list,
+  type, salience, timestamp window (`after_ms`/`before_ms`), and `tags` — for
+  exporting a focused slice of history rather than the whole chain.
+- *Redacted (summary-only) records carry a signed summary commitment*: the
+  origin's Ed25519 signature over a binding of (origin `record_hash` +
+  summary body). This makes the summary text verifiable in its own right — a
+  tampered or lifted summary is detected, not merely flagged. The commitment
+  message includes the origin record_hash so a signature can't be replayed
+  onto another record.
+- *Verify* re-checks every record's original signature against the origin
+  pubkey, content hashes, record hashes, summary commitments (for redacted
+  records), the Merkle root, and the capsule id. A capsule failing any check
+  is rejected wholesale — no partial trust in a tampered bundle.
+- *Import* appends records as a distinct `imported_capsule` type, attributed
+  to the origin agent with `source = peer_agent` (a new first-class source in
+  `metadata.VALID_SOURCES`, with a conservative PoQ `source_trust` weight),
+  recorded with a cautious epistemic class (never `known`; demoted to
+  `inferred` or weaker) and forced-`private` exposure, so imported memory is
+  never silently treated as the agent's own first-person history. Append-only;
+  `/verify` on the local chain is unaffected. Replay/dedup guard by
+  `capsule_id`.
+- *Surfaces*: REPL commands `/export-capsule <path>` and `/import-capsule
+  <path>`; session-gated webapp endpoints `GET /api/capsule/export` and `POST
+  /api/capsule/import` (same verify-before-import discipline — a capsule
+  failing verification is rejected with 400, never partially imported; newly
+  imported records are re-indexed so they're immediately retrievable).
+- New `imported_capsule` record-type defaults registered in `metadata.py`,
+  and the per-record prompt header shows `imported from <origin-fingerprint>`
+  for these records, reinforcing that they are foreign memory.
+
+### Changed
+
+- **System prompt (`run.py`).** The stale `epistemic: factual` example
+  (never a valid class) was corrected to the real set — `known`,
+  `user_context`, `inferred`, `speculative`, `disputed` — and a paragraph was
+  added explaining `imported_capsule` records as attributed third-party
+  memory. Operators running a custom system prompt may want to mirror these
+  edits. The per-record header rendering already surfaced `epistemic:` only on
+  non-default classes; it now carries a real signal because write-time
+  classification produces `speculative` on hedged responses.
+- **Chunk-aware context truncation.** `_truncate_to_budget` now sizes a file
+  record that will be rendered as a chunk-aware excerpt at the excerpt
+  ceiling rather than its full length, so a long but excerptable file is no
+  longer over-evicted under budget pressure. Mirrors the eligibility checks in
+  `_file_content_repr`; falls through to full-size estimation on any
+  uncertainty (short file, holistic query, no chunk matches).
+- **Sprouted-modality cap is now correct and loud.**
+  `SproutRegistry.load` previously sliced the raw JSON list to
+  `MAX_SPROUTED_MODALITIES` *before* building and de-duplicating, which was
+  both silent and subtly wrong — duplicates or malformed entries within the
+  first N positions could consume cap slots and silently push valid
+  modalities past the limit. Loading now builds and de-duplicates first, then
+  caps, and writes a warning to stderr naming how many modalities were dropped
+  and why. Still non-fatal (the module's always-start contract is preserved —
+  an oversized sprout file degrades to the capped set rather than crashing
+  boot); the cap value is unchanged. The warning points the operator at the
+  cap as the lever if they want more.
+
+### Migration
+
+None required at the chain level — all changes are additive; new `_meta`
+fields and record types read with safe defaults on older records, and
+`route_modalities` / `epistemic_weighting` default to on but are neutral where
+no signal is present.
+
+One exchange-format note: Experience Capsules use format version 2. The
+capsule format is for transient exchange artifacts, not on-disk chain state,
+so this affects only `.cphyx` files, never a chain. A v2 verifier requires
+summary commitments on redacted records; capsules with no redacted records are
+unaffected in practice, but the version check is strict, so re-export is the
+supported path for any older capsule.
+
+---
+
 ## v1.2.1
 
 A correctness-and-operations release from a multi-pass code review, plus
@@ -67,7 +414,8 @@ the upgrade carry it.
   the selected record is then rendered whole from the chain. Index-only —
   the signed chain still stores one record per turn/file; `/verify` is
   unaffected. Tunable via `CHUNK_TARGET_CHARS` and `CHUNK_SCHEME_VERSION`.
-  Known follow-up: `_truncate_to_budget` is not yet chunk-aware.
+  Known follow-up: `_truncate_to_budget` is not yet chunk-aware. (Resolved in
+  v1.2.2 — see the chunk-aware context truncation entry there.)
 - **`modalities_activated` on `_meta`.** Every response record now records
   which modality detectors (`signals.py`) fired with non-trivial activation
   in producing it — a data layer for retrieval to later weight or filter by
@@ -448,7 +796,7 @@ the upgrade carry it.
 
 ## v1.2
 
-Five capabilities from the Cypher Tempre build spec, all layered on top of
+Five capabilities from the project's build spec, all layered on top of
 the existing architecture rather than altering it. The framing is
 deliberately neutral engineering language: the detectors measure observable
 properties of text, "Proof-of-Quality" is a quality score, and no module

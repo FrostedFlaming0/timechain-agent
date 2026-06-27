@@ -51,10 +51,20 @@
       color: var(--ink); font-size: 12px;
     }
     header button:hover { background: var(--bg); }
+    header .navlink {
+      border: 1px solid var(--line); padding: 4px 10px; border-radius: 4px;
+      color: var(--ink); font-size: 12px; text-decoration: none; margin-left: 4px;
+    }
+    header .navlink:hover { background: var(--bg); }
 
     main {
       grid-area: main;
       overflow-y: auto;
+      /* A grid item defaults to min-height:auto, which lets it grow to fit its
+         content instead of being constrained to the 1fr track — so overflow-y
+         never engages and the page (not `main`) scrolls erratically. min-height:0
+         constrains it to the track so `main` is a real internal scroll container. */
+      min-height: 0;
       padding: 20px 18px;
     }
     .load-earlier {
@@ -155,6 +165,7 @@
       border-left: 1px solid var(--line);
       background: var(--panel);
       overflow-y: auto;
+      min-height: 0;   /* same grid scroll-container fix as `main` */
       padding: 14px;
       font-size: 13px;
     }
@@ -220,6 +231,8 @@
     <div><strong>timechain agent</strong> &middot; <span id="status">connecting...</span></div>
     <div>
       <span class="meta" id="chainmeta"></span>
+      <a href="/commands" class="navlink">commands</a>
+      <a href="/audit" class="navlink">audit</a>
       <button id="verifybtn" title="cryptographically verify the chain">verify</button>
     </div>
   </header>
@@ -246,7 +259,7 @@
       <textarea id="composer" placeholder="message... (or /command)" rows="1"></textarea>
       <button class="send" id="sendbtn">send</button>
     </div>
-    <div class="hint">enter to send, shift+enter for newline. drag files anywhere to ingest. /verify /reflect /cambium /proposals /seal /sysprompt /length /revise N text /file path</div>
+    <div class="hint">enter to send, shift+enter for newline. drag files anywhere to ingest.<br>commands: /verify /verify-semantic /length /seal /sysprompt /reflect /cambium /cambium-full /proposals /modalities /revise N text /file path /export-capsule path /import-capsule path /cypher-help /verify-source N /poq text /immune-status /immune-scan /lockdown /rollback N /recall-index /recall-fetch ids /recall query /think query /consensus-init /consensus-verify /cambium-grow text /migrate /continuum-resume /continuum-validate</div>
   </div>
 
 <script>
@@ -256,6 +269,30 @@
 let SESSION = null;
 let SENDING = false;
 const main = document.getElementById('main');
+
+// Keep the newest content in view until the user deliberately scrolls away.
+// Token events can arrive faster than deferred scroll events, so wheel/touch
+// input flips follow mode off immediately. It resumes when the user reaches
+// the bottom again, or when a new outbound message explicitly jumps there.
+let AUTO_FOLLOW = true;
+let LAST_MAIN_SCROLL_TOP = 0;
+
+function atBottom(threshold = 24) {
+  return main.scrollHeight - main.scrollTop - main.clientHeight <= threshold;
+}
+function keepScroll(update) {
+  const shouldFollow = AUTO_FOLLOW && atBottom(80);
+  update();
+  if (shouldFollow) {
+    main.scrollTop = main.scrollHeight;
+    LAST_MAIN_SCROLL_TOP = main.scrollTop;
+  }
+}
+function scrollToBottom() {
+  AUTO_FOLLOW = true;
+  main.scrollTop = main.scrollHeight;
+  LAST_MAIN_SCROLL_TOP = main.scrollTop;
+}
 const composer = document.getElementById('composer');
 const sendbtn = document.getElementById('sendbtn');
 const attachbtn = document.getElementById('attachbtn');
@@ -285,8 +322,7 @@ function placeTurn(div, opts) {
   if (opts.anchor) {
     main.insertBefore(div, opts.anchor);
   } else {
-    main.appendChild(div);
-    main.scrollTop = main.scrollHeight;
+    keepScroll(() => main.appendChild(div));
   }
 }
 
@@ -437,6 +473,7 @@ async function loadHistory({ older = false } = {}) {
       // Keep the viewport pinned to what the user was reading: grow from
       // the top, so add the height delta to scrollTop.
       main.scrollTop = prevTop + (main.scrollHeight - prevHeight);
+      LAST_MAIN_SCROLL_TOP = main.scrollTop;
     } else {
       // Initial load: render ascending (oldest at top) and scroll to
       // bottom so the newest message is visible, like a fresh session.
@@ -444,6 +481,7 @@ async function loadHistory({ older = false } = {}) {
         renderHistoryRecord(rec);
       }
       main.scrollTop = main.scrollHeight;
+      LAST_MAIN_SCROLL_TOP = main.scrollTop;
     }
 
     if (d.oldest_index !== null && d.oldest_index !== undefined) {
@@ -558,9 +596,15 @@ async function send() {
   try {
     if (text.startsWith('/')) {
       addTurn('you', text);
-      await runCommand(text);
+      scrollToBottom();
+      if (text.trim() === '/migrate') {
+        await runMigrateStream();   // long backfill — stream progress, not a single blocking call
+      } else {
+        await runCommand(text);
+      }
     } else {
       addTurn('you', text);
+      scrollToBottom();
       await runTurn(text);
     }
   } finally {
@@ -637,6 +681,8 @@ function renderCommandResult(d) {
     else addSystemTurn(`revision at #${d.record.index} corrects #${d.target_index}`);
   } else if (d.kind === 'file') {
     addFileTurn(d.record);
+  } else if (d.kind === 'cypher') {
+    addSystemTurn(`${d.command}\n${d.output}`);
   } else {
     addSystemTurn(JSON.stringify(d));
   }
@@ -655,8 +701,7 @@ async function runTurn(text) {
   const indicator = document.createElement('div');
   indicator.className = 'typing-indicator';
   indicator.innerHTML = '<span></span><span></span><span></span>';
-  agentBody.appendChild(indicator);
-  main.scrollTop = main.scrollHeight;
+  keepScroll(() => agentBody.appendChild(indicator));
 
   let buffer = '';
   let firstTokenSeen = false;
@@ -667,14 +712,15 @@ async function runTurn(text) {
     es.addEventListener('token', (ev) => {
       try {
         const d = JSON.parse(ev.data);
-        // Replace the indicator with the actual text on the first chunk.
-        if (!firstTokenSeen) {
-          agentBody.textContent = '';  // clears the indicator div
-          firstTokenSeen = true;
-        }
-        buffer += d.text;
-        agentBody.textContent = buffer;
-        main.scrollTop = main.scrollHeight;
+        keepScroll(() => {
+          // Replace the indicator with the actual text on the first chunk.
+          if (!firstTokenSeen) {
+            agentBody.textContent = '';  // clears the indicator div
+            firstTokenSeen = true;
+          }
+          buffer += d.text;
+          agentBody.textContent = buffer;
+        });
       } catch (e) {}
     });
     es.addEventListener('reflection', () => {
@@ -734,6 +780,43 @@ async function runTurn(text) {
   });
 }
 
+async function runMigrateStream() {
+  // Re-embed every record (historic-chain backfill) with live progress, so a
+  // long migration is visibly moving rather than looking frozen. Mirrors
+  // runTurn's SSE pattern; updates a single system line as progress arrives.
+  const url = `/api/migrate/stream?session=${encodeURIComponent(SESSION)}`;
+  const body = addSystemTurn('migrate: starting…');
+  return new Promise((resolve) => {
+    const es = new EventSource(url);
+    es.addEventListener('start', (ev) => {
+      keepScroll(() => {
+        try { const d = JSON.parse(ev.data);
+          body.textContent = `migrate: re-embedding ${d.total} record(s) into the index…`;
+        } catch (e) {}
+      });
+    });
+    es.addEventListener('progress', (ev) => {
+      keepScroll(() => {
+        try { const d = JSON.parse(ev.data);
+          body.textContent = `migrate: ${d.done}/${d.total} re-embedded…`;
+        } catch (e) {}
+      });
+    });
+    es.addEventListener('done', (ev) => {
+      try { const d = JSON.parse(ev.data);
+        body.textContent = `migrate: done — reindexed ${d.reindexed}/${d.total}`
+          + (d.failed ? ` (${d.failed} failed)` : '')
+          + '  (off-chain backfill — signed records untouched)';
+      } catch (e) {}
+      es.close();
+      resolve();
+    });
+    es.onerror = () => {
+      if (es.readyState === EventSource.CLOSED) { es.close(); resolve(); }
+    };
+  });
+}
+
 // =========================================================================
 // File upload
 // =========================================================================
@@ -781,6 +864,26 @@ fileinput.addEventListener('change', (e) => {
 verifybtn.addEventListener('click', async () => {
   addTurn('you', '/verify');
   await runCommand('/verify');
+});
+
+main.addEventListener('scroll', () => {
+  const currentTop = main.scrollTop;
+  if (currentTop < LAST_MAIN_SCROLL_TOP) {
+    AUTO_FOLLOW = false;
+  } else if (atBottom()) {
+    AUTO_FOLLOW = true;
+  }
+  LAST_MAIN_SCROLL_TOP = currentTop;
+});
+main.addEventListener('wheel', (e) => {
+  if (e.deltaY < 0) AUTO_FOLLOW = false;
+}, { passive: true });
+main.addEventListener('touchmove', () => {
+  AUTO_FOLLOW = false;
+}, { passive: true });
+document.addEventListener('keydown', (e) => {
+  if (e.target === composer) return;
+  if (['ArrowUp', 'PageUp', 'Home'].includes(e.key)) AUTO_FOLLOW = false;
 });
 
 // Drag-and-drop anywhere on the page

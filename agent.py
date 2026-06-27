@@ -38,8 +38,12 @@ from metadata import (
     EPISTEMIC_USER_CONTEXT,
     EPISTEMIC_INFERRED,
     DEFAULT_EPISTEMIC_BY_TYPE,
+    EXPOSURE_QUARANTINE,
 )
-from poq import PoQEvaluator, PoQResult
+from poq import (
+    PoQEvaluator, PoQResult,
+    VERDICT_SEAL, VERDICT_REJECT, VERDICT_FORCE_UNCERTAINTY,
+)
 from cambium import Cambium
 import protected_zones
 from llm_clients import was_truncated
@@ -243,6 +247,12 @@ class ProtectedZoneError(Exception):
 
 
 class Agent:
+    # Uncertainty activation at or above which a response is committed as
+    # `speculative` rather than the default `inferred` (write-time epistemic
+    # classification; see score_response). Set well above the analyzer's
+    # activation floor (~0.2) so only clearly-hedged responses reclassify.
+    _EPISTEMIC_SPECULATIVE_UNCERTAINTY = 0.6
+
     def __init__(
         self,
         chain: Chain,
@@ -252,6 +262,10 @@ class Agent:
         context_char_budget: int = 80_000,
         blob_dir: Optional[Path] = None,
         enable_poq: bool = True,
+        route_modalities: bool = True,
+        enable_immune: bool = True,
+        enforce_verdict: bool = False,
+        score_hook: Optional[Callable] = None,
     ):
         """
         context_char_budget: approximate maximum characters in the assembled
@@ -281,8 +295,50 @@ class Agent:
         self.enable_poq = enable_poq
         # PoQ evaluator and Cambium detector. Both are stateless beyond
         # their configuration, so one instance each is reused across turns.
-        self.poq = PoQEvaluator() if enable_poq else None
+        #
+        # Modality routing (build spec section 4.6): when route_modalities is
+        # True (default), the PoQ analyzer runs a routed subset of detectors
+        # per turn — the mandatory security + PoQ-feeding core plus a small
+        # discretionary budget — rather than the full bank. This makes
+        # `modalities_activated` a real per-turn decision and cuts wasted work
+        # as the detector bank grows. Security detectors (integrity_field,
+        # injection_scan) are never routed off; see signals.MANDATORY_*.
+        # Set route_modalities=False to restore the historical "run every
+        # detector every turn" behavior.
+        self.route_modalities = route_modalities
+        if enable_poq:
+            from signals import SignalAnalyzer
+            self.poq = PoQEvaluator(
+                analyzer=SignalAnalyzer(route=route_modalities)
+            )
+        else:
+            self.poq = None
         self.cambium = Cambium()
+
+        # Immune membrane (immune.py). Default ON: a conservative, low-false-
+        # positive pre-seal screen of each input (covenant-violation proxy /
+        # known attack scar / injection alert). It only refuses clearly-hostile
+        # input; benign turns are unaffected. Set enable_immune=False to disable.
+        if enable_immune:
+            from immune import Immune
+            self.immune = Immune(self.chain, covenant=self.covenant())
+        else:
+            self.immune = None
+
+        # Verdict enforcement (poq.py hard-gate). OPT-IN (default off) because
+        # the repo's PoQ runs lexical PROXIES, and hard-suppressing output on a
+        # proxy is the "proxy, not the seam" anti-pattern. When True, a REJECT
+        # verdict suppresses the candidate (an honest refusal is sealed instead)
+        # and FORCE_UNCERTAINTY triggers one hedged rewrite. Pair with
+        # `score_hook` so a real model judgment drives the verdict, not the proxy.
+        self.enforce_verdict = enforce_verdict
+
+        # The model-judgment seam: an optional callable
+        # (user_input, response_text, context) -> dict of external_scores that
+        # overrides PoQ dimensions / grounding / assertiveness / verdict. This
+        # is how a deployment makes the MODEL the judge (the skill's intended
+        # path) rather than the lexical proxy. None preserves proxy scoring.
+        self.score_hook = score_hook
 
     def commit_genesis(
         self,
@@ -497,7 +553,8 @@ class Agent:
         )
 
     def score_response(
-        self, user_input: str, response_text: str, context: list[Record]
+        self, user_input: str, response_text: str, context: list[Record],
+        external_scores: Optional[dict] = None,
     ) -> tuple[Optional[PoQResult], dict]:
         """
         Run Proof-of-Quality scoring on a candidate response.
@@ -523,12 +580,20 @@ class Agent:
         retrieved_texts = [
             self.retriever.index.record_to_text(r) for r in context
         ]
+        # Epistemic class of each retrieved record, parallel to
+        # retrieved_texts — lets PoQ weight a candidate's contradiction of the
+        # chain by how authoritative the contradicted context is (build spec
+        # 4.2/4.5). Read from each record's _meta with the same safe defaults
+        # the rest of the system uses.
+        retrieved_epistemic = [read_meta(r).epistemic_class for r in context]
         poq_result = self.poq.evaluate(
             user_input=user_input,
             candidate=response_text,
             retrieved_texts=retrieved_texts,
             input_source=SOURCE_USER,
             covenant=self.covenant(),
+            retrieved_epistemic=retrieved_epistemic,
+            external_scores=external_scores,
         )
         response_meta_kwargs["poq"] = poq_result.to_meta()
         # Record which modality detectors fired on the candidate response —
@@ -546,6 +611,18 @@ class Agent:
         # exist so the agent can read back how a turn felt when revisiting it.
         if poq_result.activated_senses:
             response_meta_kwargs["senses_activated"] = poq_result.activated_senses
+        # Write-time epistemic classification (build spec 4.2). A response
+        # defaults to `inferred` (the agent's own reasoning). When the
+        # candidate is strongly hedged — the `uncertainty` sense fired well
+        # above the activation floor — classify it `speculative` instead, so
+        # the chain records it as the flagged guess it was. Later retrieval
+        # (epistemic weighting) and PoQ (epistemic contradiction risk) both
+        # read this, so a hedged answer is grounded-upon less readily than a
+        # confident one. Threshold is deliberately conservative: only clear
+        # hedging reclassifies, ordinary prose stays `inferred`.
+        from metadata import EPISTEMIC_SPECULATIVE
+        if poq_result.uncertainty >= self._EPISTEMIC_SPECULATIVE_UNCERTAINTY:
+            response_meta_kwargs["epistemic_class"] = EPISTEMIC_SPECULATIVE
         exposure = protected_zones.exposure_for_commit(poq_result)
         if exposure is not None:
             response_meta_kwargs["exposure"] = exposure
@@ -597,9 +674,75 @@ class Agent:
             refs=refs,
         )
 
+    # ----- immune / verdict enforcement helpers (loop discipline) -----
+
+    @staticmethod
+    def _refusal_text(poq_result: Optional[PoQResult]) -> str:
+        note = (poq_result.notes[-1] if poq_result and poq_result.notes
+                else "quality gate")
+        return ("I'm not able to give that answer — it did not pass the "
+                f"Proof-of-Quality gate ({note}).")
+
+    def _hedged_rewrite(self, prep: TurnPrep, candidate: str) -> str:
+        """One cheap rewrite of a confident-but-ungrounded candidate, hedged as
+        honest uncertainty (FORCE_UNCERTAINTY enforcement)."""
+        instruction = (
+            "Rewrite the following answer as honest uncertainty: keep only what "
+            "is supported, hedge claims you cannot ground, and state plainly what "
+            "you are unsure of.\n\nANSWER:\n" + candidate)
+        kwargs = dict(prep.llm_kwargs) if prep.llm_kwargs else {}
+        try:
+            return self.llm(instruction, **kwargs) if kwargs else self.llm(instruction)
+        except Exception:
+            return "I'm not fully certain, but: " + candidate
+
+    def _refused_turn(self, user_input: str, screen: dict) -> AgentTurn:
+        """The turn returned when immune.screen refuses an input. The hostile
+        input is sealed as a QUARANTINE observation (auditable, never retrieved)
+        and an honest refusal is sealed as the response — no LLM call is made, so
+        the wound is never reasoned from."""
+        reason_bits = []
+        if screen.get("scar"):
+            reason_bits.append(f"matches known attack {screen['scar']}")
+        if screen.get("injection_alert"):
+            reason_bits.append("injection signal")
+        if self.immune is not None and screen.get("covenant", 1.0) < self.immune.floor:
+            reason_bits.append("covenant-violation signal")
+        reason = ", ".join(reason_bits) or "safety membrane"
+        obs = self.chain.append(
+            "observation",
+            {"text": user_input,
+             "_meta": build_meta("observation", source=SOURCE_USER,
+                                 epistemic_class=EPISTEMIC_USER_CONTEXT,
+                                 exposure=EXPOSURE_QUARANTINE)},
+        )
+        refusal_text = ("I can't act on that — it was refused at the safety "
+                        f"membrane ({reason}).")
+        resp = self.chain.append(
+            "response",
+            {"text": refusal_text,
+             "_meta": build_meta("response", source=SOURCE_ASSISTANT)},
+            refs=[obs.record_hash],
+        )
+        return AgentTurn(
+            observation_record=obs,
+            retrieved=[],
+            response_record=resp,
+            response_text=refusal_text,
+            poq=None,
+        )
+
     def turn(
         self, user_input: str, retrieve_k: int = 5, n_recent: int = 15
     ) -> AgentTurn:
+        # Immune screen FIRST (opt-out via enable_immune). Refuse a clearly-
+        # hostile input at the membrane before it is reasoned from or sealed as
+        # ordinary memory. Benign input passes straight through.
+        if self.immune is not None:
+            screen = self.immune.screen(user_input)
+            if screen.get("blocked"):
+                return self._refused_turn(user_input, screen)
+
         # Thin orchestration over prepare_turn / LLM / score_response /
         # commit_response. The streaming endpoint composes the same steps
         # but interleaves the LLM call with SSE yields.
@@ -621,15 +764,48 @@ class Agent:
         # informed action rather than a guess.
         response_truncated = was_truncated(self.llm)
 
+        # The model-judgment seam: if a score_hook is configured, it produces
+        # external_scores that override the lexical proxies — so the verdict
+        # below reflects a real judge, not a heuristic.
+        external_scores = None
+        if self.score_hook is not None:
+            try:
+                external_scores = self.score_hook(user_input, response_text, prep.context)
+            except Exception:
+                external_scores = None
+
         # Proof-of-Quality: score the candidate response before commit.
-        # This does NOT change what the user sees — `response_text` is
-        # returned either way. It changes how the turn is recorded in
-        # memory: a normal turn commits ordinarily; a turn PoQ judges to
-        # be an attack is committed with exposure=quarantine so retrieval
-        # never feeds it back. See poq.py and protected_zones.py.
+        # This does NOT change what the user sees (unless verdict enforcement
+        # is on) — `response_text` is returned either way. It changes how the
+        # turn is recorded in memory: a normal turn commits ordinarily; a turn
+        # PoQ judges to be an attack is committed with exposure=quarantine so
+        # retrieval never feeds it back. See poq.py and protected_zones.py.
         poq_result, response_meta_kwargs = self.score_response(
-            user_input, response_text, prep.context
+            user_input, response_text, prep.context, external_scores=external_scores
         )
+
+        # Verdict enforcement (opt-in via enforce_verdict). Gives the quality
+        # gate real teeth WITHOUT changing default behavior:
+        #   REJECT            -> suppress the candidate; emit + seal an honest
+        #                        refusal instead (do not say it).
+        #   FORCE_UNCERTAINTY -> one hedged rewrite, re-scored, then emitted.
+        # REVISE/SEAL are unchanged. Only active when enforce_verdict is set.
+        if (self.enforce_verdict and poq_result is not None
+                and poq_result.verdict in (VERDICT_REJECT, VERDICT_FORCE_UNCERTAINTY)):
+            if poq_result.verdict == VERDICT_REJECT:
+                # Suppress the candidate; emit an honest refusal. Keep the
+                # original REJECT verdict on the returned turn so the caller
+                # sees WHY the answer was withheld, and seal the refusal
+                # carrying that verdict in its _meta.
+                response_text = self._refusal_text(poq_result)
+                response_meta_kwargs = {"confidence": 0.5,
+                                        "poq": poq_result.to_meta()}
+            else:  # FORCE_UNCERTAINTY -> one hedged rewrite
+                response_text = self._hedged_rewrite(prep, response_text)
+                response_truncated = was_truncated(self.llm)
+                poq_result, response_meta_kwargs = self.score_response(
+                    user_input, response_text, prep.context,
+                    external_scores=external_scores)
 
         # Persist the truncation flag on the response record's _meta. A
         # later turn (e.g. the user typing "continue") needs to know
@@ -867,11 +1043,16 @@ class Agent:
     # the chain record makes the file searchable and provenance-checked.
     # -----------------------------------------------------------------
 
-    def ingest_file(self, path: str | Path) -> Optional[Record]:
+    def ingest_file(self, path: str | Path,
+                    original_name: Optional[str] = None) -> Optional[Record]:
         """
         Append a 'file' record for `path`. Stores the file's bytes as a
         blob (content-addressed by sha256) and records extracted text
         plus metadata on the chain.
+
+        `original_name`: the file's real name when `path` is a temporary copy
+        (e.g. a browser upload) — so the record keeps the real filename the
+        retriever embeds and the user searches by.
 
         Returns the new record, or raises if the file is missing,
         unsupported, or too large. Returns None only if no blob_dir
@@ -882,7 +1063,8 @@ class Agent:
                 "Agent.ingest_file requires blob_dir to be configured "
                 "in the Agent constructor"
             )
-        result: IngestResult = _ingest_file(path, self.blob_dir)
+        result: IngestResult = _ingest_file(
+            path, self.blob_dir, original_name=original_name)
         content = result.to_record_content()
         content["_meta"] = build_meta(
             "file",
@@ -1323,6 +1505,7 @@ class Agent:
         records: list[Record],
         fixed_overhead_chars: int,
         pinned_indices: Optional[set[int]] = None,
+        user_input: Optional[str] = None,
     ) -> tuple[list[Record], list[Record]]:
         """
         Drop lowest-salience records until the total rendered context fits
@@ -1364,13 +1547,55 @@ class Agent:
         pinned = pinned_indices or set()
         budget = max(0, self.context_char_budget - fixed_overhead_chars)
 
-        def render_size(rec: Record) -> int:
-            try:
-                return len(json.dumps(rec.content, ensure_ascii=False))
-            except (TypeError, ValueError):
-                return len(str(rec.content))
+        # Worst-case rendered size of a file record that will be shown as a
+        # chunk-aware excerpt rather than in full (issue #9). The excerpt path
+        # surfaces at most TOP_N_MATCHED_CHUNKS matched chunks plus one
+        # neighbor on each side (3x), at ~CHUNK_TARGET_CHARS each, plus a
+        # header line. Estimating the full content for such a record made
+        # truncation over-count its footprint and evict records that would
+        # actually have fit once excerpted. We import CHUNK_TARGET_CHARS from
+        # retrieval lazily to avoid a hard import dependency here.
+        try:
+            from retrieval import CHUNK_TARGET_CHARS as _CHUNK_CHARS
+        except Exception:
+            _CHUNK_CHARS = 3500
+        excerpt_ceiling = self.TOP_N_MATCHED_CHUNKS * 3 * _CHUNK_CHARS + 200
 
-        sized = [(r, render_size(r) + 80) for r in records]  # +80 for label/wrapping
+        def will_be_excerpted(rec: Record) -> bool:
+            """Mirror the eligibility checks in `_file_content_repr` so the
+            size estimate matches what the prompt will actually render. A
+            record is excerpted only if it is a long file, the task is not
+            holistic, and the most recent retrieval recorded chunk matches for
+            it. Any uncertainty falls through to 'render full' (False), which
+            is the safe over-estimate."""
+            if rec.type != "file":
+                return False
+            c = rec.content if isinstance(rec.content, dict) else {}
+            full_text = c.get("extracted_text", "") or ""
+            if len(full_text) <= self.SHORT_FILE_THRESHOLD_CHARS:
+                return False
+            if user_input is not None and is_holistic_task(user_input):
+                return False
+            chunk_matches = getattr(
+                self.retriever.index, "last_chunk_matches", {}
+            ) or {}
+            return bool(chunk_matches.get(rec.index))
+
+        def render_size(rec: Record) -> int:
+            # A record that will be excerpted is sized at the excerpt ceiling,
+            # not its full content — otherwise a 200k-char file counts its
+            # whole length against the budget even though only ~9 chunks will
+            # render. Cap at the actual content size (the ceiling can exceed a
+            # mid-size file's true length).
+            try:
+                full = len(json.dumps(rec.content, ensure_ascii=False))
+            except (TypeError, ValueError):
+                full = len(str(rec.content))
+            if will_be_excerpted(rec):
+                return min(full, excerpt_ceiling) + 80
+            return full + 80
+
+        sized = [(r, render_size(r)) for r in records]
         total = sum(s for _, s in sized)
         if total <= budget:
             return records, []
@@ -1555,7 +1780,8 @@ class Agent:
         # see the historical behavior.
         pinned = getattr(self.retriever, "last_pinned_indices", set()) or set()
         all_recs, dropped = self._truncate_to_budget(
-            list(context), fixed_overhead, pinned_indices=pinned
+            list(context), fixed_overhead, pinned_indices=pinned,
+            user_input=user_input,
         )
 
         ctx_blocks = []
@@ -1653,14 +1879,17 @@ class Agent:
             #   epistemic: X      — appears only when the record's
             #                      `_meta.epistemic_class` differs from the
             #                      type's default (e.g. a `response` whose
-            #                      class is `factual` instead of the usual
-            #                      `inferred`, or `speculative` instead).
-            #                      Names how the content is known — the one
-            #                      distinction the model cannot derive from
-            #                      the content alone. Default-matching
-            #                      records show no tag, keeping headers
-            #                      terse: a `response` tagged `inferred`
-            #                      (the default) is silent; only the
+            #                      class is `speculative` instead of the usual
+            #                      `inferred`, or `known`/`user_context`
+            #                      instead). Names how the content is known —
+            #                      the one distinction the model cannot derive
+            #                      from the content alone. The valid classes
+            #                      are `known`, `user_context`, `inferred`,
+            #                      `speculative`, and `disputed` (see
+            #                      metadata.VALID_EPISTEMIC_CLASSES).
+            #                      Default-matching records show no tag,
+            #                      keeping headers terse: a `response` tagged
+            #                      `inferred` (the default) is silent; only the
             #                      atypical case surfaces.
             extras = [
                 f"size={len(content_repr)} chars",
@@ -1692,6 +1921,17 @@ class Agent:
             )
             if meta.epistemic_class and meta.epistemic_class != default_epistemic:
                 extras.append(f"epistemic: {meta.epistemic_class}")
+            # Imported-capsule provenance: an imported_capsule record is
+            # another agent's memory (source is already `peer_agent`, which
+            # shows in the tag line). Add a short origin fingerprint so the
+            # model can see WHICH peer it came from and never conflate two
+            # peers' imported memories — and so the foreign-ness is
+            # unmistakable, reinforcing the system-prompt guidance to treat
+            # these as third-party claims rather than first-person history.
+            if rec.type == "imported_capsule" and isinstance(rec.content, dict):
+                origin = rec.content.get("origin_pubkey")
+                if isinstance(origin, str) and origin:
+                    extras.append(f"imported from {origin[:12]}…")
             tag_line = (
                 f"[record {rec.index} | {tag} | {meta.source} | {when} "
                 f"| {' | '.join(extras)}]"

@@ -43,8 +43,12 @@ def build_fixtures(param_names: list[str], workdir: Path) -> dict:
     return {k: v for k, v in out.items() if k in param_names}
 
 
-def run_one(method, instance) -> tuple[bool, str]:
-    """Run a single test method, building fixtures as needed."""
+def run_one(method, instance):
+    """Run a single test method, building fixtures as needed.
+
+    Returns (status, detail). status is True (passed), False (failed), or
+    the string "skip" when the test called pytest.skip().
+    """
     sig = inspect.signature(method)
     workdir = Path(tempfile.mkdtemp(prefix="ttest-"))
     fixtures = {}
@@ -52,7 +56,16 @@ def run_one(method, instance) -> tuple[bool, str]:
         fixtures = build_fixtures(list(sig.parameters), workdir)
         method(**fixtures)
         return True, ""
-    except Exception:
+    except BaseException as e:
+        # pytest.skip() raises _pytest.outcomes.Skipped, which derives from
+        # BaseException (NOT Exception), so a bare `except Exception` lets it
+        # escape and crash the harness. Treat it as a skip instead. Matching
+        # on the class name keeps this runner pytest-import-free.
+        if type(e).__name__ == "Skipped":
+            return "skip", str(e)
+        # Let genuine interpreter-level signals through.
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
         return False, traceback.format_exc()
     finally:
         for v in fixtures.values():
@@ -91,7 +104,10 @@ def main() -> int:
                 print(f"  SKIP {full_name} (parametrized — needs pytest)")
                 continue
             ok, err = run_one(method, instance)
-            if ok:
+            if ok == "skip":
+                skipped += 1
+                print(f"  SKIP {full_name} ({err})")
+            elif ok:
                 passed += 1
                 print(f"  ok   {full_name}")
             else:
@@ -100,7 +116,7 @@ def main() -> int:
                 print(f"  FAIL {full_name}")
 
     print()
-    print(f"results: {passed} passed, {failed} failed, {skipped} skipped (parametrized)")
+    print(f"results: {passed} passed, {failed} failed, {skipped} skipped")
     if failures:
         print()
         for name, tb in failures:

@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -291,8 +292,16 @@ class SproutRegistry:
         """
         Load from a JSON file. Returns an empty registry if the file is
         missing or malformed (logged-shaped, never raised) — the system must
-        always start, just without sprouted modalities. Caps the number of
-        modalities loaded at MAX_SPROUTED_MODALITIES.
+        always start, just without sprouted modalities.
+
+        Caps the registry at MAX_SPROUTED_MODALITIES, but does so AFTER
+        building and de-duplicating, and warns to stderr if the cap actually
+        bit. Capping the raw list before filtering (the previous behavior)
+        was both silent and subtly wrong: it could discard valid entries
+        beyond position N while keeping duplicates or malformed entries
+        within it. Filtering first means the cap applies to real, distinct
+        modalities, and the warning tells the operator their sprout file
+        outgrew the limit instead of silently losing capability.
         """
         p = Path(path)
         if not p.exists():
@@ -306,12 +315,26 @@ class SproutRegistry:
             return cls(modalities=[], path=p)
         built: list = []
         seen: set = set()
-        for entry in raw[:MAX_SPROUTED_MODALITIES]:
+        for entry in raw:
             m = build_modality(entry)
             if m is None or m.name in seen:
                 continue
             seen.add(m.name)
             built.append(m)
+        if len(built) > MAX_SPROUTED_MODALITIES:
+            dropped = len(built) - MAX_SPROUTED_MODALITIES
+            # Loud, but non-fatal — consistent with this module's
+            # always-start contract. Keep the highest-priority slice
+            # (registry order is the file's order, which is stable).
+            sys.stderr.write(
+                f"[sprouted_modalities] WARNING: {len(built)} valid "
+                f"modalities in {p.name} exceeds MAX_SPROUTED_MODALITIES "
+                f"({MAX_SPROUTED_MODALITIES}); keeping the first "
+                f"{MAX_SPROUTED_MODALITIES}, dropping {dropped}. Prune the "
+                f"sprout file or raise the cap to stop losing modalities.\n"
+            )
+            sys.stderr.flush()
+            built = built[:MAX_SPROUTED_MODALITIES]
         return cls(modalities=built, path=p)
 
     def save(self, path=None) -> None:

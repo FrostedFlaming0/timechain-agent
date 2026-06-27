@@ -42,6 +42,8 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
 
+from source_verify import current_git_info
+
 
 # Maximum extracted text length stored in a record (chars). Longer files
 # get truncated with a marker. Tunable; 40K chars is roughly 10K tokens.
@@ -98,10 +100,21 @@ class IngestResult:
     extracted_text: str
     extraction_method: str
     extraction_truncated: bool
+    # Source coordinates (additive). `source_path` is captured on every
+    # ingest so `source_verify.py` can re-check the live file; the git_*
+    # fields are populated only when the file lives inside a git worktree.
+    # All are emitted into the record content only when present, so a record
+    # ingested before this feature — or a non-git ingest — keeps byte-identical
+    # canonical JSON and old readers are unaffected.
+    source_path: Optional[str] = None
+    file_content_hash: Optional[str] = None
+    git_commit: Optional[str] = None
+    git_branch: Optional[str] = None
+    git_dirty: Optional[bool] = None
 
     def to_record_content(self) -> dict:
         """Shape suitable for chain.append('file', content=this)."""
-        return {
+        content = {
             "filename": self.filename,
             "ext": self.ext,
             "kind": self.kind,
@@ -113,6 +126,19 @@ class IngestResult:
             "extraction_truncated": self.extraction_truncated,
             "schema_version": 1,
         }
+        # Emit source coordinates only when captured — keeps the canonical
+        # JSON of pre-feature / non-git ingests unchanged (additive rule).
+        if self.source_path is not None:
+            content["source_path"] = self.source_path
+        if self.file_content_hash is not None:
+            content["file_content_hash"] = self.file_content_hash
+        if self.git_commit is not None:
+            content["git_commit"] = self.git_commit
+        if self.git_branch is not None:
+            content["git_branch"] = self.git_branch
+        if self.git_dirty is not None:
+            content["git_dirty"] = self.git_dirty
+        return content
 
 
 # ---------------------------------------------------------------------------
@@ -142,10 +168,17 @@ def ingest_file(
     path: str | Path,
     blob_dir: str | Path,
     max_bytes: int = DEFAULT_MAX_FILE_BYTES,
+    original_name: Optional[str] = None,
 ) -> IngestResult:
     """
     Read a file, store its bytes content-addressed in `blob_dir`, and
     return an IngestResult ready to be turned into a chain record.
+
+    `original_name`: the file's real name, when `path` is a temporary copy (e.g.
+    a browser upload). It becomes the record's `filename` and drives the
+    extension — important because the retriever embeds file records as
+    "[file <name> ...]", so the name the user searches by must be the real one,
+    not a temp basename. Falls back to the on-disk name for direct path ingests.
 
     Raises FileNotFoundError, ValueError (unsupported), or OSError (too big).
     """
@@ -153,7 +186,8 @@ def ingest_file(
     if not p.is_file():
         raise FileNotFoundError(p)
 
-    ext = p.suffix.lower()
+    display_name = Path(original_name).name if original_name else p.name
+    ext = Path(display_name).suffix.lower()
     if ext not in ALL_SUPPORTED:
         raise ValueError(f"unsupported file type: {ext}")
 
@@ -174,10 +208,14 @@ def ingest_file(
         blob_path.write_bytes(raw)
 
     kind = classify_kind(ext)
-    text, method, truncated = _extract_text(raw, ext, kind, p.name)
+    text, method, truncated = _extract_text(raw, ext, kind, display_name)
+
+    # Capture source coordinates so a later recall can verify the live file
+    # hasn't drifted (source_verify.py). git_* are empty for non-versioned files.
+    git = current_git_info(p)
 
     return IngestResult(
-        filename=p.name,
+        filename=display_name,
         ext=ext,
         kind=kind,
         size_bytes=size,
@@ -186,6 +224,11 @@ def ingest_file(
         extracted_text=text,
         extraction_method=method,
         extraction_truncated=truncated,
+        source_path=str(p),
+        file_content_hash=sha,
+        git_commit=git.get("commit"),
+        git_branch=git.get("branch"),
+        git_dirty=git.get("dirty"),
     )
 
 

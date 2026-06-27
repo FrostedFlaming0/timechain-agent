@@ -965,6 +965,46 @@ class Retriever:
     # Risk dimension at or above this level triggers the risk penalty.
     RISK_THRESHOLD = 0.4
 
+    # ----- epistemic weighting (build spec sections 4.2 / 4.7) -----
+    #
+    # Every record carries an `epistemic_class` in its _meta (metadata.py):
+    # how the writer knows the content — `known`, `user_context`, `inferred`,
+    # `speculative`, or `disputed`. Until now this field was recorded and
+    # displayed but invisible to retrieval scoring: a speculative guess and a
+    # user-stated fact competed on equal footing. That is an honesty gap — the
+    # agent should preferentially ground its answers in what it actually knows
+    # over what it once guessed.
+    #
+    # The fix is a multiplicative factor on the final score, applied AFTER the
+    # weighted base + penalties (like the superseded/risk penalties, not like
+    # the additive modality term). A multiplier rather than an additive term
+    # because epistemic standing should scale a record's whole relevance, not
+    # add a fixed quantity regardless of how relevant it otherwise is: a
+    # barely-relevant `known` record shouldn't leapfrog a highly-relevant one
+    # just for being known, but between two similarly-relevant records the
+    # better-grounded one should win.
+    #
+    # Calibration: `known` and `user_context` are ground truth (the user said
+    # it, or it's a verified file) — full weight. `inferred` is the agent's
+    # own reasoning — very slightly discounted. `speculative` is a flagged
+    # guess — discounted more. `disputed` is known to conflict with another
+    # record — discounted hard (but NOT removed: the chain stays honest about
+    # its history, and the revision-aware pull-in already surfaces disputes
+    # alongside their corrections). An unknown/again-defaulted class is
+    # treated as `inferred`.
+    #
+    # This is OPT-IN. `epistemic_weighting=False` (the historical behavior)
+    # makes every factor 1.0 so scoring is byte-for-byte unchanged for callers
+    # and tests that don't ask for it.
+    EPISTEMIC_FACTORS = {
+        "known":        1.0,
+        "user_context": 1.0,
+        "inferred":     0.97,
+        "speculative":  0.85,
+        "disputed":     0.65,
+    }
+    EPISTEMIC_FACTOR_DEFAULT = 0.97  # treat unknown class as `inferred`
+
     # ----- helpers -----
 
     def _superseded_indices(self) -> set[int]:
@@ -999,6 +1039,7 @@ class Retriever:
         recency_weight: Optional[float] = None,  # back-compat; overrides W_RECENCY
         salience_weights: Optional[dict] = None,  # back-compat; ignored if None
         query_modalities: Optional[set] = None,
+        epistemic_weighting: bool = False,
     ) -> list[RetrievalHit]:
         """
         Semantic search plus per-record salience, per-kind recency decay,
@@ -1119,7 +1160,20 @@ class Retriever:
             risk_penalty = (
                 self.RISK_PENALTY if risk_value >= self.RISK_THRESHOLD else 0.0
             )
-            base_minus = base - penalty - risk_penalty
+            # Epistemic weighting (build spec 4.2/4.7): scale the positive
+            # base by how well-grounded the record is, BEFORE subtracting
+            # penalties. Applied to `base` (not `base_minus`) so it scales the
+            # record's earned relevance, while the superseded/risk penalties
+            # remain absolute subtractions that act the same regardless of
+            # epistemic class. Neutral (1.0) when the feature is off, so the
+            # arithmetic is identical to before for callers that don't opt in.
+            if epistemic_weighting:
+                epi_factor = self.EPISTEMIC_FACTORS.get(
+                    meta.epistemic_class, self.EPISTEMIC_FACTOR_DEFAULT
+                )
+            else:
+                epi_factor = 1.0
+            base_minus = (base * epi_factor) - penalty - risk_penalty
             components = {
                 "semantic": float(sim),
                 "salience": float(meta.salience),
@@ -1129,6 +1183,8 @@ class Retriever:
                 "risk": risk_value,
                 "source": meta.source,
                 "confidence": float(meta.confidence),
+                "epistemic_class": meta.epistemic_class,
+                "epistemic_factor": float(epi_factor),
             }
             scratch.append((rec, base_minus, m_overlap, weight_factor, components))
 
@@ -1199,6 +1255,7 @@ class Retriever:
         type_filter: Optional[str] = None,
         anchor_modalities: bool = True,
         query_modalities: Optional[set] = None,
+        epistemic_weighting: bool = True,
     ) -> list[Record]:
         """
         Blend semantic hits with recent records, dedup, return in
@@ -1229,6 +1286,13 @@ class Retriever:
         the original claim and its correction together — that's the
         point of keeping both around.
 
+        Turn-pair stitching: an observation and the response that answers
+        it are a single Q&A unit. When only one half is retrieved, the
+        other half is pulled in (type-checked and refs-corroborated, so
+        only a genuine pair is completed) and both halves are pinned so
+        truncation keeps them together. Quarantined partners are never
+        stitched in. Idempotent when both halves are already present.
+
         Quarantine filtering: records whose `_meta.exposure` is
         `quarantine` (committed prompt-injection attempts and other
         untrusted input) are dropped from the result. They remain on the
@@ -1245,6 +1309,14 @@ class Retriever:
         explicit `query_modalities` set to skip the analysis and supply the
         modes directly. When the query implies no domain modality, anchoring
         is inert and scoring matches the historical formula exactly.
+
+        Epistemic weighting: by default (`epistemic_weighting=True`), records
+        are scaled by how well-grounded they are (`known`/`user_context` full
+        weight, `inferred` ~unchanged, `speculative`/`disputed` discounted —
+        see `EPISTEMIC_FACTORS`). This makes the agent prefer to ground
+        answers in what it knows over what it once guessed. The penalties
+        (superseded, risk) are unaffected. Pass `epistemic_weighting=False`
+        to restore the historical class-blind scoring.
         """
         # Resolve query modalities for anchoring. An explicit set wins; else
         # detect from the query if anchoring is on; else none (inert).
@@ -1255,7 +1327,8 @@ class Retriever:
         else:
             q_mods = set()
         semantic = self.hybrid(
-            query, k=k_semantic, type_filter=type_filter, query_modalities=q_mods
+            query, k=k_semantic, type_filter=type_filter, query_modalities=q_mods,
+            epistemic_weighting=epistemic_weighting,
         )
         recent = self.recent(n=n_recent, type_filter=type_filter)
         seen: set[int] = set()
@@ -1304,6 +1377,49 @@ class Retriever:
                 revision_pull_ins.append(rev)
                 merged_indices.add(rev.index)
         merged.extend(revision_pull_ins)
+
+        # Turn-pair stitching. An observation and the response that answers it
+        # are a single Q&A unit — they give each other essential context, so
+        # retrieving one half without the other strips that context. The turn
+        # flow seals them at consecutive indices (observation N, response N+1)
+        # and the response carries a `refs` link back to its observation, so we
+        # complete any half-retrieved pair by pulling in its partner. Applied to
+        # the whole merged set and idempotent: when both halves are already
+        # present it does nothing. Refinements:
+        #   - Type-checked + refs-corroborated, so a failed-response gap (an
+        #     observation whose N+1 is the *next* turn's record) can't pull an
+        #     unrelated record.
+        #   - Quarantine-respecting: an untrusted (quarantined) partner is never
+        #     stitched in.
+        #   - Budget-safe: both halves are pinned, so `_truncate_to_budget`
+        #     keeps the pair together (or drops it together) rather than
+        #     splitting it under prompt-budget pressure.
+        stitched_in: list[Record] = []
+        for rec in list(merged):
+            if rec.type == "observation":
+                partner_idx, partner_type = rec.index + 1, "response"
+            elif rec.type == "response":
+                partner_idx, partner_type = rec.index - 1, "observation"
+            else:
+                continue
+            if partner_idx < 0 or partner_idx in merged_indices:
+                continue
+            partner = self.chain.get(partner_idx)
+            if partner is None or partner.type != partner_type:
+                continue
+            # Corroborate the pair with the refs link (the response refs its
+            # observation), so we only ever stitch a genuine turn pair.
+            resp, obs = (rec, partner) if rec.type == "response" else (partner, rec)
+            if obs.record_hash not in (resp.refs or []):
+                continue
+            if read_meta(partner).exposure == EXPOSURE_QUARANTINE:
+                continue
+            stitched_in.append(partner)
+            merged_indices.add(partner_idx)
+            pinned.add(rec.index)
+            pinned.add(partner_idx)
+        merged.extend(stitched_in)
+        self.last_pinned_indices = pinned
 
         # Drop quarantined records. Done last so a quarantined record
         # can't sneak back in via the revision pull-in either.

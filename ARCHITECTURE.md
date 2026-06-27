@@ -2,7 +2,7 @@
 
 A guide to the files that make up the timechain agent, what each is responsible for, and how they fit together.
 
-**Version: 1.2.1.** This document describes the system as it currently
+**Version: 1.3.0.** This document describes the system as it currently
 stands. For the release-by-release history of how it got here, see
 [CHANGELOG.md](CHANGELOG.md).
 
@@ -55,6 +55,13 @@ Think of this as a four-layer system:
   apply_proposal.py REVIEW TOOL — operator-run: lists/shows proposals,
                     scaffolds detector stubs into signals.py, records
                     accept/decline decisions on the chain
+
+  capsule.py        EXCHANGE — Experience Capsules: signed, exposure-gated
+                    export of selected Rings + verify + attributed import
+                    (build spec .cphyx). Uses only the chain's existing
+                    crypto; no network, no tokens, no consensus. Redacted
+                    (summary-only) records carry a signed summary commitment.
+                    Format spec: CAPSULE.md.
 
   timechain_web/    OPTIONAL UI — FastAPI server + browser frontend
     webapp.py       Same agent, same chain, alternate I/O layer
@@ -621,6 +628,69 @@ Every turn writes two records: one for what you said (tagged `source=user`), one
 
 ---
 
+## Cognitive faculties (v1.3)
+
+v1.3 adds a layer of cognitive faculties. They are deliberately
+**storage-independent**: each speaks a generic "ring" shape through one small
+adapter, `ring_compat.py`, which presents a repo `Record` as a ring
+(`index`/`ring_type`/`payload`/`ring_hash`) on the read side and seals
+ring-style payloads back through `chain.append` + `build_meta` on the write
+side. So the cognitive *logic* never touches SQLite directly — it composes with
+the same signed chain everything else uses, and the cryptographic core is
+unchanged.
+
+The faculties, and how each maps onto the existing substrate:
+
+- **`poq.py` (extended) — a quality gate with teeth.** On top of the existing
+  `brightness`/`action`, PoQ now returns a `verdict`
+  (`SEAL`/`REVISE`/`FORCE_UNCERTAINTY`/`REJECT`) from two new measures
+  (grounding, assertiveness) and the existing covenant/consistency dimensions.
+  `evaluate(..., external_scores=...)` is the **seam**: a real model can
+  override any score, so the lexical proxies are a runnable fallback, not the
+  judge. The `verdict` is persisted inside `_meta.poq` only when it is not
+  `seal`, so no schema version changed.
+
+- **`immune.py` — active self-defense.** `screen` refuses covenant/scar inputs
+  at the membrane; `scan` reuses the Ed25519 `chain.verify()` for tamper
+  detection; `rollback` seals a `recovery` record and molts the wound into a
+  learned scar. Enforcement is a **one-line lockdown gate at the top of
+  `chain.append`** (only `recovery` may be sealed while a `LOCKED` sidecar flag
+  exists) — so no seal path can bypass it. State is a sidecar, never on-chain.
+
+- **`continuum.py` — long-horizon tasking.** Streams a job too large for any
+  context window into bounded data-height blocks, each carrying a full
+  task-state refresh, so `resume()` re-hydrates from the head block alone.
+  Built for a **per-task chain** (its own DB) so a big audit doesn't dilute the
+  identity chain.
+
+- **`recall.py` — relevance realization.** `label` self-tags a record using the
+  existing `signals.py` faculties; `index`→`fetch` is the model-as-judge loop
+  over a chain larger than context; `retrieve` is a cheap pre-filter that
+  delegates to the existing `Retriever`, never the arbiter.
+
+- **`chronosynaptic.py` — single-pass parallel-self MCTS.** Forks faculty-lens
+  perspectives (drawn from the `signals.py` registries), scores each with PoQ,
+  and collapses to one `synthesis` record — no subagents.
+
+- **`consensus.py` — quorum attestation.** k-of-n HMAC witnesses attest each
+  head over the *recomputed* `record_hash`, layering tamper-*resistance* on the
+  chain's tamper-*evidence*. Sidecar config/attestations, never on-chain.
+
+- **`faculties.py` + `faculties/*.json` — faculties as data + growth.**
+  Descriptive data faculties (84 modalities, 107 senses) complement the
+  executable `signals.py` detectors; `FacultyGarden.grow` sprouts/promotes new
+  faculties when an input reveals a gap, sealing `faculty`/`promotion` records.
+
+- **`chain.py` (extended) — optional proof-of-work.** `append(..., difficulty=N)`
+  mines a nonce inside `content["_pow"]`; `difficulty=0` (the default) is
+  byte-identical to before. **`migrate.py`** backfills the derived embedding
+  index off-chain for historic records — the signed chain is never rewritten.
+
+The two turn-loop changes — immune screening (on by default, narrow) and PoQ
+verdict enforcement (opt-in) — live in `Agent.turn()` and the webapp
+`turn_stream`, so the REPL and web UI route through the same gates. `run.py`
+exposes the faculties as slash commands via `cypher_commands.py` (`/cypher-help`).
+
 ## What's where: a quick reference
 
 | If you want to change... | Edit this file |
@@ -630,7 +700,7 @@ Every turn writes two records: one for what you said (tagged `source=user`), one
 | The agent's personality / tone | `run.py` — `SYSTEM_PROMPT` (auto-logged on change) |
 | How often the agent reflects | `run.py` — `AUTO_REFLECT_EVERY` |
 | How much context the agent sees | `run.py` — `SEMANTIC_K` and `RECENT_N` |
-| Maximum prompt size before truncation | `run.py` — `CONTEXT_BUDGET_CHARS` (default 80,000). Fed to the `Agent` constructor's `context_char_budget` by both `run.py` and `webapp.py`. |
+| Maximum prompt size before truncation | `run.py` — `CONTEXT_BUDGET_CHARS` (default 150,000). Fed to the `Agent` constructor's `context_char_budget` by both `run.py` and `webapp.py`. |
 | Default salience by record type | `metadata.py` — `DEFAULT_SALIENCE_BY_TYPE` |
 | Per-kind decay half-lives | `metadata.py` — `DEFAULT_HALF_LIFE_DAYS_BY_TYPE` |
 | Source tag enum | `metadata.py` — `SOURCE_*` constants |
@@ -653,7 +723,13 @@ Every turn writes two records: one for what you said (tagged `source=user`), one
 | Adding a new file type | `file_ingest.py` — add to `*_EXTS` set and add an `_extract_*` function |
 | Web UI behavior or appearance | `timechain_web/webapp.py` (server) and `timechain_web/static/index.html` (frontend) |
 | Streaming responses to the browser | `llm_clients.py` — each client's `.stream()` method |
-| Adding tests | `test_timechain.py` — pytest classes by concern |
+| Adding tests | `test_timechain.py` — pytest classes by concern; `test_cypher_port.py` / `test_cypher_integration.py` for the v1.3 faculties |
+| PoQ verdict thresholds | `poq.py` — `PoQ_THRESHOLDS` |
+| Enabling verdict enforcement / the model-judgment seam | `agent.py` — `Agent(enforce_verdict=..., score_hook=...)` |
+| Disabling immune screening | `agent.py` — `Agent(enable_immune=False)` |
+| The immune covenant/scar lexicon | `immune.py` — `_COVENANT_VIOLATIONS`, `SKIP_TYPES` |
+| Data-faculty registries / growth thresholds | `faculties/*.json`; `faculties.py` — `DISSONANCE_FLOOR`, `PROMOTE_AT` |
+| Adding a v1.3 faculty REPL command | `cypher_commands.py` — `dispatch()` |
 
 ---
 

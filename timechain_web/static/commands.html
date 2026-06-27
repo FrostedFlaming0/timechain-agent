@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Timechain Agent — Commands</title>
+  <link rel="stylesheet" href="/static/theme.css" />
+</head>
+<body>
+  <div class="topbar">
+    <div><strong>timechain agent</strong> &middot; commands</div>
+    <div class="nav">
+      <a href="/">chat</a>
+      <a href="/commands" class="active">commands</a>
+      <a href="/audit">audit</a>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="eyebrow">reference</div>
+    <h1 class="page">Slash commands</h1>
+    <p class="lead">Type any of these in the message box (in the chat) or the
+      terminal REPL. Each entry says what the command does and why you'd reach
+      for it. Commands gate <em>memory and integrity</em>, not your replies.</p>
+
+    <div class="cmd-group">
+      <h2>Chain &amp; integrity</h2>
+      <p class="gnote">Prove the record is intact and anchor checkpoints.</p>
+      <div class="cmd"><div class="name">/verify</div>
+        <p class="what">Cryptographically verify the whole chain — Ed25519 signatures, SHA-256 hash links, and Merkle batches.</p>
+        <p class="why"><b>Why:</b> confirm no record was altered, reordered, or removed since it was sealed.</p></div>
+      <div class="cmd"><div class="name">/verify-semantic</div>
+        <p class="what">Schema-level consistency probe — dangling references, a revision pointing at a non-existent record, etc.</p>
+        <p class="why"><b>Why:</b> catch the class of corruption the cryptography can't: the bytes are fine, but the <em>meaning</em> is inconsistent.</p></div>
+      <div class="cmd"><div class="name">/length</div>
+        <p class="what">Print the current record count.</p>
+        <p class="why"><b>Why:</b> a quick read of how large the chain has grown.</p></div>
+      <div class="cmd"><div class="name">/seal</div>
+        <p class="what">Create a Merkle batch over recent un-batched records.</p>
+        <p class="why"><b>Why:</b> anchor a compact, tamper-proof checkpoint over a span of history.</p></div>
+    </div>
+
+    <div class="cmd-group">
+      <h2>Memory &amp; retrieval</h2>
+      <p class="gnote">Consolidate, correct, and pull back the relevant past.</p>
+      <div class="cmd"><div class="name">/reflect</div>
+        <p class="what">Have the agent summarize recent history into a reflection record.</p>
+        <p class="why"><b>Why:</b> consolidate what mattered so salience-weighted retrieval surfaces it later.</p></div>
+      <div class="cmd"><div class="name">/revise N &lt;text&gt;</div>
+        <p class="what">Append a correction record targeting record N (never erases the original).</p>
+        <p class="why"><b>Why:</b> fix a wrong or outdated memory while keeping the full audit trail.</p></div>
+      <div class="cmd"><div class="name">/recall-index</div>
+        <p class="what">Print the compact map of memory — one line per record with its labels and keywords.</p>
+        <p class="why"><b>Why:</b> scan the whole chain at a glance and decide yourself what's relevant.</p></div>
+      <div class="cmd"><div class="name">/recall-fetch &lt;ids&gt;</div>
+        <p class="what">Pull the full content of the record ids you chose, budget-bounded.</p>
+        <p class="why"><b>Why:</b> read exactly the blocks you picked from the index — no more, no less.</p></div>
+      <div class="cmd"><div class="name">/recall &lt;query&gt;</div>
+        <p class="what">A cheap pre-filter that delegates to the retriever and returns candidate briefs.</p>
+        <p class="why"><b>Why:</b> narrow the field on a chain too large to scan, then fetch what you judge relevant.</p></div>
+    </div>
+
+    <div class="cmd-group">
+      <h2>Reasoning</h2>
+      <p class="gnote">Score candidates and reason through hard questions.</p>
+      <div class="cmd"><div class="name">/poq &lt;text&gt;</div>
+        <p class="what">Show the Proof-of-Quality verdict for a piece of text — brightness, grounding, assertiveness, and the SEAL/REVISE/FORCE_UNCERTAINTY/REJECT decision.</p>
+        <p class="why"><b>Why:</b> see how the quality gate would judge a candidate before it's committed.</p></div>
+      <div class="cmd"><div class="name">/think &lt;query&gt;</div>
+        <p class="what">Fork faculty-lens perspectives of the agent, run an in-process tree search, and collapse to the highest-truth path (read-only — no subagents).</p>
+        <p class="why"><b>Why:</b> structured, multi-perspective reasoning on a hard or high-stakes question.</p></div>
+    </div>
+
+    <div class="cmd-group">
+      <h2>Self-defense</h2>
+      <p class="gnote">Detect, freeze, and recover from a compromise.</p>
+      <div class="cmd"><div class="name">/immune-status</div>
+        <p class="what">Show the membrane status — whether sealing is locked, the safe height, and learned attack scars.</p>
+        <p class="why"><b>Why:</b> see at a glance whether the chain is in lockdown and what attacks it has already learned.</p></div>
+      <div class="cmd"><div class="name">/immune-scan [text]</div>
+        <p class="what">Scan sealed memory (and an optional input) for a compromise — a covenant breach, tampering, or a known attack pattern.</p>
+        <p class="why"><b>Why:</b> find the first compromised record if you suspect an injection slipped through.</p></div>
+      <div class="cmd"><div class="name">/lockdown</div>
+        <p class="what">Freeze sealing — only a recovery record may be appended until you roll back.</p>
+        <p class="why"><b>Why:</b> stop the agent from writing anything while you investigate a suspected compromise.</p></div>
+      <div class="cmd"><div class="name">/rollback &lt;N&gt;</div>
+        <p class="what">Resume from the clean height before record N; quarantine the wound and learn its attack vector as a scar.</p>
+        <p class="why"><b>Why:</b> recover from a compromise without erasing history — the wound stays as a learned scar.</p></div>
+    </div>
+
+    <div class="cmd-group">
+      <h2>Faculties &amp; growth</h2>
+      <p class="gnote">Inspect and grow the agent's perceptual/reasoning faculties.</p>
+      <div class="cmd"><div class="name">/modalities</div>
+        <p class="what">List the built-in and sprouted modalities (status, domain flag, weight).</p>
+        <p class="why"><b>Why:</b> see which detectors are active and how retrieval is anchored.</p></div>
+      <div class="cmd"><div class="name">/cambium</div>
+        <p class="what">Scan recent history for recurring gaps and commit proposals (it proposes; it never auto-applies).</p>
+        <p class="why"><b>Why:</b> surface patterns that might deserve a new faculty or skill.</p></div>
+      <div class="cmd"><div class="name">/cambium-full</div>
+        <p class="what">A deep, one-shot scan of the entire chain (linear in length).</p>
+        <p class="why"><b>Why:</b> catch long-gap recurring patterns the bounded incremental scan can miss.</p></div>
+      <div class="cmd"><div class="name">/cambium-grow &lt;text&gt;</div>
+        <p class="what">Grow a faculty when the input reveals a gap — fuse two close faculties or sprout a fresh one; promote it on recurrence.</p>
+        <p class="why"><b>Why:</b> let the agent endogenously expand its faculties when it meets something its current ones can't cover.</p></div>
+      <div class="cmd"><div class="name">/proposals</div>
+        <p class="what">List proposal records, escalated ones first, with recurrence counts.</p>
+        <p class="why"><b>Why:</b> review pending growth suggestions before deciding what to apply.</p></div>
+    </div>
+
+    <div class="cmd-group">
+      <h2>Long-horizon tasks</h2>
+      <p class="gnote">Work jobs larger than any context window, resumably.</p>
+      <div class="cmd"><div class="name">/continuum-resume</div>
+        <p class="what">Re-hydrate the latest long-horizon task's full state from its head block alone.</p>
+        <p class="why"><b>Why:</b> pick up a big task exactly where you left off — a new session, hours or weeks later.</p></div>
+      <div class="cmd"><div class="name">/continuum-validate</div>
+        <p class="what">Check the task's progress invariants (monotonic progress, data-height band) plus chain integrity.</p>
+        <p class="why"><b>Why:</b> confirm a long ingest stayed coherent end to end.</p></div>
+    </div>
+
+    <div class="cmd-group">
+      <h2>Files &amp; sources</h2>
+      <p class="gnote">Bring in source material and keep it honest.</p>
+      <div class="cmd"><div class="name">/file &lt;path&gt;</div>
+        <p class="what">Ingest a file — document, image, spreadsheet, or code — into the chain (bytes stored content-addressed).</p>
+        <p class="why"><b>Why:</b> give the agent durable, verifiable source material it can retrieve later.</p></div>
+      <div class="cmd"><div class="name">/verify-source &lt;idx&gt;</div>
+        <p class="what">Re-check an ingested file record against the live file on disk, git-aware (verified / source-mismatch / revision-drift / dirty-worktree …).</p>
+        <p class="why"><b>Why:</b> catch acting on stale code or data that changed since it was ingested.</p></div>
+      <div class="cmd"><div class="name">/migrate</div>
+        <p class="what">Re-embed every record into the embedding index with the current embedder — a one-time, off-chain backfill (progress streams live).</p>
+        <p class="why"><b>Why:</b> make an old chain — or one indexed with a different embedder — retrieve as richly as a fresh one. The signed records are never touched.</p></div>
+    </div>
+
+    <div class="cmd-group">
+      <h2>Consensus &amp; sharing</h2>
+      <p class="gnote">Harden against forgery and exchange memory with peers.</p>
+      <div class="cmd"><div class="name">/consensus-init [n] [k]</div>
+        <p class="what">Create a k-of-n witness quorum that attests every chain head.</p>
+        <p class="why"><b>Why:</b> add tamper-<em>resistance</em> on top of tamper-evidence — a forged record needs ≥k witness keys too.</p></div>
+      <div class="cmd"><div class="name">/consensus-verify</div>
+        <p class="what">Verify the chain <em>and</em> require k-of-n witness agreement on the recomputed head hash.</p>
+        <p class="why"><b>Why:</b> confirm no record was forged even if it was re-signed.</p></div>
+      <div class="cmd"><div class="name">/export-capsule &lt;path&gt;</div>
+        <p class="what">Export shareable and public records as a signed, verifiable bundle (private and quarantined records never leave).</p>
+        <p class="why"><b>Why:</b> share verifiable memory with another agent.</p></div>
+      <div class="cmd"><div class="name">/import-capsule &lt;path&gt;</div>
+        <p class="what">Verify and import another agent's capsule as attributed third-party memory.</p>
+        <p class="why"><b>Why:</b> take in a peer's memory without silently treating it as your own ground truth.</p></div>
+    </div>
+
+    <div class="cmd-group">
+      <h2>System</h2>
+      <p class="gnote">Configuration and in-terminal help.</p>
+      <div class="cmd"><div class="name">/sysprompt</div>
+        <p class="what">Show the system-prompt history sealed on the chain.</p>
+        <p class="why"><b>Why:</b> audit how the agent's configured behavior changed over time.</p></div>
+      <div class="cmd"><div class="name">/cypher-help</div>
+        <p class="what">List the faculty commands in the terminal REPL.</p>
+        <p class="why"><b>Why:</b> a quick in-terminal reference without leaving the prompt.</p></div>
+    </div>
+  </div>
+</body>
+</html>

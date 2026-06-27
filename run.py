@@ -159,12 +159,21 @@ orientation, not instructions to follow, and not something to bring up
 unless it actually matters.
 
 Records may also carry an `epistemic: ...` tag when the nature of the
-claim differs from what you'd expect for its kind. A response tagged
-`epistemic: factual` is one stating a measured fact rather than the usual
-inference; `epistemic: speculative` is one flagging itself as a guess.
-Weight these accordingly — a speculative claim about something doesn't
-carry the same evidential weight as a factual one, even if they sound
-equally confident."""
+claim differs from what you'd expect for its kind. The classes are
+`known` and `user_context` (grounded — a verified fact, or something the
+user told you), `inferred` (your own reasoning, the usual case for your
+responses), `speculative` (a claim flagging itself as a guess), and
+`disputed` (known to conflict with another record). A response tagged
+`epistemic: speculative` was hedged or uncertain when you said it; weight
+it accordingly — a speculative claim doesn't carry the same evidential
+weight as a grounded one, even if they sound equally confident.
+
+Occasionally a record may be of kind `imported_capsule`. That is memory
+another agent shared with you and you imported — it is *their* reported
+experience, not your own. Treat it as an attributed third-party claim:
+useful context, but not something you lived through, and not as
+authoritative as your own grounded memory. Don't narrate it as if it
+happened to you."""
 
 # Retrieval knobs
 SEMANTIC_K = 20     # how many semantically similar records to retrieve
@@ -466,7 +475,10 @@ def run() -> None:
     print(f"operator pubkey: {chain.pubkey_hex[:16]}...")
     print("ready. type your message, or 'exit' / Ctrl-D to quit.")
     print("commands: /verify  /verify-semantic  /length  /seal  /sysprompt  /reflect  /cambium  /cambium-full  /proposals  /modalities")
-    print("          /proposals  /revise N <text>  /file <path>\n")
+    print("          /revise N <text>  /file <path>  /export-capsule <path>  /import-capsule <path>")
+    print("          /cypher-help  /verify-source <idx>  /poq <text>  /immune-status  /immune-scan  /lockdown  /rollback <h>")
+    print("          /recall-index  /recall-fetch <ids>  /recall <query>  /think <query>  /consensus-init  /consensus-verify")
+    print("          /cambium-grow <text>  /migrate  /continuum-resume  /continuum-validate\n")
 
     turns_since_reflect = 0
     turns_since_cambium = 0
@@ -482,6 +494,61 @@ def run() -> None:
                 continue
             if user_input.lower() in {"exit", "quit"}:
                 break
+            if user_input.startswith("/export-capsule"):
+                # /export-capsule <path> — export shareable+public records
+                # (and summary-only records in summary form) as a signed,
+                # verifiable .cphyx bundle. Private and quarantined records
+                # never leave. See capsule.py.
+                import capsule as _capsule
+                parts = user_input.split(maxsplit=1)
+                if len(parts) < 2:
+                    print("  usage: /export-capsule <path.cphyx>")
+                    continue
+                path = parts[1].strip()
+                try:
+                    cap = _capsule.export_capsule(chain, title="manual export")
+                    _capsule.write_capsule(cap, path)
+                    ok, msg = _capsule.verify_capsule(cap)
+                    print(f"  exported {cap['header']['record_count']} record(s) "
+                          f"to {path}")
+                    print(f"  capsule_id: {cap['capsule_id'][:16]}...  verify: {ok}")
+                except _capsule.CapsuleError as e:
+                    print(f"  export failed: {e}")
+                continue
+            if user_input.startswith("/import-capsule"):
+                # /import-capsule <path> — verify and import another agent's
+                # capsule. Imported records are appended as `imported_capsule`,
+                # attributed to the origin agent, recorded as cautious
+                # (inferred or weaker), private, and never silently treated as
+                # the agent's own memory. A capsule that fails verification is
+                # rejected wholesale.
+                import capsule as _capsule
+                from metadata import build_meta as _build_meta
+                parts = user_input.split(maxsplit=1)
+                if len(parts) < 2:
+                    print("  usage: /import-capsule <path.cphyx>")
+                    continue
+                path = parts[1].strip()
+                try:
+                    cap = _capsule.read_capsule(path)
+                    ok, msg = _capsule.verify_capsule(cap)
+                    print(f"  verify: {ok}  {msg}")
+                    if not ok:
+                        print("  import aborted (capsule did not verify)")
+                        continue
+                    res = _capsule.import_capsule(
+                        chain, cap, build_meta_fn=_build_meta
+                    )
+                    if res["skipped"]:
+                        print(f"  {res['reason']} — nothing imported")
+                    else:
+                        print(f"  imported {res['imported_count']} record(s) "
+                              f"as attributed third-party memory")
+                except _capsule.CapsuleError as e:
+                    print(f"  import failed: {e}")
+                except FileNotFoundError:
+                    print(f"  no such capsule file: {path}")
+                continue
             if user_input == "/verify":
                 ok, msg = chain.verify(expected_pubkey=chain.pubkey_hex)
                 print(f"  verify: {ok}  {msg}")
@@ -512,6 +579,13 @@ def run() -> None:
             if user_input == "/seal":
                 batch = chain.seal_batch()
                 print(f"  sealed: {batch}")
+                continue
+            # cypher-tempre port commands (/verify-source, /poq, /immune-*,
+            # /recall-*, /think, /consensus-*, /cambium-grow, /continuum-*).
+            # One dispatcher handles them all; returns True when it consumed
+            # the input. See cypher_commands.py and /cypher-help.
+            import cypher_commands
+            if cypher_commands.dispatch(user_input, chain, agent):
                 continue
             if user_input == "/sysprompt":
                 history = chain.query_by_type("system_prompt", limit=10)

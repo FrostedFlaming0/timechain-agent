@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Timechain Agent — Audit</title>
+  <link rel="stylesheet" href="/static/theme.css" />
+</head>
+<body>
+  <div class="topbar">
+    <div><strong>timechain agent</strong> &middot; audit</div>
+    <div class="nav">
+      <a href="/">chat</a>
+      <a href="/commands">commands</a>
+      <a href="/audit" class="active">audit</a>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;">
+      <div>
+        <div class="eyebrow">personal chain agent</div>
+        <h1 class="page">Timechain Audit</h1>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;">
+        <span class="path-badge" id="pathbadge">—</span>
+        <button id="refresh" style="border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:6px 12px;border-radius:6px;cursor:pointer;font:inherit;">refresh</button>
+      </div>
+    </div>
+
+    <div id="err" class="muted" style="margin-top:8px;"></div>
+    <div class="metrics" id="metrics"></div>
+
+    <div class="cols">
+      <div>
+        <div class="section-head"><h2>Domain Context</h2><span class="note" id="dcount"></span></div>
+        <div id="domains"></div>
+      </div>
+      <div>
+        <div class="section-head"><h2>Faculty Surface</h2><span class="note" id="fnote"></span></div>
+        <div class="fac-cols">
+          <div class="fac"><h4>Modalities</h4><div id="facmod"></div></div>
+          <div class="fac"><h4>Senses</h4><div id="facsense"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section-head" style="margin-top:32px;"><h2>Rings</h2></div>
+    <div class="toolbar">
+      <input id="search" placeholder="Search rings (text, #index, keyword)" />
+      <select id="typefilter"></select>
+    </div>
+    <div class="ring-split">
+      <div class="ring-list" id="ringlist"></div>
+      <div class="detail" id="detail"><div class="empty">Select a ring</div></div>
+    </div>
+
+    <div class="section-head" style="margin-top:32px;"><h2>Blockspace</h2><span class="note" id="bcount"></span></div>
+    <div id="block"></div>
+  </div>
+
+  <script>
+    const $ = id => document.getElementById(id);
+    const metricsEl=$('metrics'), domainsEl=$('domains'), facModEl=$('facmod'),
+          facSenseEl=$('facsense'), ringListEl=$('ringlist'), detailEl=$('detail'),
+          blockEl=$('block'), searchEl=$('search'), typeEl=$('typefilter'),
+          errEl=$('err'), pathEl=$('pathbadge');
+    let DATA = null, SELECTED = null;
+
+    function esc(s){ return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+    function fmtSize(n){ if(n<1024)return n+' B'; if(n<1048576)return (n/1024).toFixed(1)+' KB'; return (n/1048576).toFixed(1)+' MB'; }
+
+    async function load(){
+      errEl.textContent='loading…';
+      try{
+        const r = await fetch('/api/audit');
+        if(!r.ok){ errEl.textContent='failed to load audit ('+r.status+')'; return; }
+        DATA = await r.json();
+        errEl.textContent='';
+        typeEl.dataset.filled=''; SELECTED=null;
+        render();
+      }catch(e){ errEl.textContent='failed to load audit: '+e.message; }
+    }
+
+    function metric(label,value,cls=''){
+      return `<div class="card metric"><div class="label">${esc(label)}</div><div class="value ${cls}">${esc(value)}</div></div>`;
+    }
+    function facRows(cats){
+      if(!cats.length) return '<p class="muted">none</p>';
+      const max = Math.max(...cats.map(c=>c.count),1);
+      return cats.map(c=>`<div class="frow"><div class="lbl"><span>${esc(c.category)}</span><span class="ct">${c.count}/${c.total}</span></div><div class="bar"><span style="width:${Math.round(c.count/max*100)}%"></span></div></div>`).join('');
+    }
+
+    function render(){
+      const m=DATA.metrics;
+      pathEl.textContent = DATA.data_dir || '';
+      metricsEl.innerHTML = [
+        metric('Rings', m.rings),
+        metric('Modalities', m.modalities),
+        metric('Senses', m.senses),
+        metric('Blockspace', m.blockspace),
+        metric('Context tokens', (m.context_tokens||0).toLocaleString()),
+        metric('Integrity', m.integrity, m.integrity==='PASS'?'pass':(m.integrity==='FAIL'?'fail':'')),
+      ].join('');
+
+      domainsEl.innerHTML = (DATA.domains||[]).map(d=>`
+        <div class="domain">
+          <div class="row"><span class="name">${esc(d.name)}</span>
+            <span class="meta">${d.rings} rings · ${(d.est_tokens||0).toLocaleString()} est. tokens</span></div>
+          <div class="bar"><span style="width:${Math.round((d.bar||0)*100)}%"></span></div>
+          <div class="kw">${(d.keywords||[]).map(k=>`<b>${esc(k.word)}</b> ×${k.count}`).join(' · ')}</div>
+        </div>`).join('') || '<p class="muted">no domains detected yet</p>';
+      $('dcount').textContent = (DATA.domains||[]).length + ' detected';
+
+      const f=DATA.faculties||{};
+      $('fnote').textContent = `${f.modalities_total||0} modalities · ${f.senses_total||0} senses · ${f.emergent||0} emergent`;
+      facModEl.innerHTML = facRows(f.modalities||[]);
+      facSenseEl.innerHTML = facRows(f.senses||[]);
+
+      renderRings();
+
+      $('bcount').textContent = `${(DATA.blockspace||[]).length} entries`;
+      blockEl.innerHTML = (DATA.blockspace||[]).map(b=>`
+        <div class="blob"><div><div class="bn">${esc(b.name)}</div>
+          <div class="bh">${esc(b.hash.slice(0,12))}…${esc(b.hash.slice(-6))}</div></div>
+          <span class="pill">${fmtSize(b.size)}</span></div>`).join('') || '<p class="muted">blockspace is empty</p>';
+    }
+
+    function renderRings(){
+      const q=(searchEl.value||'').toLowerCase().trim(), type=typeEl.value;
+      if(typeEl.dataset.filled!=='1'){
+        const types=Array.from(new Set((DATA.rings||[]).map(r=>r.type))).sort();
+        typeEl.innerHTML='<option value="">All types</option>'+types.map(t=>`<option>${esc(t)}</option>`).join('');
+        typeEl.dataset.filled='1';
+      }
+      const rows=(DATA.rings||[]).filter(r=>(!type||r.type===type) &&
+        (!q || (r.summary||'').toLowerCase().includes(q) || String(r.index)===q ||
+         (r.keywords||[]).some(k=>k.includes(q))));
+      ringListEl.innerHTML = rows.map(r=>`
+        <div class="ring ${SELECTED===r.index?'sel':''}" data-idx="${r.index}">
+          <div class="rh"><span class="idx">#${r.index} <span class="type">${esc(r.type)}</span></span>
+            <span class="b">${r.brightness!=null?('b='+Number(r.brightness).toFixed(3)):''}</span></div>
+          <div class="sum">${esc(r.summary||'')||'(no text)'}</div>
+          <div class="tags">${(r.keywords||[]).slice(0,8).map(esc).join(' · ')}</div>
+        </div>`).join('') || '<p class="muted">no rings match</p>';
+      ringListEl.querySelectorAll('.ring').forEach(el=>el.onclick=()=>{
+        SELECTED=Number(el.dataset.idx); renderRings(); renderDetail();
+      });
+    }
+    function fmtVal(v){
+      if(Array.isArray(v)) return v.join(', ');
+      if(v && typeof v==='object') return JSON.stringify(v);
+      return String(v);
+    }
+    function kvRows(obj, keys){
+      return keys.filter(k=>obj[k]!==undefined && obj[k]!==null && obj[k]!=='')
+        .map(k=>`<div class="k">${esc(k)}</div><div class="v">${esc(fmtVal(obj[k]))}</div>`).join('');
+    }
+    function detailHead(r){
+      return `<div class="rh" style="display:flex;justify-content:space-between;align-items:baseline;">
+          <span class="idx" style="font-weight:600;">#${r.index} <span class="type muted">${esc(r.type)}</span></span>
+          <span class="b mono muted">${r.brightness!=null?('b='+Number(r.brightness).toFixed(3)):''}</span></div>
+        <p class="muted mono" style="margin:10px 0 4px;">keywords: ${(r.keywords||[]).map(esc).join(' · ')||'—'}</p>`;
+    }
+
+    async function renderDetail(){
+      const r=(DATA.rings||[]).find(x=>x.index===SELECTED);
+      if(!r){ detailEl.innerHTML='<div class="empty">Select a ring</div>'; return; }
+      detailEl.innerHTML = detailHead(r) + '<pre>loading…</pre>';
+      let full;
+      try{
+        const resp = await fetch('/api/audit/ring/'+r.index);
+        if(!resp.ok) throw new Error('HTTP '+resp.status);
+        full = await resp.json();
+      }catch(e){
+        detailEl.innerHTML = detailHead(r) + '<pre>'+esc((r.summary||'')+'\n\n(could not load full content: '+e.message+')')+'</pre>';
+        return;
+      }
+      const c = full.content || {};
+      const meta = (c && c._meta) || {};
+      const poq = meta.poq || null;
+      let html = detailHead(r);
+      html += '<pre>'+esc(full.text && full.text.trim() ? full.text : '(no text content)')+'</pre>';
+
+      // File records: surface the real filename and file facts prominently.
+      if(r.type === 'file'){
+        const fr = [
+          ['filename', c.filename], ['kind', c.kind], ['ext', c.ext],
+          ['size', c.size_bytes!=null ? fmtSize(c.size_bytes) : null],
+          ['extraction', c.extraction_method],
+          ['source path', c.source_path],
+        ].filter(x=>x[1]!=null && x[1]!=='')
+         .map(x=>`<div class="k">${esc(x[0])}</div><div class="v">${esc(String(x[1]))}</div>`).join('');
+        if(fr) html += `<div class="det-section"><h5>file</h5><div class="kv">${fr}</div></div>`;
+      }
+
+      // Metadata that drives retrieval (provenance, salience, epistemics).
+      const metaRows = kvRows(meta, ['source','epistemic_class','exposure','salience',
+                                     'confidence','schema_version','supersedes','truncated']);
+      if(metaRows) html += `<div class="det-section"><h5>metadata</h5><div class="kv">${metaRows}</div></div>`;
+
+      // Activated faculties — the retrieval anchors.
+      const mods = meta.modalities_activated||[], senses = meta.senses_activated||[];
+      if(mods.length || senses.length){
+        html += '<div class="det-section"><h5>activated faculties</h5>';
+        if(mods.length) html += `<div class="muted" style="font-size:12px;">modalities</div><div class="chips">${mods.map(m=>'<span>'+esc(m)+'</span>').join('')}</div>`;
+        if(senses.length) html += `<div class="muted" style="font-size:12px;margin-top:6px;">senses</div><div class="chips">${senses.map(s=>'<span>'+esc(s)+'</span>').join('')}</div>`;
+        html += '</div>';
+      }
+
+      // Proof-of-Quality.
+      if(poq){
+        let prows = kvRows(poq, ['brightness','action','verdict','integrity_alert']);
+        const dims = poq.dimensions || {};
+        prows += Object.keys(dims).map(k=>`<div class="k">${esc(k)}</div><div class="v">${esc(Number(dims[k]).toFixed(3))}</div>`).join('');
+        if(prows) html += `<div class="det-section"><h5>proof-of-quality</h5><div class="kv">${prows}</div></div>`;
+      }
+
+      // Integrity / cryptographic fields.
+      const sh = s => esc((s||'').slice(0,40)) + ((s||'').length>40?'…':'');
+      html += `<div class="det-section"><h5>integrity</h5><div class="kv">
+        <div class="k">record_hash</div><div class="v mono">${sh(full.record_hash)}</div>
+        <div class="k">prior_hash</div><div class="v mono">${sh(full.prior_hash)}</div>
+        <div class="k">content_hash</div><div class="v mono">${sh(full.content_hash)}</div>
+        <div class="k">signature</div><div class="v mono">${sh(full.signature)}</div>
+        <div class="k">pubkey</div><div class="v mono">${sh(full.pubkey)}</div>
+        <div class="k">refs</div><div class="v">${(full.refs||[]).length} reference(s)</div>
+        <div class="k">sealed</div><div class="v mono">${esc(full.timestamp_iso||'')}</div>
+      </div></div>`;
+
+      // Everything, raw.
+      html += '<details style="margin-top:14px;"><summary class="muted mono" style="cursor:pointer;font-size:12px;">raw JSON (full ring)</summary><pre style="font-size:11px;">'+esc(JSON.stringify(full,null,2))+'</pre></details>';
+
+      detailEl.innerHTML = html;
+    }
+
+    searchEl.addEventListener('input', renderRings);
+    typeEl.addEventListener('change', ()=>{ renderRings(); });
+    $('refresh').addEventListener('click', load);
+    load();
+  </script>
+</body>
+</html>
