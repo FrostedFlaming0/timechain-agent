@@ -1402,14 +1402,37 @@ def execute_task_retrieve(kwargs: dict, ctx: AgentContext) -> str:
     )
     if not rings:
         return "No matching blocks (is the task ingested and embedded?)."
+    task = ctx.registry.get(kwargs["task_name"]) or {}
+    source_root = task.get("source_root")
     out = []
+    stale = 0
     for r in rings:
         data = r.get("payload", {}).get("data", {}) or {}
+        rel = data.get("relative_path", "?")
         snippet = str(data.get("content") or "")[:200].replace("\n", " ")
-        out.append(f"[{r['index']:>4}] {data.get('relative_path', '?')}"
+        # The snippet is an INGESTED snapshot. Verify it against the live
+        # file so the model never asserts from stale code: each block is
+        # stamped with its source verdict (verified / source-mismatch /
+        # revision-drift / dirty-worktree / missing-source-file / …).
+        try:
+            verdict = recall.verify_source(
+                r["index"], repo=source_root).get("verdict", "?")
+        except Exception:                       # noqa: BLE001 — never block recall
+            verdict = "unverifiable"
+        if verdict not in ("verified", "no-source-path"):
+            stale += 1
+        out.append(f"[{r['index']:>4}] {rel}"
                    f":{data.get('line_start', '?')}-{data.get('line_end', '?')}"
-                   f"  score={r.get('_final_score', 0):.3f}  {snippet}")
-    return "\n".join(out)
+                   f"  score={r.get('_final_score', 0):.3f}  [{verdict}]  {snippet}")
+    header = (f"source_root: {source_root}\n"
+              f"Snippets below are INGESTED snapshots — read_file "
+              f"<source_root>/<relative_path> for LIVE source. ")
+    if stale:
+        header += (f"{stale}/{len(rings)} block(s) are NOT 'verified' against "
+                   f"live source — read the live file before asserting on those.\n")
+    else:
+        header += "All blocks verified against live source.\n"
+    return header + "\n".join(out)
 
 
 def execute_task_audit_source(kwargs: dict, ctx: AgentContext) -> str:
@@ -1453,20 +1476,26 @@ def execute_list_tasks(kwargs: dict, ctx: AgentContext) -> str:
     for name, t in pairs:
         active = " *active*" if name == ctx.active_task else ""
         lines.append(f"{name} [{t['status']}] {t['items_done']}/{t['items_total']}"
-                     f" — {t['objective'][:80]}{active}")
+                     f" — {t['objective'][:80]}{active}\n"
+                     f"    source: {t.get('source_root', '?')}"
+                     f"  (read_file <source>/<path> for LIVE files)")
     return "\n".join(lines)
 
 
 def execute_resolve_task(kwargs: dict, ctx: AgentContext) -> str:
     out = resolve_task(ctx.registry, kwargs["name_hint"])
     slim = dict(out)
+    # source_root is kept so the model can read_file the task's LIVE source
+    # (an absolute path under it is an allowed read root, even when inactive).
     for key in ("task",):
         if key in slim:
             slim[key] = {k: slim[key][k] for k in
-                         ("name", "objective", "status") if k in slim[key]}
+                         ("name", "objective", "status", "source_root")
+                         if k in slim[key]}
     for key in ("candidates", "all_tasks"):
         if key in slim:
-            slim[key] = [{k: t[k] for k in ("name", "objective", "status")
+            slim[key] = [{k: t[k] for k in
+                          ("name", "objective", "status", "source_root")
                           if k in t} for t in slim[key]]
     if out["status"] == "exact":
         ctx.active_task = out["task"]["name"]

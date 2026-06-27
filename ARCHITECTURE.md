@@ -2,7 +2,7 @@
 
 A guide to the files that make up the timechain agent, what each is responsible for, and how they fit together.
 
-**Version: 1.5.0.** This document describes the system as it currently
+**Version: 1.5.1.** This document describes the system as it currently
 stands. For the release-by-release history of how it got here, see
 [CHANGELOG.md](CHANGELOG.md).
 

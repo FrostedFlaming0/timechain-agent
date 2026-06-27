@@ -5,7 +5,7 @@ append-only memory substrate. Memory survives across sessions, is tamper-evident
 and can be cryptographically verified at any time. Provider-agnostic: works with
 Claude, GPT, Gemini, DeepSeek, any model on OpenRouter, or local models via Ollama.
 
-**Version: 1.5.0.** See [CHANGELOG.md](CHANGELOG.md) for the full release
+**Version: 1.5.1.** See [CHANGELOG.md](CHANGELOG.md) for the full release
 history. Project home:
 [github.com/frostedflaming0/timechain-agent](https://github.com/frostedflaming0/timechain-agent).
 
@@ -708,5 +708,5 @@ original architect. This project preserves that attribution above.
 
 ## Status
 
-Prototype, version 1.5.0. Works end-to-end. Not production-hardened. Issues
+Prototype, version 1.5.1. Works end-to-end. Not production-hardened. Issues
 and PRs welcome.

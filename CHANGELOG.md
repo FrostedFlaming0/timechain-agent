@@ -12,6 +12,61 @@ disk. Append-only means append-only, including for schema migrations.
 
 ---
 
+## v1.5.1 — 2026-06-13
+
+### Fixed — the agent can now read (and trust) task-chain source
+
+A user reported the agent confidently asserting **stale** code when comparing
+its working directory against another repo it had previously ingested as a
+task chain, and separately claiming it *could not read* source files in
+inactive task chains — sometimes with a literal "outside the allowed read
+roots" refusal. Reproducing the read-permission check against a real
+`AgentContext`/`TaskRegistry` showed there was **no permission bug**: an
+absolute path under any task's `source_root` (active or not) has been an
+allowed read root since v1.4.0 (`_resolve_allowed_path`, which whitelists every
+task's `source_root` via `registry.list_all()`). The real cause was a
+**discovery gap** — no tool ever told the model the absolute `source_root` of a
+task, so it could not construct a path to read live source and fell back to the
+ingested (point-in-time) snapshot, asserting from it as if it were current. The
+"outside the allowed read roots" message was the agent guessing a path it had
+never been given and missing.
+
+Three coordinated changes close the gap:
+
+- **Surface the path (discovery).** `list_tasks` now prints each task's
+  `source_root` with a read hint, and `resolve_task` no longer strips
+  `source_root` from its result. The model can now learn the exact absolute
+  path and `read_file` the live source of any task chain, active or inactive.
+
+- **Self-verifying retrieval.** `task_retrieve` now stamps every returned block
+  with a live source verdict (`verified` / `source-mismatch` / `revision-drift`
+  / `dirty-worktree` / `missing-source-file` / …) via `recall.verify_source`,
+  prints a `source_root` header, and — when any block has drifted — warns
+  "N/M block(s) are NOT 'verified' … read the live file before asserting".
+  Verification is read-only and wrapped so it can never block recall.
+  Detection deliberately does **not** trigger or suggest re-ingestion: the task
+  chain is a point-in-time audit record, drift detection is the feature, and
+  verification (read the live file) is the sufficient guard against stale
+  assertions. Re-ingesting changed files remains available on explicit user
+  request (`task_ingest_path … changed_only=true`) for deliberately refreshing
+  an audit baseline, but it is not nudged on every drift — that would add
+  duplicate versions to a chain that has no supersession or latest-per-path
+  dedup, making retrieval noisier without improving correctness.
+
+- **Prompt clarification.** `TOOL_SAFETY_PROMPT` now states `read_file` is not
+  limited to the working directory (any path under a task `source_root` is
+  readable, including inactive tasks), that `task_retrieve` returns ingested
+  *snapshots* tagged with a verdict, and that the agent must verify against
+  live source — never assert from a snapshot whose verdict is not `verified`.
+
+No schema or chain-format change; existing chains read unchanged. Verified with
+the full `test_tools.py` (176) and `test_timechain.py` (310) suites plus an
+end-to-end drift check: a freshly ingested block reads `verified`, and mutating
+the live file flips the next retrieval to `source-mismatch` with the refresh
+suggestion.
+
+---
+
 ## v1.5.0 — 2026-06-13
 
 ### Changed — default Anthropic model is now Opus 4.8 (Fable 5 withdrawn)

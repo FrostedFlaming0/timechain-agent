@@ -19,7 +19,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "timechain-agent"
-version = "1.5.0"
+version = "1.5.1"
 description = "Persistent-memory AI agent on a signed, hash-chained, append-only memory substrate"
 readme = "README.md"
 license = { file = "LICENSE" }
