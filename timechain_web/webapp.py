@@ -64,6 +64,7 @@ except ImportError:
 from chain import Chain, load_or_create_key
 from retrieval import EmbeddingIndex, Retriever
 from agent import Agent
+from metadata import build_meta, SOURCE_USER, SOURCE_ASSISTANT
 from run import (
     DATA_DIR,
     LLM_PROVIDER,
@@ -72,7 +73,6 @@ from run import (
     SEMANTIC_K,
     EMBED_DIM,
     AUTO_REFLECT_EVERY,
-    REFLECT_WINDOW,
     build_llm,
     make_sentence_embedder,
 )
@@ -357,7 +357,7 @@ async def run_command(request: Request, body: dict):
             return {"kind": "sysprompt", "entries": entries}
 
         if cmd == "/reflect":
-            rec = state.agent.reflect(window=REFLECT_WINDOW)
+            rec = state.agent.reflect()
             if rec is None:
                 return {"kind": "reflect", "result": "not_enough_history"}
             state.index.index_record(rec)
@@ -463,7 +463,7 @@ async def turn(request: Request, body: dict):
         # Auto-reflection mirrors run.py's behavior.
         reflection_rec = None
         if AUTO_REFLECT_EVERY > 0 and state.turns_since_reflect >= AUTO_REFLECT_EVERY:
-            reflection_rec = state.agent.reflect(window=REFLECT_WINDOW)
+            reflection_rec = state.agent.reflect()
             if reflection_rec is not None:
                 state.index.index_record(reflection_rec)
             state.turns_since_reflect = 0
@@ -506,7 +506,21 @@ async def turn_stream(request: Request, input: str, session: str):
 
             # 1. Commit observation up front so the user can see the index
             # immediately, and the response can ref it.
-            obs = chain.append("observation", {"text": user_input})
+            # NOTE: we write the same v1.1 _meta block here that
+            # agent.turn() does — the streaming endpoint inlines chain
+            # writes (rather than calling agent.turn()) so it can split
+            # the LLM call into a thread. We must keep metadata in sync.
+            obs = chain.append(
+                "observation",
+                {
+                    "text": user_input,
+                    "_meta": build_meta(
+                        "observation",
+                        source=SOURCE_USER,
+                        confidence=1.0,
+                    ),
+                },
+            )
             state.index.index_record(obs)
             yield {
                 "event": "observation",
@@ -577,7 +591,18 @@ async def turn_stream(request: Request, input: str, session: str):
 
             # 4. Commit response with refs. Back on the main thread.
             refs = [r.record_hash for r in context] + [obs.record_hash]
-            response = chain.append("response", {"text": response_text}, refs=refs)
+            response = chain.append(
+                "response",
+                {
+                    "text": response_text,
+                    "_meta": build_meta(
+                        "response",
+                        source=SOURCE_ASSISTANT,
+                        confidence=0.9,
+                    ),
+                },
+                refs=refs,
+            )
             state.index.index_record(response)
             state.turns_since_reflect += 1
 
@@ -594,7 +619,7 @@ async def turn_stream(request: Request, input: str, session: str):
             # for now; if it becomes an issue, refactor Agent.reflect to
             # split the LLM call out the way we did above.
             if AUTO_REFLECT_EVERY > 0 and state.turns_since_reflect >= AUTO_REFLECT_EVERY:
-                reflection_rec = agent.reflect(window=REFLECT_WINDOW)
+                reflection_rec = agent.reflect()
                 if reflection_rec is not None:
                     state.index.index_record(reflection_rec)
                     yield {

@@ -392,7 +392,7 @@ class TestAgent:
     def test_reflect_needs_history(self, agent, index):
         agent.commit_genesis(["be honest"])
         # Not enough substantive records yet
-        assert agent.reflect(window=10) is None
+        assert agent.reflect() is None
 
     def test_reflect_writes_record(self, agent, index):
         agent.commit_genesis(["be honest"])
@@ -400,7 +400,7 @@ class TestAgent:
             t = agent.turn(msg)
             index.index_record(t.observation_record)
             index.index_record(t.response_record)
-        rec = agent.reflect(window=20)
+        rec = agent.reflect()
         assert rec is not None
         assert rec.type == "reflection"
         assert "text" in rec.content
@@ -436,7 +436,7 @@ class TestAgent:
             t = agent.turn(msg)
             index.index_record(t.observation_record)
             index.index_record(t.response_record)
-        agent.reflect(window=20)
+        agent.reflect()
         agent.revise(2, "correction")
         ok, msg = agent.chain.verify(expected_pubkey=agent.chain.pubkey_hex)
         assert ok, msg
@@ -642,7 +642,7 @@ class TestContextBudget:
             t = agent.turn(f"long observation {i} " * 10)
             index.index_record(t.observation_record)
             index.index_record(t.response_record)
-        refl = agent.reflect(window=10)
+        refl = agent.reflect()
         if refl:
             index.index_record(refl)
 

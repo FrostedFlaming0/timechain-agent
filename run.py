@@ -1,8 +1,7 @@
 """
 run — interactive entry point for a real, persistent timechain agent.
 
-Unlike demo.py (which uses a temp dir, mock LLM, and toy embedder), this
-script:
+This script:
   - Stores the chain, embedding index, and operator key in a stable directory
     so memory persists across runs.
   - Uses a real LLM client (see llm_clients.py — Claude, OpenAI, Gemini, Ollama).
@@ -92,8 +91,10 @@ EMBED_DIM = 384    # matches all-MiniLM-L6-v2; change if you swap models
 
 # Reflection cadence — auto-reflect every N turns. Set to 0 to disable
 # auto-reflection (you can still trigger it manually with /reflect).
+# Each reflection automatically covers every record since the previous
+# reflection (or since genesis if there hasn't been one yet), so the
+# scope sizes itself to actual activity rather than a fixed window.
 AUTO_REFLECT_EVERY = 10
-REFLECT_WINDOW = 20  # how many recent records to include in each reflection
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +246,7 @@ def run() -> None:
                 continue
             if user_input == "/reflect":
                 print("  reflecting...")
-                rec = agent.reflect(window=REFLECT_WINDOW)
+                rec = agent.reflect()
                 if rec is None:
                     print("  not enough history to reflect on yet")
                 else:
@@ -315,7 +316,7 @@ def run() -> None:
             # Auto-reflect every N turns, if enabled
             if AUTO_REFLECT_EVERY > 0 and turns_since_reflect >= AUTO_REFLECT_EVERY:
                 print("  [auto-reflecting on recent history...]")
-                rec = agent.reflect(window=REFLECT_WINDOW)
+                rec = agent.reflect()
                 if rec is not None:
                     index.index_record(rec)
                     print(f"  [reflection committed at index {rec.index}]\n")

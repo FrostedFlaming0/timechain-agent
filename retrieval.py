@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -25,6 +26,7 @@ import numpy as np
 from sklearn.neighbors import NearestNeighbors
 
 from chain import Chain, Record
+from metadata import read_meta, half_life_days
 
 
 Embedder = Callable[[str], np.ndarray]
@@ -148,49 +150,116 @@ class RetrievalHit:
     record: Record
     score: float
     reason: str  # "semantic", "recent", "type", "ancestry"
+    # Score breakdown — useful for debugging and for tuning weights.
+    # Empty for non-semantic hits (recency / ancestry) where the score
+    # isn't a weighted blend.
+    components: dict = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.components is None:
+            object.__setattr__(self, "components", {})
 
 
 class Retriever:
+    """
+    Read-side intelligence over the chain. Three things to know:
+
+    1. Salience is per-record, read from the v2 metadata block on the record.
+       v1 records (without _meta) get type-based defaults from metadata.py.
+       This replaces the old per-type DEFAULT_SALIENCE constant — the
+       defaults still exist (in metadata.py) but only kick in for v1 records.
+
+    2. Recency uses per-kind half-lives. A genesis record from a year ago
+       is still as relevant as it was; an observation from a week ago has
+       decayed substantially. The score is 0.5 ** (age_days / half_life).
+
+    3. Revision-aware. Records that have been superseded by a later
+       revision get a demotion penalty — they still surface (the
+       conflict itself is informative) but rank below their corrections.
+    """
+
     def __init__(self, chain: Chain, index: EmbeddingIndex):
         self.chain = chain
         self.index = index
 
-    # ----- hybrid: semantic + structural -----
+    # ----- score weights -----
 
-    # ----- hybrid: semantic + structural + salience -----
+    # Weights for the hybrid score. Tunable; named so the impact of each
+    # term is visible in `RetrievalHit.components`. They sum to 1.0 to keep
+    # raw scores in roughly [0, 1.5] range (semantic + boosts).
+    W_SEMANTIC = 0.55
+    W_SALIENCE = 0.25
+    W_RECENCY  = 0.20
 
-    # Default salience weights by record type. Reflections represent the
-    # agent's own judgment about what mattered, so they get a strong boost.
-    # Revisions matter because they correct prior records. System prompts and
-    # genesis are foundational identity records — boosted modestly so they
-    # surface when relevant. Observations and responses are the baseline.
-    DEFAULT_SALIENCE = {
-        "reflection": 0.20,
-        "revision": 0.15,
-        "file": 0.12,
-        "genesis": 0.10,
-        "system_prompt": 0.05,
-        "observation": 0.0,
-        "response": 0.0,
-    }
+    # Penalty subtracted from a hit's score when a later revision
+    # supersedes it. Applied AFTER the weighted sum, so it can push a
+    # superseded record below an otherwise-weaker correction. Set high
+    # enough to flip ordering when both are retrieved together, but not
+    # so high the original drops out of context entirely.
+    SUPERSEDED_PENALTY = 0.30
+
+    # ----- helpers -----
+
+    def _superseded_indices(self) -> set[int]:
+        """
+        Indices of records that have been superseded by a later revision.
+        Computed by scanning revision records and reading their `supersedes`
+        pointer (from _meta) or the legacy `revises_index` field.
+        Cached per-call; recomputed each time hybrid()/build_context() runs.
+        """
+        revisions = self.chain.query_by_type("revision", limit=1000)
+        out: set[int] = set()
+        for rev in revisions:
+            meta = read_meta(rev)
+            if meta.supersedes is not None:
+                out.add(meta.supersedes)
+        return out
+
+    @staticmethod
+    def _recency_score(age_seconds: float, half_life_seconds: float) -> float:
+        """0.5 ** (age / half_life). Capped to [0, 1] for numerical safety."""
+        if half_life_seconds <= 0:
+            return 0.0
+        try:
+            return float(0.5 ** (age_seconds / half_life_seconds))
+        except OverflowError:
+            return 0.0
+
+    # ----- hybrid: semantic + structural + salience + recency + revision-aware -----
 
     def hybrid(
         self,
         query: str,
         k: int = 10,
         type_filter: Optional[str] = None,
-        recency_weight: float = 0.0,
-        salience_weights: Optional[dict] = None,
+        recency_weight: Optional[float] = None,  # back-compat; overrides W_RECENCY
+        salience_weights: Optional[dict] = None,  # back-compat; ignored if None
     ) -> list[RetrievalHit]:
         """
-        Semantic search with optional type filter, recency boost, and
-        per-type salience boost. Salience lets reflection and revision
-        records surface preferentially even when they're not the closest
-        semantic match — modeling "the agent's own sense of what mattered."
+        Semantic search plus per-record salience, per-kind recency decay,
+        and revision-aware demotion.
+
+        Score formula:
+            base = W_SEMANTIC*similarity + W_SALIENCE*salience + W_RECENCY*recency
+            score = base - (SUPERSEDED_PENALTY if record is superseded else 0)
+
+        - similarity: cosine sim from the embedding index, in [0, 1].
+        - salience:   from the record's _meta block, in [0, 1].
+        - recency:    0.5 ** (age_days / half_life_days_for_type), in [0, 1].
+
+        Back-compat: `recency_weight` and `salience_weights` are still
+        accepted but their interpretation has shifted —
+          - recency_weight: if set, overrides the default W_RECENCY.
+          - salience_weights: now ignored. Salience is per-record from _meta,
+            with type defaults from metadata.py for v1 records. Pass-through
+            kept so old callers don't crash.
         """
-        salience = salience_weights if salience_weights is not None else self.DEFAULT_SALIENCE
+        w_recency = self.W_RECENCY if recency_weight is None else float(recency_weight)
         candidates = self.index.search(query, k=max(k * 4, 20))
-        head_idx = self.chain.length() - 1
+        if not candidates:
+            return []
+        superseded = self._superseded_indices()
+        now_seconds = time.time()
         hits: list[RetrievalHit] = []
         for rec_idx, sim in candidates:
             rec = self.chain.get(rec_idx)
@@ -198,10 +267,26 @@ class Retriever:
                 continue
             if type_filter and rec.type != type_filter:
                 continue
-            recency = 1.0 - (head_idx - rec_idx) / max(head_idx + 1, 1) if head_idx >= 0 else 0.0
-            sal = salience.get(rec.type, 0.0)
-            score = sim + recency_weight * recency + sal
-            hits.append(RetrievalHit(rec, score, "semantic"))
+            meta = read_meta(rec)
+            age_seconds = max(0.0, now_seconds - rec.timestamp / 1000.0)
+            half_life_seconds = half_life_days(rec.type) * 86400.0
+            recency = self._recency_score(age_seconds, half_life_seconds)
+            base = (
+                self.W_SEMANTIC * sim
+                + self.W_SALIENCE * meta.salience
+                + w_recency * recency
+            )
+            penalty = self.SUPERSEDED_PENALTY if rec.index in superseded else 0.0
+            score = base - penalty
+            components = {
+                "semantic": float(sim),
+                "salience": float(meta.salience),
+                "recency": float(recency),
+                "superseded_penalty": float(penalty),
+                "source": meta.source,
+                "confidence": float(meta.confidence),
+            }
+            hits.append(RetrievalHit(rec, score, "semantic", components))
         hits.sort(key=lambda h: h.score, reverse=True)
         return hits[:k]
 
@@ -209,7 +294,7 @@ class Retriever:
 
     def ancestry(self, record_hash: str, depth: int = 3) -> list[RetrievalHit]:
         recs = self.chain.follow_refs(record_hash, depth=depth)
-        return [RetrievalHit(r, 1.0, "ancestry") for r in recs]
+        return [RetrievalHit(r, 1.0, "ancestry", {}) for r in recs]
 
     # ----- temporal window -----
 
@@ -218,7 +303,7 @@ class Retriever:
             recs = self.chain.query_by_type(type_filter, limit=n)
         else:
             recs = self.chain.query_recent(limit=n)
-        return [RetrievalHit(r, 1.0, "recent") for r in recs]
+        return [RetrievalHit(r, 1.0, "recent", {}) for r in recs]
 
     # ----- combined context for LLM -----
 
@@ -230,8 +315,14 @@ class Retriever:
         type_filter: Optional[str] = None,
     ) -> list[Record]:
         """
-        Practical default: blend semantic hits with recent records, dedup,
-        return chronological order suitable for an LLM context window.
+        Blend semantic hits with recent records, dedup, return in
+        chronological order suitable for an LLM context window.
+
+        Revision pull-in: when a record in the result set has been
+        superseded by a revision, that revision is automatically pulled
+        in too (if not already present). The model needs to see both
+        the original claim and its correction together — that's the
+        point of keeping both around.
         """
         semantic = self.hybrid(query, k=k_semantic, type_filter=type_filter)
         recent = self.recent(n=n_recent, type_filter=type_filter)
@@ -242,6 +333,20 @@ class Retriever:
                 continue
             seen.add(hit.record.index)
             merged.append(hit.record)
+
+        # Pull in revisions that supersede anything we've retrieved.
+        # Without this, the model can see a stale claim and miss the
+        # correction sitting on the chain.
+        merged_indices = {r.index for r in merged}
+        revision_pull_ins: list[Record] = []
+        all_revisions = self.chain.query_by_type("revision", limit=1000)
+        for rev in all_revisions:
+            meta = read_meta(rev)
+            if meta.supersedes in merged_indices and rev.index not in merged_indices:
+                revision_pull_ins.append(rev)
+                merged_indices.add(rev.index)
+        merged.extend(revision_pull_ins)
+
         merged.sort(key=lambda r: r.index)
         return merged
 

@@ -28,6 +28,14 @@ from typing import Callable, Optional
 from chain import Chain, Record
 from retrieval import Retriever, RetrievalHit
 from file_ingest import IngestResult, ingest_file as _ingest_file
+from metadata import (
+    build_meta,
+    read_meta,
+    SOURCE_USER,
+    SOURCE_ASSISTANT,
+    SOURCE_SYSTEM,
+    SOURCE_TOOL,
+)
 
 
 # Pluggable LLM interface — implement this for whatever model you're using.
@@ -134,7 +142,12 @@ class Agent:
             "genesis",
             {
                 "commitments": founding_commitments,
-                "schema_version": 1,
+                "_meta": build_meta(
+                    "genesis",
+                    source=SOURCE_SYSTEM,
+                    salience=1.0,        # foundational — never decay out
+                    confidence=1.0,
+                ),
             },
         )
 
@@ -187,12 +200,29 @@ class Agent:
             return None  # unchanged, nothing to log
         return self.chain.append(
             "system_prompt",
-            {"text": self.system_prompt, "schema_version": 1},
+            {
+                "text": self.system_prompt,
+                "_meta": build_meta(
+                    "system_prompt",
+                    source=SOURCE_SYSTEM,
+                    confidence=1.0,
+                ),
+            },
         )
 
     def turn(self, user_input: str, retrieve_k: int = 5) -> AgentTurn:
         # 1. Commit observation
-        obs = self.chain.append("observation", {"text": user_input})
+        obs = self.chain.append(
+            "observation",
+            {
+                "text": user_input,
+                "_meta": build_meta(
+                    "observation",
+                    source=SOURCE_USER,
+                    confidence=1.0,  # the user said it; that's a fact about what was said
+                ),
+            },
+        )
 
         # 2. Retrieve relevant context
         context = self.retriever.build_context(
@@ -218,7 +248,18 @@ class Agent:
         # 6. Commit response with refs to what informed it
         refs = [r.record_hash for r in context] + [obs.record_hash]
         response = self.chain.append(
-            "response", {"text": response_text}, refs=refs
+            "response",
+            {
+                "text": response_text,
+                "_meta": build_meta(
+                    "response",
+                    source=SOURCE_ASSISTANT,
+                    # Default confidence for a response is high but not 1.0 —
+                    # the model's output is its best effort, not ground truth.
+                    confidence=0.9,
+                ),
+            },
+            refs=refs,
         )
 
         return AgentTurn(
@@ -269,27 +310,69 @@ class Agent:
     # what it noticed. Triggered manually (/reflect) or periodically.
     # -----------------------------------------------------------------
 
-    def reflect(self, window: int = 20) -> Optional[Record]:
+    def reflect(self, max_records: int = 200) -> Optional[Record]:
         """
-        Read the last `window` records, ask the LLM to reflect on them, and
-        write the reflection as a new chain record. Reflections become part
-        of retrievable memory and get a salience boost in retrieval.
+        Reflect on every record since the last reflection (or since
+        genesis if there hasn't been one yet). The size of the window is
+        determined dynamically — a reflection covers exactly the slice
+        of chain history that the previous reflection didn't.
+
+        `max_records` is a safety cap. If the lookback would exceed it,
+        only the most recent `max_records` are reflected on. This
+        protects against runaway size when auto-reflection is disabled
+        and the chain has grown a lot since the last manual `/reflect`.
+        Tunable per call; default of 200 fits comfortably in any modern
+        LLM context window.
 
         Returns the new reflection record, or None if there's not enough
-        history to reflect on yet.
+        history to reflect on yet (fewer than 4 substantive records in
+        the lookback). Reflections become part of retrievable memory and
+        carry high default salience.
         """
-        recent = self.chain.query_recent(limit=window)
-        # Skip if we have nothing meaningful — genesis only, or just the
-        # system prompt record.
+        # Find where the last reflection landed. Records strictly after
+        # that index are the ones this reflection should cover. If there
+        # is no prior reflection, start from index 0 (genesis).
+        prior_reflections = self.chain.query_by_type("reflection", limit=1)
+        if prior_reflections:
+            start_idx = prior_reflections[0].index + 1
+        else:
+            start_idx = 0
+
+        head_idx = self.chain.length() - 1
+        if head_idx < start_idx:
+            return None  # nothing new since last reflection
+
+        # Apply the safety cap. If the unbounded window would be larger
+        # than max_records, we only look at the tail of it. Note this
+        # creates a gap — records between start_idx and the new effective
+        # start are skipped by *this* reflection. That's the trade-off
+        # against trying to summarize an unbounded window.
+        effective_start = max(start_idx, head_idx - max_records + 1)
+        capped = effective_start > start_idx
+
+        recent = list(self.chain.iter_records(start=effective_start, end=head_idx + 1))
+
+        # Skip if we don't have enough conversational substance to reflect
+        # on. Files and system prompts alone aren't a useful reflection
+        # subject — we want at least a few back-and-forth turns.
         substantive = [r for r in recent if r.type in ("observation", "response", "reflection", "revision")]
         if len(substantive) < 4:
             return None
 
-        recent_chronological = sorted(recent, key=lambda r: r.index)
-        history_text = self._format_history_for_reflection(recent_chronological)
+        history_text = self._format_history_for_reflection(recent)
+
+        cap_note = ""
+        if capped:
+            cap_note = (
+                f"NOTE: a long stretch of history accumulated since the last "
+                f"reflection. This reflection covers only the most recent "
+                f"{max_records} records of that stretch; earlier records in "
+                f"the gap were not included.\n\n"
+            )
 
         prompt = (
-            "Below are the most recent records from your memory, in order.\n"
+            "Below are the records from your memory since your last\n"
+            "reflection (or since the beginning, if this is your first).\n"
             "Reflect on them. What stands out? What patterns do you notice?\n"
             "What might be worth revisiting or correcting? What did the user\n"
             "seem to actually be reaching for, beyond their literal questions?\n"
@@ -297,7 +380,8 @@ class Agent:
             "Be concise — a few paragraphs. Write for your future self, who\n"
             "will retrieve this when something relevant comes up. Skip\n"
             "throat-clearing; just say what you noticed.\n\n"
-            f"Recent records:\n{history_text}"
+            f"{cap_note}"
+            f"Records (indices {effective_start}–{head_idx}):\n{history_text}"
         )
 
         if self.system_prompt:
@@ -305,10 +389,25 @@ class Agent:
         else:
             reflection_text = self.llm(prompt)
 
-        refs = [r.record_hash for r in recent_chronological]
+        refs = [r.record_hash for r in recent]
         return self.chain.append(
             "reflection",
-            {"text": reflection_text, "window_size": window},
+            {
+                "text": reflection_text,
+                # Store the actual span this reflection covered, so the
+                # chain history (and view_chain.py) shows what was
+                # reflected on. Replaces the old fixed `window_size` field.
+                "covers_indices": [effective_start, head_idx],
+                "window_size": len(recent),  # back-compat for any reader
+                "capped": capped,
+                "_meta": build_meta(
+                    "reflection",
+                    source=SOURCE_ASSISTANT,
+                    # Reflections are the agent's read of what mattered —
+                    # important (high salience) but inferential, not factual.
+                    confidence=0.7,
+                ),
+            },
             refs=refs,
         )
 
@@ -335,7 +434,13 @@ class Agent:
                 "in the Agent constructor"
             )
         result: IngestResult = _ingest_file(path, self.blob_dir)
-        return self.chain.append("file", result.to_record_content())
+        content = result.to_record_content()
+        content["_meta"] = build_meta(
+            "file",
+            source=SOURCE_TOOL,
+            confidence=1.0,  # the bytes are what they are; sha256 verifies it
+        )
+        return self.chain.append("file", content)
 
     def revise(self, target_index: int, correction_text: str) -> Optional[Record]:
         """
@@ -353,8 +458,17 @@ class Agent:
             "revision",
             {
                 "text": correction_text,
+                # Kept at top level for backward compatibility with
+                # view_chain.py and any existing reader code. The canonical
+                # "this supersedes record N" pointer also lives in _meta.
                 "revises_index": target_index,
                 "revises_hash": target.record_hash,
+                "_meta": build_meta(
+                    "revision",
+                    source=SOURCE_ASSISTANT,
+                    confidence=0.95,
+                    supersedes=target_index,
+                ),
             },
             refs=[target.record_hash],
         )
@@ -374,25 +488,19 @@ class Agent:
             lines.append(f"[{rec.index} | {when}] {rec.type}: {content}")
         return "\n".join(lines)
 
-    # Priority order for keeping records under the char budget. Higher
-    # priority records are kept first when truncation is needed. Ties are
-    # broken by recency (newer wins) inside _truncate_to_budget.
-    _RETENTION_PRIORITY = {
-        "reflection": 5,
-        "revision": 4,
-        "file": 4,
-        "genesis": 3,
-        "system_prompt": 2,
-        "response": 1,
-        "observation": 0,
-    }
+    # Truncation order is driven by per-record salience (see _truncate_to_budget).
 
     def _truncate_to_budget(
         self, records: list[Record], fixed_overhead_chars: int
     ) -> tuple[list[Record], int]:
         """
-        Drop lowest-priority records until the total rendered context fits
+        Drop lowest-salience records until the total rendered context fits
         under (context_char_budget - fixed_overhead_chars).
+
+        Salience is read from each record's _meta block (with type-based
+        defaults for v1 records — see metadata.py). This replaces the older
+        type-priority table: per-record salience is finer-grained and the
+        record itself is the right place for that judgment to live.
 
         Returns (kept_records, dropped_count). Kept records are returned in
         chronological order regardless of priority.
@@ -410,10 +518,10 @@ class Agent:
         if total <= budget:
             return records, 0
 
-        # Sort by retention priority desc, then index desc (newer first within type).
+        # Sort by salience desc, then index desc (newer first within ties).
         ranked = sorted(
             sized,
-            key=lambda rs: (self._RETENTION_PRIORITY.get(rs[0].type, 0), rs[0].index),
+            key=lambda rs: (read_meta(rs[0]).salience, rs[0].index),
             reverse=True,
         )
         kept: list[Record] = []
@@ -450,13 +558,27 @@ class Agent:
         fixed_overhead = 600 + len(user_input)
         all_recs, dropped = self._truncate_to_budget(all_recs, fixed_overhead)
 
+        # Compute supersession set so we can flag superseded originals.
+        # Read from revision _meta (or legacy revises_index) — see read_meta.
+        superseded_indices = set()
+        for rev in revisions:
+            rmeta = read_meta(rev)
+            if rmeta.supersedes is not None:
+                superseded_indices.add(rmeta.supersedes)
+
         ctx_blocks = []
         for rec in all_recs:
+            # Strip _meta from rendered content — it's metadata about the
+            # record, not part of what the record says. Source/salience
+            # surface as visible tags below instead.
+            display_content = rec.content
+            if isinstance(display_content, dict) and "_meta" in display_content:
+                display_content = {k: v for k, v in display_content.items() if k != "_meta"}
             try:
                 if rec.type == "file":
                     # Render files specially: a short metadata header plus
                     # the extracted text. Keeps prompt compact and readable.
-                    c = rec.content
+                    c = display_content if isinstance(display_content, dict) else {}
                     trunc = " (text truncated)" if c.get("extraction_truncated") else ""
                     content_repr = (
                         f'file: {c.get("filename", "?")} ({c.get("kind", "?")}, '
@@ -465,15 +587,27 @@ class Agent:
                         f'{c.get("extracted_text", "")}'
                     )
                 else:
-                    content_repr = json.dumps(rec.content, ensure_ascii=False)
+                    content_repr = json.dumps(display_content, ensure_ascii=False)
             except (TypeError, ValueError):
-                content_repr = str(rec.content)
+                content_repr = str(display_content)
+
+            meta = read_meta(rec)
             tag = rec.type
             if rec.type == "revision":
-                tag = f"revision (corrects #{rec.content.get('revises_index')})"
+                rev_target = rec.content.get("revises_index") if isinstance(rec.content, dict) else None
+                if rev_target is None:
+                    rev_target = meta.supersedes
+                tag = f"revision (corrects #{rev_target})"
+            if rec.index in superseded_indices:
+                tag = f"{tag}, SUPERSEDED"
+
+            # Source is the load-bearing distinction: was this said by the
+            # user, said by the agent, declared by the operator, or produced
+            # by a tool? Surfacing it lets the model treat its own past
+            # inferences differently from things the user actually said.
             when = _humanize_delta((now_ms - rec.timestamp) / 1000)
             ctx_blocks.append(
-                f"[record {rec.index} | {tag} | {when}] {content_repr}"
+                f"[record {rec.index} | {tag} | {meta.source} | {when}] {content_repr}"
             )
         ctx = "\n".join(ctx_blocks) if ctx_blocks else "(no prior context)"
         head_idx = self.chain.length() - 1
@@ -509,8 +643,14 @@ class Agent:
             "The records below are a SELECTIVE retrieval based on relevance — gaps\n"
             "in indices do not mean records are missing, only that they weren't\n"
             "retrieved this turn. Don't speculate about what's not shown.\n"
-            "Records of type 'revision' correct earlier records — when both are\n"
-            "shown, the revision supersedes the original.\n"
+            "Each record is tagged with its source: 'user' (the user said it),\n"
+            "'assistant' (you said or inferred it), 'system' (operator config),\n"
+            "or 'tool' (produced by a tool such as file ingestion). Treat user\n"
+            "statements as evidence about what was said; treat your own past\n"
+            "inferences as inferences, not facts.\n"
+            "Records of type 'revision' correct earlier records. Records marked\n"
+            "SUPERSEDED have been corrected by a later revision — read both, but\n"
+            "trust the revision over the original where they conflict.\n"
             "Each record shows its relative time (e.g. '3 hours ago'); use this\n"
             "naturally when relevant, but don't over-narrate it.\n\n"
             f"{truncation_note}"
@@ -521,14 +661,14 @@ class Agent:
 
 
 # ---------------------------------------------------------------------------
-# Mock LLM for the demo (so the demo is reproducible and offline)
+# Mock LLM for tests and offline use (deterministic, no network, no API keys)
 # ---------------------------------------------------------------------------
 
 class MockLLM:
     """
     Deterministic fake model. Echoes back a structured summary of context +
-    input so the demo shows the chain doing its job without needing API keys.
-    Replace with a real LLM client.
+    input so tests and offline experimentation can exercise the chain
+    without needing API keys. Replace with a real LLM client for real use.
     """
 
     def __call__(self, prompt: str, system: Optional[str] = None,
