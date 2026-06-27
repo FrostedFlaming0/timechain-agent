@@ -5,7 +5,7 @@ append-only memory substrate. Memory survives across sessions, is tamper-evident
 and can be cryptographically verified at any time. Provider-agnostic: works with
 Claude, GPT, Gemini, DeepSeek, any model on OpenRouter, or local models via Ollama.
 
-**Version: 1.4.0.** See [CHANGELOG.md](CHANGELOG.md) for the full release
+**Version: 1.5.0.** See [CHANGELOG.md](CHANGELOG.md) for the full release
 history. Project home:
 [github.com/frostedflaming0/timechain-agent](https://github.com/frostedflaming0/timechain-agent).
 
@@ -41,6 +41,19 @@ remembered exchange happened, and when there's been a long gap between sessions.
   turn (`uncertainty`, `insight_markers`, `cognitive_weather`, etc.) —
   not used for retrieval but readable when the agent revisits its own
   history.
+- **Second-look memory** — `recall_index`/`recall_fetch` tools let the
+  model pull identity-chain records the automatic pass missed, mid-turn,
+  judging relevance from a compact map by understanding; fetched records
+  are ref'd by the sealed response. Automatic retrieval stays the
+  deterministic baseline.
+- **Deep think** — for hard or high-stakes questions the model is
+  routed (via the tools prompt) to fork 3–5 named perspectives of
+  itself within its own response, score each on the six PoQ
+  dimensions, and call `think_collapse`: the winning synthesis is
+  sealed as its own chain record (rejected forks preserved in the
+  payload) and the turn's response references it. No extra LLM calls —
+  the forking happens inside the one response; routine questions skip
+  it.
 - **Hybrid retrieval** with explicit, named score components: semantic
   similarity, per-record salience, and per-kind half-life recency decay.
   Observations decay over weeks; reflections over months; genesis and
@@ -92,10 +105,21 @@ remembered exchange happened, and when there's been a long gap between sessions.
 - **Code-working agent** — the default turn is a text-parsed tool-calling
   loop (`turn_with_tools`): the model can read files, open per-task
   continuum chains, ingest repositories as data-height blocks, retrieve
-  path-aware, and audit chain blocks against live source. Writes never
-  execute directly — `write_file` creates a durable PendingOperation that
-  only the user can `/approve` (optimistic concurrency, atomic replace,
-  idempotent ingest, automatic post-write audit).
+  path-aware, and audit chain blocks against live source. Recursive
+  ingests are volume-gated (ask, never block): a bounded pre-walk survey
+  asks for explicit confirmation — with the surveyed numbers — above
+  1,000 files or 1 GB; oversized files stream through the chunker with
+  bounded memory; PDF/Office trees ingest as extracted, searchable text.
+  Writes never
+  execute directly — `write_file` creates a durable PendingOperation, the
+  turn pauses, and only the user can approve (optimistic concurrency,
+  atomic replace, idempotent ingest, automatic post-write audit). The
+  decision happens mid-turn and is embedded in the turn's response record;
+  no decision within 300s auto-expires the proposal. A `.docx` target
+  generates a real Word document from the model's markdown (python-docx
+  when installed, stdlib WordprocessingML otherwise) — the approval card
+  shows the readable source; the chain seals it searchable with the
+  binary's hash.
 - **Task chains** — `task_registry.py` + `/task` commands manage per-task
   continuum chains under `timechain_data/tasks/<name>/`, each with its own
   chain database, signing key, and embedding index. Task selection is
@@ -219,6 +243,15 @@ here corresponds to a real boot-time indexing failure — and prints
 OK/FAILED with timing and chunk count for each, so a problem record (or
 a slow embedder) is pinned down immediately rather than appearing as a
 silent hang.
+
+For retrieval *latency* rather than correctness, `python
+bench_retrieval.py [size ...]` is the permanent tripwire: it measures
+per-turn (write + search) and warm-search latency on synthetic chains
+(default 1k/10k/50k records). Per-turn writes append to the in-memory
+search matrix incrementally, so brute-force cosine stays fast; when warm
+search crosses ~200 ms at your real chain size, that is the measured
+signal to put a shortlist pre-filter in front of it — and not before,
+since every pre-filter trades recall quality for speed.
 
 ### Reviewing Cambium proposals
 
@@ -407,9 +440,11 @@ All slash commands from the REPL work the same way:
 Tool turns work in the browser too: the streaming endpoint runs the same
 tool loop as the REPL (one shared driver, so the safety gates can't drift),
 showing each tool call as a collapsible note in the transcript. When the
-agent proposes a `write_file`, the UI renders an approve/reject card — the
-write happens only when you click approve (`POST
-/api/pending-ops/{id}/approve`), never autonomously.
+agent proposes a `write_file`, the turn PAUSES and the UI renders an
+approve/reject card — the write happens only when you click approve (`POST
+/api/pending-ops/{id}/approve`), never autonomously. The decision resolves
+mid-turn: the agent continues from the real outcome (written / rejected /
+expired) and your decision is recorded in that turn's response record.
 
 Content ingestion runs through the continuum path: paste or upload via the
 web attach button (`POST /api/upload`) or the `ingest_blob` tool. Uploads
@@ -545,7 +580,9 @@ choices are informed.
   stay consistent with later. Two mechanisms mitigate this: **semantic
   relevance dominates selection** (weight `0.55` vs `0.25` for salience),
   so a response that's relevant to the query still surfaces; and
-  **observation/response turn-pair stitching** pulls a response in with its
+  **observation/response turn-pair stitching** (legacy chains only — new
+  turns seal ONE response record carrying the input as `content.context`,
+  so the Q&A unit is never split) pulls a response in with its
   observation (and vice versa) so a retrieved half brings its partner. An
   earlier `artifact_content` *salience boost* (lifting code/structured
   responses toward `ARTIFACT_SALIENCE_MAX`) was **removed** — it was a
@@ -671,5 +708,5 @@ original architect. This project preserves that attribution above.
 
 ## Status
 
-Prototype, version 1.4.0. Works end-to-end. Not production-hardened. Issues
+Prototype, version 1.5.0. Works end-to-end. Not production-hardened. Issues
 and PRs welcome.

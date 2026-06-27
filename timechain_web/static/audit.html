@@ -219,7 +219,22 @@
       const meta = (c && c._meta) || {};
       const poq = meta.poq || null;
       let html = detailHead(r);
-      html += '<pre>'+esc(full.text && full.text.trim() ? full.text : '(no text content)')+'</pre>';
+
+      // The user's request is sealed into the response record as
+      // content.context (single-record turn shape). block_text — which feeds
+      // full.text — CONCATENATES the response and that request into one blob,
+      // so for any ring that carries a context we render the pure response
+      // from content.text and surface the request in its own labeled section,
+      // instead of one smushed run-on.
+      const ctx = (c.context != null) ? String(c.context) : '';
+      const hasCtx = ctx.trim() !== '';
+      const body = (hasCtx && c.text != null)
+        ? String(c.text)
+        : (full.text && full.text.trim() ? full.text : '(no text content)');
+      html += '<pre>'+esc(body.trim() ? body : '(no text content)')+'</pre>';
+      if(hasCtx){
+        html += `<div class="det-section"><h5>request (context)</h5><pre class="ctx">${esc(ctx)}</pre></div>`;
+      }
 
       // File records: surface the real filename and file facts prominently.
       if(r.type === 'file'){

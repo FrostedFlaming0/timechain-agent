@@ -43,6 +43,23 @@ import ring_compat
 # file_content_hash with it) so approval-time checks and post-write audits
 # can never drift on normalization. Re-exported here for existing callers.
 from pending_ops import sha256_text  # noqa: F401
+# ONE extraction rule for documents: extractors.py serves uploads
+# (ingest_blob) AND walked trees, so a PDF ingests the same searchable
+# text regardless of how it arrived. Stdlib-graceful: a missing optional
+# library yields "" / method "none", and the walk skips visibly.
+from extractors import extract_text
+
+
+def _file_text_sha(path: Path) -> str:
+    """sha256_text of a file's decoded text, computed streaming — equal to
+    sha256_text(path.read_text(errors='replace')) without ever holding the
+    file in memory (same default encoding, same error handling; hashing the
+    utf-8 re-encoding of the identical character stream)."""
+    h = hashlib.sha256()
+    with open(path, "r", errors="replace") as fh:
+        for ln in fh:
+            h.update(ln.encode("utf-8"))
+    return h.hexdigest()
 
 
 @dataclass
@@ -90,6 +107,17 @@ FINDINGS_WINDOW = 6    # rolling cap so the state refresh stays bounded
 DEFAULT_SKIP_DIRS = {".git", ".hg", ".svn", ".venv", "__pycache__",
                      "node_modules", "vendor"}
 
+# Files above this size are STREAMED through the chunker (two passes,
+# bounded memory) instead of read whole — nothing is skipped or truncated,
+# a big file is just more data-height blocks. See Continuum.walk.
+STREAM_FILE_BYTES = 8 * 1024 * 1024
+
+# Document formats the walk routes through extractors.py (the same
+# extraction the upload path uses) so a directory of PDFs/Office documents
+# seals searchable prose instead of binary noise. Plain-text formats
+# (.csv/.tsv/.md/source) read directly.
+EXTRACTABLE_EXTS = {".pdf", ".docx", ".dotx", ".xlsx", ".pptx"}
+
 LANGUAGE_BY_EXT = {
     ".c": "c", ".cc": "cpp", ".cpp": "cpp", ".cxx": "cpp", ".go": "go",
     ".h": "c", ".hpp": "cpp", ".java": "java", ".js": "javascript",
@@ -114,42 +142,79 @@ def approx_tokens(s: str) -> int:
     return max(1, len(s) // 4)
 
 
-def chunk_text_with_lines(text: str, target=TARGET_TOKENS, min_=MIN_TOKENS, max_=MAX_TOKENS):
-    """Split text into chunks and retain 1-based inclusive source line ranges."""
-    chunks, cur, cur_start, cur_end = [], "", None, None
+def iter_chunks_with_lines(lines, target=TARGET_TOKENS, min_=MIN_TOKENS,
+                           max_=MAX_TOKENS):
+    """Streaming core of chunk_text_with_lines: the SAME greedy left-to-right
+    chunking over an ITERABLE of lines (keepends=True), yielding chunk dicts
+    as it goes — so a file can be chunked without ever holding more than two
+    chunks (plus one line) in memory. The final small-tail merge needs the
+    last TWO chunks, so a two-slot buffer holds back the most recent pair;
+    everything earlier streams out immediately. `chunk_text_with_lines` is a
+    list() over this generator, so the two can never drift."""
+    held: list = []                       # at most the last two chunks
+    cur, cur_start, cur_end = "", None, None
+    line_no = 0
+    produced = False
+
+    def out(chunk):
+        held.append(chunk)
+        if len(held) > 2:
+            return held.pop(0)
+        return None
 
     def flush():
         nonlocal cur, cur_start, cur_end
         if cur:
-            chunks.append({"content": cur, "line_start": cur_start or 1,
-                           "line_end": cur_end or cur_start or 1})
+            ready = out({"content": cur, "line_start": cur_start or 1,
+                         "line_end": cur_end or cur_start or 1})
             cur, cur_start, cur_end = "", None, None
+            return ready
+        return None
 
-    lines = text.splitlines(keepends=True)
-    for line_no, ln in enumerate(lines, start=1):
+    for ln in lines:
+        line_no += 1
         if approx_tokens(ln) > max_:                      # a single oversized line
-            flush()
+            ready = flush()
+            if ready:
+                produced = True
+                yield ready
             step = max_ * 4
             for j in range(0, len(ln), step):
-                chunks.append({"content": ln[j:j + step], "line_start": line_no,
-                               "line_end": line_no})
+                ready = out({"content": ln[j:j + step], "line_start": line_no,
+                             "line_end": line_no})
+                if ready:
+                    produced = True
+                    yield ready
             continue
         if cur and approx_tokens(cur + ln) > target:
-            flush()
+            ready = flush()
+            if ready:
+                produced = True
+                yield ready
         if not cur:
             cur_start = line_no
         cur += ln
         cur_end = line_no
-    flush()
+    ready = flush()
+    if ready:
+        produced = True
+        yield ready
 
-    if not chunks:
-        chunks.append({"content": "", "line_start": 1, "line_end": 1})
-    if (len(chunks) >= 2 and approx_tokens(chunks[-1]["content"]) < min_
-            and approx_tokens(chunks[-2]["content"] + chunks[-1]["content"]) <= max_):
-        chunks[-2]["content"] += chunks[-1]["content"]
-        chunks[-2]["line_end"] = chunks[-1]["line_end"]
-        chunks.pop()
-    return chunks
+    if not held and not produced:
+        yield {"content": "", "line_start": 1, "line_end": 1}
+        return
+    if (len(held) == 2 and approx_tokens(held[-1]["content"]) < min_
+            and approx_tokens(held[-2]["content"] + held[-1]["content"]) <= max_):
+        held[-2]["content"] += held[-1]["content"]
+        held[-2]["line_end"] = held[-1]["line_end"]
+        held.pop()
+    yield from held
+
+
+def chunk_text_with_lines(text: str, target=TARGET_TOKENS, min_=MIN_TOKENS, max_=MAX_TOKENS):
+    """Split text into chunks and retain 1-based inclusive source line ranges."""
+    return list(iter_chunks_with_lines(text.splitlines(keepends=True),
+                                       target, min_, max_))
 
 
 def chunk_text(text: str, target=TARGET_TOKENS, min_=MIN_TOKENS, max_=MAX_TOKENS):
@@ -228,11 +293,13 @@ def should_skip_file(path: Path, skip_dirs):
 
 
 def file_metadata(base_path: Path, file_path: Path, file_index: int, content: str,
-                  git_info=None, redaction_count=0):
+                  git_info=None, redaction_count=0, content_hash=None):
     rel = file_path.relative_to(base_path).as_posix()
     parts = rel.split("/")
     ext = file_path.suffix.lower()
-    h = sha256_text(content)
+    # content_hash lets the streaming walk pass a hash computed during its
+    # stats pass instead of materializing the whole text just to hash it.
+    h = content_hash if content_hash is not None else sha256_text(content)
     role = path_role(rel, ext)
     git_info = dict(git_info or {})
     return {
@@ -307,21 +374,52 @@ class Continuum:
         return state, rec
 
     def ingest(self, name, content, finding=None, label=True, metadata=None):
+        chunks = chunk_text_with_lines(content, self.target, self.min, self.max)
+        return self._seal_chunks(name, iter(chunks), len(chunks),
+                                 finding=finding, label=label,
+                                 metadata=metadata)
+
+    def ingest_stream(self, name, lines_factory, finding=None, label=True,
+                      metadata=None, n_chunks=None):
+        """Two-pass streaming ingest for files too large to hold in memory.
+
+        `lines_factory` is a zero-arg callable returning a FRESH iterable of
+        lines (keepends) each call — e.g. a generator over an open file.
+        Pass 1 streams the lines through the SAME greedy chunker to count
+        the chunks (chunk_of must be known before chunk 1 seals); pass 2
+        streams again and seals. The sealed blocks are identical to
+        `ingest(name, full_text)` — same chunk boundaries, same line
+        numbers, same tail merge — but peak memory is one chunk plus one
+        line instead of the whole file. The cost is reading the file twice
+        (callers may pre-count and pass `n_chunks` to fold pass 1 into a
+        stats pass of their own)."""
+        if n_chunks is None:
+            n_chunks = sum(1 for _ in iter_chunks_with_lines(
+                lines_factory(), self.target, self.min, self.max))
+        chunks = iter_chunks_with_lines(lines_factory(), self.target,
+                                        self.min, self.max)
+        return self._seal_chunks(name, chunks, n_chunks, finding=finding,
+                                 label=label, metadata=metadata)
+
+    def _seal_chunks(self, name, chunks_iter, n_chunks, finding=None,
+                     label=True, metadata=None):
+        """Shared sealing body for ingest (in-memory) and ingest_stream
+        (two-pass streaming): consumes chunk dicts one at a time and seals
+        each as a continuum block with a full state refresh."""
         st = self._state if self._state is not None else self._head_state()
         if st is None:
             raise RuntimeError("No open task on this chain — run open_task first.")
         metadata = dict(metadata or {})
         rel_path = metadata.get("relative_path") or name
-        chunks = chunk_text_with_lines(content, self.target, self.min, self.max)
         sealed = []
-        for i, chunk in enumerate(chunks):
+        for i, chunk in enumerate(chunks_iter):
             ch = chunk["content"]
             file_content_hash = metadata.get("file_content_hash") or metadata.get("content_hash")
             st = json.loads(json.dumps(st))   # deep copy the prior state
-            last = (i == len(chunks) - 1)
+            last = (i == n_chunks - 1)
             st["cursor"] = {"item_index": st["cursor"]["item_index"] + (1 if i == 0 else 0),
                             "item": rel_path, "file_index": metadata.get("file_index"),
-                            "chunk_index": i + 1, "chunk_of": len(chunks)}
+                            "chunk_index": i + 1, "chunk_of": n_chunks}
             st["metrics"]["chunks_sealed"] += 1
             st["metrics"]["approx_tokens_ingested"] += approx_tokens(ch)
             if last:
@@ -334,14 +432,14 @@ class Continuum:
                 st["next_action"] = ("task complete" if (it and done >= it)
                                      else f"ingest next item (done {done}" + (f"/{it}" if it else "") + ")")
             else:
-                st["next_action"] = f"continue ingesting {rel_path}: chunk {i + 2}/{len(chunks)}"
+                st["next_action"] = f"continue ingesting {rel_path}: chunk {i + 2}/{n_chunks}"
             data = {
                 "item": rel_path,
                 "relative_path": rel_path,
                 "filename": metadata.get("filename") or Path(name).name,
                 "file_index": metadata.get("file_index"),
                 "chunk_index": i + 1,
-                "chunk_of": len(chunks),
+                "chunk_of": n_chunks,
                 "line_start": chunk["line_start"],
                 "line_end": chunk["line_end"],
                 "top_dir": metadata.get("top_dir"),
@@ -440,13 +538,25 @@ class Continuum:
             and not should_skip_file(p.relative_to(path), skip_dirs)
         )
         prior_hashes = self.latest_file_hashes() if changed_only else {}
+        # Plan WITHOUT reading file contents: the old walk preloaded every
+        # file's text here, so a big tree meant the whole tree in RAM
+        # before sealing began. Texts are now read one file at a time in
+        # the seal loop (and STREAMED for oversized files); changed_only
+        # hashes are computed streaming for the same reason.
         planned = []
         for file_index, f in enumerate(files, start=1):
-            text = f.read_text(errors="replace")
             rel = f.relative_to(path).as_posix()
-            if changed_only and prior_hashes.get(rel) == sha256_text(text):
-                continue
-            planned.append((file_index, f, rel, text))
+            if changed_only and rel in prior_hashes:
+                if f.suffix.lower() in EXTRACTABLE_EXTS:
+                    # Document formats hash their EXTRACTED text (that is
+                    # what a prior walk sealed) — extract for the compare.
+                    text, _m, _t = extract_text(f.read_bytes(), f.name)
+                    h = sha256_text(text)
+                else:
+                    h = _file_text_sha(f)
+                if prior_hashes[rel] == h:
+                    continue
+            planned.append((file_index, f, rel))
         git_info = git_info_for(path)
         # Reuse an already-open task instead of re-opening. open_task seals
         # a task_open ring, and walk used to call it unconditionally — so
@@ -467,16 +577,92 @@ class Continuum:
         results = []
         sealed_all = []
         state = self._state
-        for file_index, f, rel, text in planned:
-            sealed_text, redaction_count = redact_secrets(text) if redact else (text, 0)
-            ndef = text.count("def "); ncls = text.count("class ")
-            finding = f"{text.count(chr(10)) + 1} lines, {ndef} defs, {ncls} classes"
-            if redaction_count:
-                finding += f", {redaction_count} secret(s) redacted"
-            meta = file_metadata(path, f, file_index, text, git_info=git_info,
-                                 redaction_count=redaction_count)
-            sealed, state = self.ingest(rel, sealed_text, finding=finding,
-                                        label=label, metadata=meta)
+        for file_index, f, rel in planned:
+            ext = f.suffix.lower()
+            try:
+                size = f.stat().st_size
+            except OSError:
+                size = 0
+
+            if ext in EXTRACTABLE_EXTS:
+                # Document formats (PDF / Office): extract searchable text
+                # exactly like the upload path does — a walked directory of
+                # agreements must seal prose, not binary noise. A file with
+                # no extractable text (missing library, scanned images) is
+                # SKIPPED VISIBLY: it appears in results with 0 blocks.
+                text, method, _trunc = extract_text(f.read_bytes(), f.name)
+                if not text:
+                    results.append((rel, 0))
+                    continue
+                sealed_text, redaction_count = (redact_secrets(text)
+                                                if redact else (text, 0))
+                ndef = text.count("def "); ncls = text.count("class ")
+                finding = (f"{text.count(chr(10)) + 1} lines, {ndef} defs, "
+                           f"{ncls} classes (extracted: {method})")
+                if redaction_count:
+                    finding += f", {redaction_count} secret(s) redacted"
+                meta = file_metadata(path, f, file_index, text,
+                                     git_info=git_info,
+                                     redaction_count=redaction_count)
+                meta["extraction_method"] = method
+                sealed, state = self.ingest(rel, sealed_text, finding=finding,
+                                            label=label, metadata=meta)
+
+            elif size > STREAM_FILE_BYTES:
+                # Oversized file: stream it. Pass A walks the chunker once
+                # for stats (chunk count, line/def/class counts, content
+                # hash, redaction count); pass B re-streams and seals.
+                # Nothing is skipped or truncated — a big file is just more
+                # data-height blocks; peak memory is one chunk, not the
+                # file. Trade documented: redaction is applied per chunk,
+                # so a secret spanning a chunk boundary can be missed (the
+                # in-memory path scans the whole file at once).
+                def _lines(f=f):
+                    with open(f, "r", errors="replace") as fh:
+                        yield from fh
+                hasher = hashlib.sha256()
+                n_chunks = n_nl = ndef = ncls = red_count = 0
+                for chunk in iter_chunks_with_lines(_lines(), self.target,
+                                                    self.min, self.max):
+                    n_chunks += 1
+                    c = chunk["content"]
+                    hasher.update(c.encode("utf-8"))
+                    n_nl += c.count("\n")
+                    ndef += c.count("def "); ncls += c.count("class ")
+                    if redact:
+                        red_count += redact_secrets(c)[1]
+                finding = (f"{n_nl + 1} lines, {ndef} defs, {ncls} classes "
+                           f"(streamed, {size} bytes)")
+                if red_count:
+                    finding += f", {red_count} secret(s) redacted"
+                meta = file_metadata(path, f, file_index, "",
+                                     git_info=git_info,
+                                     redaction_count=red_count,
+                                     content_hash=hasher.hexdigest())
+                chunks = iter_chunks_with_lines(_lines(), self.target,
+                                                self.min, self.max)
+                if redact:
+                    chunks = (dict(c, content=redact_secrets(c["content"])[0])
+                              for c in chunks)
+                sealed, state = self._seal_chunks(rel, chunks, n_chunks,
+                                                  finding=finding,
+                                                  label=label, metadata=meta)
+
+            else:
+                text = f.read_text(errors="replace")
+                sealed_text, redaction_count = (redact_secrets(text)
+                                                if redact else (text, 0))
+                ndef = text.count("def "); ncls = text.count("class ")
+                finding = (f"{text.count(chr(10)) + 1} lines, {ndef} defs, "
+                           f"{ncls} classes")
+                if redaction_count:
+                    finding += f", {redaction_count} secret(s) redacted"
+                meta = file_metadata(path, f, file_index, text,
+                                     git_info=git_info,
+                                     redaction_count=redaction_count)
+                sealed, state = self.ingest(rel, sealed_text, finding=finding,
+                                            label=label, metadata=meta)
+
             sealed_all.extend(sealed)
             results.append((rel, len(sealed)))
         return WalkResult(files=files, results=results,

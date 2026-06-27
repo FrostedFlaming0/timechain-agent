@@ -76,6 +76,10 @@ from typing import Optional
 MAX_SPROUTED_MODALITIES = 64       # registry size cap
 MAX_PATTERNS_PER_MODALITY = 24     # patterns in one modality
 MAX_PATTERN_LENGTH = 200           # chars in one pattern string
+# Sharp edge: the cap is a hard HEAD truncation, not a windowed sample — a
+# modality whose distinctive vocabulary appears only after the first 20k
+# chars of a long input will never fire on it. Position in the document
+# matters for detection.
 MATCH_INPUT_CAP = 20_000           # chars of input any pattern ever sees
 
 # Status values.

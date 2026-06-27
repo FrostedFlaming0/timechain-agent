@@ -547,9 +547,20 @@ function renderHistoryRecord(rec, opts={}) {
   const c = rec.content || {};
   switch (rec.type) {
     case 'observation':
+      // Legacy two-record turns only — new turns carry the user's input
+      // inside the response record (content.context).
       addTurn('you', c.text ?? '', opts);
       break;
     case 'response':
+      // Single-record turn shape: one record renders the whole exchange —
+      // YOU bubble from content.context, attachment chips for uploads
+      // that rode this turn, AGENT bubble from content.text. Legacy
+      // responses (no context) render the agent half only; their
+      // observation partner renders separately.
+      if (c.context) addTurn('you', c.context, opts);
+      (c.attachments || []).forEach(entry => {
+        addFileTurn({ content: entry }, opts);
+      });
       addTurn('agent', c.text ?? '', opts);
       break;
     case 'file':
@@ -955,7 +966,17 @@ async function streamTurn(url, { resumed = false } = {}) {
       // conversation order puts it).
       try {
         const d = JSON.parse(ev.data);
-        if (typeof d.index !== 'number') return;
+        if (typeof d.index !== 'number') {
+          // Synthetic observation (single-record turn shape: no
+          // observation record exists; the input seals into the response
+          // record at commit). Safe to render on resumed streams without
+          // an index: resumeActiveTurn only attaches to RUNNING turns, so
+          // the input can't already be in the transcript via history.
+          if (resumed) {
+            addTurn('you', (d.content || {}).text || '', { anchor: agentTurnDiv });
+          }
+          return;
+        }
         if (resumed && !RENDERED_INDICES.has(d.index)) {
           addTurn('you', (d.content || {}).text || '', { anchor: agentTurnDiv });
         }
@@ -1030,6 +1051,16 @@ async function streamTurn(url, { resumed = false } = {}) {
       // The banner above the composer is the SINGLE approval surface —
       // rendering buttons in the transcript too showed two approve
       // prompts for one operation, which read as two decisions.
+      // inline=true ops (mid-turn gate) also land here: the turn is now
+      // PAUSED waiting on the banner's approve/reject.
+      refreshPendingBanner();
+    });
+    es.addEventListener('op_resolved', (ev) => {
+      // Mid-turn gate resolved — the turn is continuing with the outcome.
+      try {
+        const d = JSON.parse(ev.data);
+        addSystemTurn(`✓ ${d.decision}: ${d.target || ''} — ${d.result || ''}`);
+      } catch (e) {}
       refreshPendingBanner();
     });
     es.addEventListener('reflection', () => {
@@ -1228,6 +1259,13 @@ async function uploadFile(file) {
     const d = await r.json();
     // Task-route ingests have no identity record — show the result line.
     if (d.record) addFileTurn(d.record);
+    else if (d.staged) {
+      // Single-record turn shape: the pointer is staged and will seal
+      // into the next turn's response record — show the chip now so the
+      // upload is visibly attached to what you're about to send.
+      addFileTurn({ content: d.staged });
+      addSystemTurn(`attached — seals with your next message (${d.staged_count} pending)`);
+    }
     else addSystemTurn(d.result || `ingested ${file.name}`);
     refreshSidebar();
   } catch (e) {
@@ -1310,7 +1348,13 @@ async function pendingOpAction(opId, action) {
     const r = await fetch(`/api/pending-ops/${encodeURIComponent(opId)}/${action}`,
                           { method: 'POST', headers: sessionHeaders() });
     const d = await r.json();
-    addSystemTurn(`${action}: ${d.result || d.detail || JSON.stringify(d)}`);
+    // Mid-turn delivery (d.delivered): say nothing here — the turn's
+    // op_resolved event reports the real outcome, and two messages for
+    // one decision read as two events. Legacy post-turn ops still get
+    // their feedback (no op_resolved follows them).
+    if (!d.delivered) {
+      addSystemTurn(`${action}: ${d.result || d.detail || JSON.stringify(d)}`);
+    }
   } catch (e) {
     addErrorTurn(`${action} failed: ${e}`);
   }
@@ -1332,6 +1376,8 @@ async function refreshPendingBanner() {
       desc.className = 'op-desc';
       desc.textContent = op.kind === 'tool_call'
         ? `⏳ tool call awaiting approval: ${op.tool} ${JSON.stringify(op.arguments || {})}`
+          + (op.change && op.change.includes('—')
+             ? ` (${op.change.split('—').slice(1).join('—').trim()})` : '')
         : `⏳ write awaiting approval: ${op.file} — ${op.change}`;
       desc.title = desc.textContent;
       const ok = document.createElement('button');

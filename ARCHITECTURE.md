@@ -2,7 +2,7 @@
 
 A guide to the files that make up the timechain agent, what each is responsible for, and how they fit together.
 
-**Version: 1.4.0.** This document describes the system as it currently
+**Version: 1.5.0.** This document describes the system as it currently
 stands. For the release-by-release history of how it got here, see
 [CHANGELOG.md](CHANGELOG.md).
 
@@ -108,15 +108,15 @@ Helper functions: `canonical_json` for stable serialization, `sha256` for hashin
 |------|--------------|---------|
 | `genesis` | First run only, record 0 | Sealed founding commitments |
 | `system_prompt` | On startup if prompt changed | Audit trail of behavioral configuration |
-| `observation` | Every user input | What the user said |
-| `response` | Every model response | What the agent said |
+| `observation` | (legacy, pre-single-record turns) | What the user said. No longer written — the user's input rides the turn's response record as `content.context`. Old pairs still read, render, and stitch |
+| `response` | Every turn (ONE record per turn) | The whole exchange in one signed unit: the user's input (`content.context`, the skill's `payload.context` shape), the agent's answer (`content.text`), mid-turn approval decisions (`content.resolutions`), and pointers for uploads that rode this turn (`content.attachments`) |
 | `reflection` | `/reflect` or auto-cadence | Agent's own summary of what mattered |
 | `revision` | `/revise N <text>` | Correction to a prior record (original is preserved) |
 | `file` | (legacy, pre-v1.4) | Ingested file: metadata + extracted text on chain. Still read and verified; new code enters via `continuum` blocks on task chains |
 | `tool_use` | (legacy, pre-v1.4) | Per-call sanitized audit — no longer written; the identity chain carries one observation + one response per turn, with the response narrating the tool work. Old records still read fine |
-| `resolution` | user approves/rejects a pending op | The USER's decision joins the stream: outcome, op id, kind, file/tool, bounded result — so the model's memory never holds a stale "pending" forever |
+| `resolution` | out-of-band approve/reject only | The USER's decision on an op resolved AFTER its turn (crash recovery, legacy ops). Decisions made DURING a turn embed in that turn's response record instead — no separate block |
 | `continuum` | `/task ingest`, write approvals | One data-height source chunk with source coordinates, hashes, and rolling task state |
-| `attachment` | upload / paste (`ingest_blob`) | Tiny pointer ring: filename, mime, sha, refs into the artifacts chain — never the content itself, so big documents can't crowd identity retrieval |
+| `attachment` | (legacy, pre-single-record turns) | Standalone pointer ring. No longer written — upload pointers are STAGED and seal into the next turn's response record (`content.attachments`), with the message they accompanied (the skill's `blockspace_refs` shape). Content still lives on the artifacts chain / blob store. Old pointers read fine |
 
 Every record's `content` dict carries a `_meta` block (see `metadata.py`). The chain itself is unaware of this — `_meta` is just JSON inside `content` from the chain's perspective — but reader code uses it to distinguish source, salience, and supersession.
 
@@ -217,7 +217,7 @@ Reflections and revisions are written with high salience because they represent 
 | `genesis` | effectively never (1e6 days) |
 | `system_prompt` | effectively never |
 | `revision` | 365 days |
-| `reflection` | 180 days |
+| `reflection` | 75 days |
 | `file` | 90 days |
 | `observation`, `response` | 14 days |
 
@@ -244,7 +244,7 @@ The recency contribution to a hit's score is `0.5 ** (age_days / half_life_for_t
 **Key components:**
 
 `EmbeddingIndex` is the vector store. It maintains a parallel SQLite database mapping each chain record to **one or more chunk vectors** (a long record is split into chunks before embedding — see "Chunked embedding store" below). Methods:
-- `index_record(rec)` — chunk a record's text and embed/store one vector per chunk. Idempotent: re-indexing a record replaces its chunks rather than duplicating them.
+- `index_record(rec)` — chunk a record's text and embed/store one vector per chunk. Idempotent: re-indexing a record replaces its chunks rather than duplicating them. A NEW record's vectors are appended to the live in-memory search matrix (`_append_ann`) instead of invalidating it — before this, every per-turn write forced the next search to rebuild the whole matrix from SQLite, the only per-turn cost that grew with chain size (measured at 50k chunks: 424 ms → 118 ms). Re-indexing an existing record still invalidates, since its old rows are baked into the matrix.
 - `index_chain(chain)` — embed every record not yet indexed (catch-up after restart).
 - `search(query_text, k)` — return top-k **records** by cosine similarity, collapsing each record's chunk hits to a single per-record score (max over its chunks). The return contract is one `(record_idx, similarity)` pair per record, exactly as before chunking — the chunking is invisible to callers.
 
@@ -399,7 +399,11 @@ Change `W_*` constants to rebalance the score components. Change
 alter `chunk_text`'s boundary logic). Add a method for time-window queries.
 Add an embedder (e.g. a sentence-transformers wrapper). Replace
 `EmbeddingIndex` with FAISS or pgvector while keeping the `Retriever`
-interface stable.
+interface stable — but measure first: `bench_retrieval.py` is the
+standing latency tripwire, and until warm search crosses ~200 ms at the
+real chain size, brute-force cosine over the in-memory matrix is the
+right answer (every shortlist pre-filter trades recall quality for
+speed).
 
 ---
 
@@ -417,13 +421,14 @@ interface stable.
 - `check_genesis_drift(configured_commitments)` — compare currently-configured commitments against what's sealed at record 0. Returns `None` if they match, or a structured drift report if they differ. Used by `run.py` at startup to warn when configuration edits would silently be ignored.
 - `log_system_prompt()` — write the current system prompt to the chain as a `system_prompt` record, but only if it differs from the last logged prompt. Provides an audit trail of behavioral configuration over time.
 - `turn(user_input, retrieve_k)` — the heart of the loop:
-  1. Append the user input as an `observation` record (`source=user, confidence=1.0`).
+  1. Hold the user input (it seals into the response record as `content.context` at commit — no observation record is minted; nothing touches the chain before retrieval).
   2. Build context via the retriever.
   3. Format a prompt combining current time, retrieved context (with relative-time labels and source/SUPERSEDED tags), any revisions targeting retrieved records, and the new input. Truncate to fit the context budget if needed.
   4. Call the LLM with the system prompt.
   5. Append the response as a `response` record (`source=assistant, confidence=0.9`), with refs pointing to the records that informed it.
   6. Return an `AgentTurn` containing all three.
-- `reflect(max_records=200)` — reflect on every record since the last reflection (or since genesis, if there hasn't been one). Asks the LLM "what stands out, what patterns, what's worth revisiting" and writes the result as a `reflection` record (`source=assistant, confidence=0.7` — reflections are inferential, not factual). The window sizes itself dynamically: each reflection covers exactly the slice the previous one didn't, so there are no gaps and no overlaps. `max_records` is a safety cap for the unusual case where auto-reflection has been disabled and a long stretch of history has accumulated; if the lookback would exceed it, only the most recent `max_records` are reflected on and the resulting record is flagged `capped: True`. Reflections become retrievable memory and have high default salience. Returns `None` if there are fewer than 4 substantive records since the last reflection (i.e. nothing meaningful new to reflect on).
+- `reflect(max_records=300)` — reflect on every record since the last reflection (or since genesis, if there hasn't been one). Asks the LLM "what stands out, what patterns, what's worth revisiting" and writes the result as a `reflection` record (`source=assistant, confidence=0.7` — reflections are inferential, not factual). The window sizes itself dynamically: each reflection covers exactly the slice the previous one didn't, so there are no gaps and no overlaps. `max_records` is a safety cap for the unusual case where a long stretch of history has accumulated (e.g. auto-reflection was disabled); if the lookback would exceed it, only the most recent `max_records` are reflected on and the resulting record is flagged `capped: True`. The default is 300 (was 200), giving ~3× headroom over the every-100-turn cadence; the apps pass `MAX_REFLECT_RECORDS` from `run.py`. Reflections become retrievable memory and have high default salience. Returns `None` if there are fewer than 4 substantive records since the last reflection (i.e. nothing meaningful new to reflect on).
+- `turns_since_reflection()` / `turns_since_cambium()` — chain-derived counts that make the auto-reflect and auto-Cambium cadences carry across sessions rather than resetting per process. The first counts response turns since the last `reflection` ring; the second counts response turns since Cambium's persistent scan watermark (`cambium.last_scanned_idx`). Both seed the in-memory counters at startup (REPL and web), so at long cadences (reflect every 100, Cambium every 30) the cadence is measured against cumulative history — a per-session counter would rarely fire in short sessions.
 - `revise(target_index, correction_text)` — append a `revision` record correcting a prior record (`source=assistant, supersedes=target_index`). The original is never modified. Both the legacy `revises_index`/`revises_hash` fields (for backward compatibility with `view_chain.py` and the web UI) and the canonical `_meta.supersedes` pointer are written.
 - `_truncate_to_budget(records, fixed_overhead_chars)` — when retrieved context would exceed `context_char_budget`, drop lowest-salience records first. Ranking uses **per-record** salience read from each record's `_meta` block (with type-based defaults for legacy records via `read_meta`). Returns kept records (chronologically ordered) and a count of dropped records, which the prompt formatter surfaces as a note to the model.
 
@@ -461,7 +466,7 @@ Six builder functions, all returning a callable with shape
 `(prompt, system=None, attachments=None) -> str`. Each callable also
 exposes `.stream(prompt, system=None, attachments=None)` — a generator
 yielding text chunks, used by the web UI for streaming responses.
-- `make_claude_client(model, max_tokens, timeout_s)` — Anthropic Claude. Default: `claude-fable-5`. No sampling parameters (Fable 5 rejects `temperature`/`top_p`/`top_k`); thinking is always on (the `thinking` param is omitted); a classifier `refusal` is surfaced as an honest inline note.
+- `make_claude_client(model, max_tokens, timeout_s)` — Anthropic Claude. Default: `claude-opus-4-8` (Fable 5 was withdrawn by government order on 2026-06-12). No sampling parameters (Opus 4.7/4.8 reject `temperature`/`top_p`/`top_k`, as Fable 5 did); `thinking={"type": "adaptive"}` is set explicitly in both request paths — on Opus 4.8 omitting it turns thinking OFF, and with thinking off Opus 4.8 leaks reasoning into the visible answer (which would be sealed as the response text); the stream yields only text deltas, so thinking never reaches the answer. A classifier `refusal` is surfaced as an honest inline note.
 - `make_openai_client(model, ...)` — OpenAI. Default: `gpt-5.5`.
 - `make_openrouter_client(model, ...)` — OpenRouter (aggregator). Default: `anthropic/claude-opus-4.7`. Reuses the OpenAI SDK against OpenRouter's base URL.
 - `make_deepseek_client(model, ...)` — DeepSeek. Default: `deepseek-v4-pro`. Reuses the OpenAI SDK against DeepSeek's base URL. The V4 models toggle thinking mode via a request parameter rather than a separate model name; this client runs the default (non-thinking) mode and, if a `reasoning_content` trace is returned, uses only the final answer.
@@ -513,19 +518,50 @@ surrounding text kept) joined with the final answer, in both loops and in
 the web UI's live view — never just the last round's fragment, which would
 read out of context on its own.
 
+**Identity tools: second-look memory and deep think.** Two reflexes the
+tools prompt teaches the model, both read-or-seal against the IDENTITY
+chain rather than a task chain. *Second-look memory*: automatic
+retrieval stays the deterministic baseline, but when the user refers to
+something absent from the retrieved context, the model calls
+`recall_index` (a bounded one-line-per-record map of the chain; an
+optional query shortlists ~50 candidates via the hybrid scorer — a
+pre-filter, never the arbiter) and then `recall_fetch` for the records
+it judges relevant (≤ 12, quarantine-filtered, superseded records
+arriving with their corrections). *Deep think*: for a hard, high-stakes,
+or genuinely ambiguous question, the model forks 3–5 named perspectives
+within its own response, reasons each to its own conclusion, scores each
+on the six PoQ dimensions, and calls `think_collapse` —
+`ChronosynapticTree.collapse_explicit_notes` seals the winner as a
+`synthesis` record with the rejected forks preserved in its payload. No
+extra LLM calls; the forking is in-context, the script only collapses
+and seals. Both reflexes leave a cryptographic trace: every fetched
+record's hash and every sealed synthesis's hash is staged on
+`ctx.recalled_refs` and drained into the turn's response record refs at
+commit, so the chain records exactly what informed the answer.
+
 **The three safety tiers:**
 
 | Tier | Mechanism |
 |------|-----------|
 | 1. Task selection | `task_registry.resolve_task()` returns exact/ambiguous/not-found and never auto-selects a fuzzy match; the system prompt forbids the model from guessing |
 | 2. File scoping | `pin_file` scopes a turn's writes to one path; the pin resets at every turn start |
-| 3. Write gate | `write_file` only creates a durable `PendingOperation` (0600, 1MB cap, TTL); ONLY the user can `/approve` — approval checks the pre-write hash (TOCTOU), writes atomically, ingests idempotently (`operation_id`), audits the block against live source, then deletes the op file |
+| 3. Write gate | `write_file` only creates a durable `PendingOperation` (0600, 1MB cap, TTL); ONLY the user can approve — and the turn PAUSES on the proposal (mid-turn gate): approve/reject resolves it inline, the model continues from the real outcome, and the decision embeds in the response record. No decision within the TTL auto-expires the op, so a request can never outlive its turn. Approval checks the pre-write hash (TOCTOU), writes atomically, ingests idempotently (`operation_id`), audits the block against live source, then deletes the op file; expired ops still in `pending` are swept on store construction (v1.4.1). A `.docx` target converts the model's markdown to a real Word document at proposal time (`docx_writer.py`): the op carries the binary (hashed — the recovery machine verifies real bytes) plus the readable source for the approval card, and the chain seals the source searchable |
 
-Tier 3 also covers **boundary expansion**: `tools.requires_confirmation()` —
-the one policy function both the REPL and web loops call — gates
-`CONFIRM_TOOLS` (e.g. `task_ingest_file`, `task_reembed`) and any `task_open`
-whose `source_root` resolves outside the workspace, since a task's source
-root becomes an allowed read/ingest root. How the user confirms depends on
+Tier 3 also covers **boundary expansion** and **volume**:
+`tools.requires_confirmation()` — the one policy function both the REPL and
+web loops call — gates `CONFIRM_TOOLS` (e.g. `task_ingest_file`,
+`task_reembed`), any `task_open` whose `source_root` resolves outside the
+workspace (a task's source root becomes an allowed read/ingest root), and
+any recursive ingest (`task_open` auto-ingest / `task_ingest_path`) whose
+bounded pre-walk survey crosses 1,000 files or 1 GB — ask, never block:
+the confirmation shows the surveyed numbers and an approve runs the full
+walk untouched. The volume gate fires even inside the workspace, so a
+workspace accidentally set to `$HOME` cannot silently walk the world into
+a chain. Every gated call carries its reason (`ctx.last_gate_reason`) on
+all confirmation surfaces. Oversized files (> 8 MB) are STREAMED through
+the chunker (two passes, identical blocks, bounded memory), and document
+formats (`.pdf`/`.docx`/`.xlsx`/`.pptx`) are routed through the same
+extractors as uploads, so walked agreements seal searchable prose. How the user confirms depends on
 the loop: the REPL prompts inline (`proceed? yes/no`); the web loop —
 which cannot prompt over one-way SSE — defers the call as a pending op of
 kind `tool_call` (`tools.defer_tool_call`: exact name + arguments pinned
@@ -637,7 +673,7 @@ Top-of-file configuration block:
 - `SEMANTIC_K` / `RECENT_N` — retrieval knobs.
 - `OLLAMA_EMBED_MODEL` / `OLLAMA_BASE_URL` — which Ollama embedding model to use, and where to reach the server. Used by the tiered embedder resolver.
 - `HASHING_EMBED_DIM` — dimension of the fallback `HashingEmbedder`. There is no longer an `EMBED_DIM` constant: the active embedding dimension is whatever the resolved embedder reports.
-- `AUTO_REFLECT_EVERY` — how often the agent automatically reflects (in turns). Set to 0 to disable. Each reflection automatically covers every record since the previous reflection — there's no separate window setting; the scope sizes itself to actual activity.
+- `AUTO_REFLECT_EVERY` — how often the agent automatically reflects (in turns; default 100). Set to 0 to disable. The counter is chain-derived (`turns_since_reflection()`), so the cadence carries across sessions rather than resetting per process. Each reflection automatically covers every record since the previous reflection — there's no separate window setting; the scope sizes itself to actual activity, capped at `MAX_REFLECT_RECORDS` (300).
 
 Functions:
 - `make_tiered_embedder()` — resolves the embedder with a fallback chain: `OllamaEmbedder` if a local Ollama server is reachable, otherwise `HashingEmbedder`. Returns an `(embedder, dim, name)` triple. Never raises — the worst case is the fallback.
@@ -761,7 +797,12 @@ The faculties, and how each maps onto the existing substrate:
 
 - **`chronosynaptic.py` — single-pass parallel-self MCTS.** Forks faculty-lens
   perspectives (drawn from the `signals.py` registries), scores each with PoQ,
-  and collapses to one `synthesis` record — no subagents.
+  and collapses to one `synthesis` record — no subagents. The lexical MCTS
+  (`/think`) is the zero-cost scaffold; the model-judged path is wired into
+  the turn loop as the `think_collapse` tool plus the tools prompt's DEEP
+  THINK routing (see "Identity tools" in the v1.4 section) — the model forks
+  and scores within its own response, the module collapses and seals, and the
+  response record refs the synthesis.
 
 - **`consensus.py` — quorum attestation.** k-of-n HMAC witnesses attest each
   head over the *recomputed* `record_hash`, layering tamper-*resistance* on the
@@ -817,7 +858,8 @@ exposes the faculties as slash commands via `cypher_commands.py` (`/cypher-help`
 | How memory is presented to the model | `agent.py` — `_format_prompt` method |
 | How the agent reflects | `agent.py` — `reflect` method and reflection prompt |
 | Adding a new LLM provider | `llm_clients.py` — add a new `make_X_client()` |
-| Adding a tool | `tools.py` — schema in `TOOLS`, executor in `EXECUTORS`, audit fields in `TOOL_AUDIT_FIELDS` |
+| Adding a tool | `tools.py` — schema in `TOOLS`, executor in `EXECUTORS` (per-call audit records were removed in v1.4 — the response narrates the turn's work) |
+| Retrieval latency at scale | `bench_retrieval.py` — the tripwire harness; build a shortlist pre-filter only when warm search crosses ~200 ms at the real chain size |
 | Write-gate rules | `tools.resolve_write_path` and `pending_ops.execute_approve_write` |
 | Web UI behavior or appearance | `timechain_web/webapp.py` (server) and `timechain_web/static/index.html` (frontend) |
 | Streaming responses to the browser | `llm_clients.py` — each client's `.stream()` method |

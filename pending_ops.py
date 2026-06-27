@@ -23,8 +23,10 @@ partially-executed states recover regardless of TTL.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import logging
 import os
 import shutil
 import time
@@ -32,6 +34,11 @@ import uuid
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Literal, Optional
+
+# Best-effort steps (resolution sealing) must not undo a write that already
+# happened, but their failures must not be invisible either — they warn here
+# so an operator can spot quiet degradation across sessions.
+log = logging.getLogger(__name__)
 
 PENDING_TTL_SECONDS = 300
 MAX_CONTENT_BYTES = 1024 * 1024          # 1MB cap on proposed content
@@ -74,6 +81,15 @@ class PendingOperation:
     tool_name: str = ""
     tool_args_json: str = ""
 
+    # Generated binary formats (write_file on a .docx path): the bytes that
+    # will be WRITTEN ride here base64; proposed_content keeps the SOURCE
+    # markdown so every approval surface shows readable prose, never
+    # base64. proposed_content_hash pins the BINARY (it is what lands on
+    # disk — the whole crash-recovery machine hashes disk bytes against
+    # it). Defaults keep older on-disk ops loading unchanged.
+    binary_b64: str = ""
+    generated_format: str = ""
+
     def expired(self) -> bool:
         return time.time() > self.expires_at
 
@@ -90,6 +106,33 @@ class PendingOpStore:
 
     def __init__(self, data_dir: str | Path):
         self.dir = Path(data_dir) / "pending_ops"
+        self.sweep_expired()
+
+    def sweep_expired(self) -> int:
+        """Remove EXPIRED ops still in `pending` (and any tmp file of
+        theirs, defensively). Without this, a pending op whose approval
+        never arrives sits on disk forever — expiry otherwise only fires
+        if someone later calls approve/reject on that exact id. Ops in
+        partially-executed states (`writing`, `written`, `ingest_failed`)
+        are NEVER touched: they recover regardless of TTL, and a `writing`
+        op's tmp file is exactly what crash recovery completes the
+        os.replace from."""
+        removed = 0
+        for op_id in self.list_ids():
+            op = self.load(op_id)
+            if op is None or op.status != "pending" or not op.expired():
+                continue
+            if op.kind == "write" and op.file_path:
+                try:
+                    Path(op.tmp_path).unlink(missing_ok=True)
+                except OSError as e:
+                    log.warning("could not remove tmp file for expired "
+                                "op %s: %s", op.id, e)
+            self.delete(op.id)
+            removed += 1
+        if removed:
+            log.info("swept %d expired pending op(s)", removed)
+        return removed
 
     def _path(self, op_id: str) -> Path:
         # op ids are uuid4 hex — refuse anything path-like outright.
@@ -99,10 +142,19 @@ class PendingOpStore:
         return self.dir / f"{safe}.json"
 
     def create(self, task_name: str, file_path: str, proposed_content: str,
-               change_summary: str, ttl: float = PENDING_TTL_SECONDS) -> PendingOperation:
+               change_summary: str, ttl: float = PENDING_TTL_SECONDS,
+               binary: Optional[bytes] = None,
+               generated_format: str = "") -> PendingOperation:
+        """`binary` switches the op to a generated-format write (e.g. a
+        .docx produced from markdown): the BYTES are what gets written and
+        hashed; `proposed_content` then carries the human-readable SOURCE
+        for the approval surfaces and the post-approval ingest."""
         if len(proposed_content.encode("utf-8")) > MAX_CONTENT_BYTES:
             raise ValueError(
                 f"proposed content exceeds {MAX_CONTENT_BYTES} bytes — refuse")
+        if binary is not None and len(binary) > MAX_CONTENT_BYTES:
+            raise ValueError(
+                f"generated document exceeds {MAX_CONTENT_BYTES} bytes — refuse")
         target = Path(file_path)
         existed = target.is_file()
         now = time.time()
@@ -111,23 +163,31 @@ class PendingOpStore:
             task_name=task_name,
             file_path=str(file_path),
             proposed_content=proposed_content,
-            proposed_content_hash=sha256_text(proposed_content),
+            proposed_content_hash=(hashlib.sha256(binary).hexdigest()
+                                   if binary is not None
+                                   else sha256_text(proposed_content)),
             pre_write_file_hash=sha256_file(target) if existed else None,
             change_summary=change_summary,
             created_at=now,
             expires_at=now + ttl,
             status="pending",
             target_existed=existed,
+            binary_b64=(base64.b64encode(binary).decode("ascii")
+                        if binary is not None else ""),
+            generated_format=generated_format,
         )
         self.save(op)
         return op
 
     def create_tool_call(self, tool_name: str, arguments: dict,
-                         ttl: float = PENDING_TTL_SECONDS) -> PendingOperation:
+                         ttl: float = PENDING_TTL_SECONDS,
+                         reason: str = None) -> PendingOperation:
         """Defer a confirmation-gated TOOL CALL for user approval (the
         web loop's stand-in for the REPL's inline confirm hook). The exact
         call is pinned: canonical-JSON arguments, hashed into
-        proposed_content_hash, verified again at approval."""
+        proposed_content_hash, verified again at approval. `reason` (e.g.
+        the pre-walk survey numbers) rides the summary so every approval
+        surface shows WHY this call needs a decision."""
         args_json = json.dumps(arguments, sort_keys=True, ensure_ascii=False)
         if len(args_json.encode("utf-8")) > MAX_CONTENT_BYTES:
             raise ValueError(
@@ -141,7 +201,8 @@ class PendingOpStore:
             proposed_content="",
             proposed_content_hash=sha256_text(args_json),
             pre_write_file_hash=None,
-            change_summary=f"tool call: {tool_name}",
+            change_summary=(f"tool call: {tool_name}"
+                            + (f" — {reason}" if reason else "")),
             created_at=now,
             expires_at=now + ttl,
             status="pending",
@@ -191,14 +252,33 @@ class PendingOpStore:
 # --------------------------------------------------------------- execution
 
 
+def _discard_tmp(op: PendingOperation) -> None:
+    """Best-effort removal of a write op's tmp file on terminal resolution.
+    No current path reaches expire/reject with a tmp on disk (both gate on
+    status == 'pending', before _atomic_write runs) — this is a backstop so
+    a future state-machine change cannot start leaking tmp files."""
+    if getattr(op, "kind", "write") != "write" or not op.file_path:
+        return
+    try:
+        Path(op.tmp_path).unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("could not remove tmp file for op %s: %s", op.id, e)
+
+
 def _atomic_write(op: PendingOperation) -> None:
     """Write proposed content via temp file + os.replace, preserving mode."""
     tmp = op.tmp_path
-    # utf-8 pinned: proposed_content_hash was computed over utf-8 bytes; a
-    # locale-default write would either raise UnicodeEncodeError mid-approval
-    # (stranding the op in status='writing') or write bytes whose hash can
-    # never match verification.
-    Path(tmp).write_text(op.proposed_content, encoding="utf-8")
+    if getattr(op, "binary_b64", ""):
+        # Generated format (e.g. docx): the BYTES are the approved content;
+        # proposed_content_hash was computed over them, so disk-vs-hash
+        # verification works unchanged.
+        Path(tmp).write_bytes(base64.b64decode(op.binary_b64))
+    else:
+        # utf-8 pinned: proposed_content_hash was computed over utf-8 bytes;
+        # a locale-default write would either raise UnicodeEncodeError
+        # mid-approval (stranding the op in status='writing') or write bytes
+        # whose hash can never match verification.
+        Path(tmp).write_text(op.proposed_content, encoding="utf-8")
     if Path(op.file_path).exists():
         shutil.copymode(op.file_path, tmp)    # preserve existing mode
     else:
@@ -206,7 +286,8 @@ def _atomic_write(op: PendingOperation) -> None:
     os.replace(tmp, op.file_path)             # atomic on POSIX
 
 
-def _finalize_approved(op: PendingOperation, ctx, ingest_result, note: str = "") -> str:
+def _finalize_approved(op: PendingOperation, ctx, ingest_result, note: str = "",
+                       seal_resolution: bool = True) -> str:
     """Shared tail for the primary path AND ingest_failed recovery:
     mark approved, audit the just-ingested block, delete the pending-op
     file. Neither path may skip the audit or the cleanup."""
@@ -234,7 +315,8 @@ def _finalize_approved(op: PendingOperation, ctx, ingest_result, note: str = "")
     # this delete leaves status=approved, so a retry reports "already
     # processed" instead of re-executing.
     ctx.pending_ops.delete(op.id)
-    _seal_resolution(ctx, op, "approved", msg)
+    if seal_resolution:
+        _seal_resolution(ctx, op, "approved", msg)
     return msg
 
 
@@ -265,11 +347,14 @@ def _seal_resolution(ctx, op: PendingOperation, outcome: str,
         else:
             content["file"] = op.file_path
         chain.append("resolution", content)
-    except Exception:        # noqa: BLE001 — the decision already executed
-        pass
+    except Exception as e:   # noqa: BLE001 — the decision already executed
+        log.warning("failed to seal %s resolution for op %s (the decision "
+                    "executed but is not on the identity chain): %s",
+                    outcome, op.id, e)
 
 
-def _approve_tool_call(op: PendingOperation, ctx) -> str:
+def _approve_tool_call(op: PendingOperation, ctx,
+                       seal_resolution: bool = True) -> str:
     """USER-triggered approval of a deferred tool call. Single-shot: there
     is no resumable middle state like the write machine — once execution
     starts the op is terminal, and a crash mid-execution reads as
@@ -302,13 +387,15 @@ def _approve_tool_call(op: PendingOperation, ctx) -> str:
     op.status = "approved"
     ctx.pending_ops.save(op)
     ctx.pending_ops.delete(op.id)    # cleanup on resolution
-    _seal_resolution(ctx, op, "approved", result)
+    if seal_resolution:
+        _seal_resolution(ctx, op, "approved", result)
     if result.startswith("TOOL ERROR"):
         return f"ERROR: {result}"    # keep the ok/failed prefix contract
     return result
 
 
-def execute_approve_write(kwargs: dict, ctx) -> str:
+def execute_approve_write(kwargs: dict, ctx,
+                          seal_resolution: bool = True) -> str:
     """USER-triggered approval. For kind="write": the full write-gate state
     machine, including crash recovery for the writing/written/ingest_failed
     states. For kind="tool_call": single-shot deferred-call execution
@@ -322,7 +409,7 @@ def execute_approve_write(kwargs: dict, ctx) -> str:
         return "ERROR: Operation not found — invalid or expired pending_op_id."
 
     if getattr(op, "kind", "write") == "tool_call":
-        return _approve_tool_call(op, ctx)
+        return _approve_tool_call(op, ctx, seal_resolution=seal_resolution)
 
     if op.status == "ingest_failed":
         # Recovery: file already written, retry only the ingest step.
@@ -334,12 +421,16 @@ def execute_approve_write(kwargs: dict, ctx) -> str:
                     f"Expected {op.proposed_content_hash[:8]}, "
                     f"got {live_hash[:8] if live_hash else 'file missing'}. "
                     f"Manual intervention required.")
-        ingest_result = ctx.task_ingest(op.task_name, op.file_path,
-                                        finding=op.change_summary,
-                                        content_hash=op.proposed_content_hash,
-                                        operation_id=op.id)
+        ingest_result = ctx.task_ingest(
+            op.task_name, op.file_path,
+            finding=op.change_summary,
+            content_hash=op.proposed_content_hash,
+            operation_id=op.id,
+            text_override=(op.proposed_content
+                           if getattr(op, "binary_b64", "") else None))
         return _finalize_approved(op, ctx, ingest_result,
-                                  note="recovered from ingest failure")
+                                  note="recovered from ingest failure",
+                                  seal_resolution=seal_resolution)
 
     if op.status in ("writing", "written"):
         # Crash-recovery: inspect live hash, proposed hash, pre-write hash,
@@ -392,12 +483,16 @@ def execute_approve_write(kwargs: dict, ctx) -> str:
                         f"Expected {op.proposed_content_hash[:8]}, "
                         f"got {live_hash[:8] if live_hash else 'file missing'}. "
                         f"Manual intervention required.")
-            ingest_result = ctx.task_ingest(op.task_name, op.file_path,
-                                            finding=op.change_summary,
-                                            content_hash=op.proposed_content_hash,
-                                            operation_id=op.id)
+            ingest_result = ctx.task_ingest(
+                op.task_name, op.file_path,
+                finding=op.change_summary,
+                content_hash=op.proposed_content_hash,
+                operation_id=op.id,
+                text_override=(op.proposed_content
+                               if getattr(op, "binary_b64", "") else None))
             return _finalize_approved(op, ctx, ingest_result,
-                                      note="recovered from crash")
+                                      note="recovered from crash",
+                                      seal_resolution=seal_resolution)
 
     if op.status != "pending":
         return f"ERROR: Operation already processed (status={op.status})."
@@ -407,6 +502,7 @@ def execute_approve_write(kwargs: dict, ctx) -> str:
     if op.expired():
         op.status = "expired"
         ctx.pending_ops.save(op)
+        _discard_tmp(op)
         ctx.pending_ops.delete(op.id)   # cleanup on resolution (expire)
         return "ERROR: Operation expired."
 
@@ -431,20 +527,25 @@ def execute_approve_write(kwargs: dict, ctx) -> str:
     # operation_id and find_by_operation_id() detects duplicates, so a crash
     # after ingest but before approved cannot double-seal on retry.
     try:
-        ingest_result = ctx.task_ingest(op.task_name, op.file_path,
-                                        finding=op.change_summary,
-                                        content_hash=op.proposed_content_hash,
-                                        operation_id=op.id)
+        ingest_result = ctx.task_ingest(
+            op.task_name, op.file_path,
+            finding=op.change_summary,
+            content_hash=op.proposed_content_hash,
+            operation_id=op.id,
+            text_override=(op.proposed_content
+                           if getattr(op, "binary_b64", "") else None))
     except Exception as e:                    # noqa: BLE001 — recovery state
         op.status = "ingest_failed"
         ctx.pending_ops.save(op)
         return (f"ERROR: Written {op.file_path} but ingest failed: {e} "
                 f"(op {op.id}, status=ingest_failed). Retry with "
                 f"approve_write to re-attempt ingest.")
-    return _finalize_approved(op, ctx, ingest_result)
+    return _finalize_approved(op, ctx, ingest_result,
+                               seal_resolution=seal_resolution)
 
 
-def execute_reject_write(kwargs: dict, ctx) -> str:
+def execute_reject_write(kwargs: dict, ctx,
+                         seal_resolution: bool = True) -> str:
     """USER-triggered (or expiry-driven) rejection — never the model's call.
     Covers both kinds: a rejected tool_call op is simply discarded."""
     op = ctx.pending_ops.load(kwargs.get("pending_op_id", ""))
@@ -452,10 +553,68 @@ def execute_reject_write(kwargs: dict, ctx) -> str:
         return "ERROR: Operation already processed."
     op.status = "rejected"
     ctx.pending_ops.save(op)
+    _discard_tmp(op)
     ctx.pending_ops.delete(op.id)   # cleanup on resolution (reject)
     if getattr(op, "kind", "write") == "tool_call":
         msg = f"Tool call {op.tool_name} rejected."
     else:
         msg = f"Write to {op.file_path} rejected."
-    _seal_resolution(ctx, op, "rejected", msg)
+    if seal_resolution:
+        _seal_resolution(ctx, op, "rejected", msg)
     return msg
+
+
+def resolve_inline(op_id: str, decision: str, ctx) -> tuple[Optional[dict], str]:
+    """Resolve a pending op MID-TURN (the inline approval gate, v1.4.x).
+
+    Unlike the user-action entrypoints above, this path seals NO separate
+    resolution record: the caller is a running turn, and it embeds the
+    returned entry in the turn's response record instead — the resolution
+    becomes part of the narrative of the turn that produced it. The
+    out-of-band endpoints keep their default sealing for ops resolved
+    AFTER their turn (crash recovery, legacy ops).
+
+    decision: "approved" | "rejected" | "expired" (the gate timed out with
+    no user decision — the op is discarded, mirroring the expire path).
+
+    Returns (entry, message): `entry` is the compact dict to embed in the
+    response record (None if the op was unknown/already processed);
+    `message` is the executor result to feed back to the model as the
+    tool result.
+    """
+    op = ctx.pending_ops.load(op_id)
+    if op is None:
+        return None, ("ERROR: Operation not found — invalid or already "
+                      "processed pending_op_id.")
+    if decision == "approved":
+        msg = execute_approve_write({"pending_op_id": op_id}, ctx,
+                                    seal_resolution=False)
+        # The approval may still fail (hash mismatch, expiry race) — record
+        # the outcome that actually happened, not the decision requested.
+        outcome = "approved" if not msg.startswith(("ERROR", "REFUSED")) \
+            else "approve_failed"
+    elif decision == "rejected":
+        msg = execute_reject_write({"pending_op_id": op_id}, ctx,
+                                   seal_resolution=False)
+        outcome = "rejected"
+    elif decision == "expired":
+        op.status = "expired"
+        ctx.pending_ops.save(op)
+        _discard_tmp(op)
+        ctx.pending_ops.delete(op.id)
+        msg = ("EXPIRED: the user gave no decision within the approval "
+               "window — the operation was discarded. Do not retry it; "
+               "continue without it and tell the user what was skipped.")
+        outcome = "expired"
+    else:
+        return None, f"ERROR: unknown resolution decision {decision!r}"
+    entry = {
+        "pending_op_id": op.id,
+        "kind": getattr(op, "kind", "write"),
+        "target": (op.tool_name if getattr(op, "kind", "write") == "tool_call"
+                   else op.file_path),
+        "summary": op.change_summary,
+        "decision": outcome,
+        "result": (msg or "")[:300],
+    }
+    return entry, msg

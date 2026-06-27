@@ -102,6 +102,7 @@ h1.page { font-size: 34px; margin: 2px 0 6px; letter-spacing: -0.01em; }
 .detail { border: 1px solid var(--line); border-radius: 8px; padding: 16px; background: var(--panel); min-height: 220px; position: sticky; top: 70px; }
 .detail .empty { color: var(--muted); }
 .detail pre { white-space: pre-wrap; word-wrap: break-word; font-family: var(--mono); font-size: 12px; line-height: 1.5; }
+.detail pre.ctx { border-left: 2px solid var(--line); padding-left: 10px; color: #444; }
 .det-section { margin-top: 16px; }
 .det-section h5 { margin: 0 0 7px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
 .kv { display: grid; grid-template-columns: 140px 1fr; gap: 4px 10px; font-size: 13px; }

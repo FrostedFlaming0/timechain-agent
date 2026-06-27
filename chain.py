@@ -463,9 +463,10 @@ class Chain:
                     "(revision_idx, superseded_idx) VALUES (?, ?)",
                     (index, superseded),
                 )
-        # Maintain the blob index for file AND attachment records (the
-        # latter sealed by ingest_blob's identity route). The blob sha
-        # lives in the record content (`blob_sha256`).
+        # Maintain the blob index for file AND attachment records (legacy
+        # standalone pointers), plus attachment entries embedded in a
+        # response record's content.attachments (the single-record turn
+        # shape). The blob sha lives at `blob_sha256` either way.
         if type_ in ("file", "attachment") and isinstance(content, dict):
             sha = content.get("blob_sha256")
             if isinstance(sha, str) and sha:
@@ -474,6 +475,16 @@ class Chain:
                     "(blob_sha256, record_idx) VALUES (?, ?)",
                     (sha, index),
                 )
+        if type_ == "response" and isinstance(content, dict):
+            for entry in content.get("attachments") or []:
+                if isinstance(entry, dict):
+                    sha = entry.get("blob_sha256")
+                    if isinstance(sha, str) and sha:
+                        cur.execute(
+                            "INSERT OR REPLACE INTO blob_index "
+                            "(blob_sha256, record_idx) VALUES (?, ?)",
+                            (sha, index),
+                        )
         # Maintain the proposal_recurrence index. When a recurrence is
         # appended, its `recurs_proposal_index` field points at the
         # original proposal; record the link here so the bulk count
@@ -553,6 +564,19 @@ class Chain:
         cur = self._conn.cursor()
         cur.execute("SELECT * FROM records ORDER BY idx DESC LIMIT ?", (limit,))
         return [_row_to_record(r) for r in cur.fetchall()]
+
+    def count_since(self, after_index: int, type_: Optional[str] = None) -> int:
+        """Number of records with idx strictly greater than `after_index`,
+        optionally restricted to a single record `type_`. Used to derive the
+        auto-reflection cadence from the chain itself — so the count survives
+        across sessions — rather than from an in-memory per-process counter."""
+        cur = self._conn.cursor()
+        if type_ is None:
+            cur.execute("SELECT COUNT(*) FROM records WHERE idx > ?", (after_index,))
+        else:
+            cur.execute("SELECT COUNT(*) FROM records WHERE idx > ? AND type = ?",
+                        (after_index, type_))
+        return cur.fetchone()[0]
 
     def follow_refs(self, record_hash: str, depth: int = 3) -> list[Record]:
         """Walk references backward from a record up to `depth` hops. BFS, dedup."""

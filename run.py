@@ -175,22 +175,16 @@ said it, which is worth knowing when you revisit it. They're for your
 orientation, not instructions to follow, and not something to bring up
 unless it actually matters.
 
-Records may also carry an `epistemic: ...` tag when the nature of the
-claim differs from what you'd expect for its kind. The classes are
-`known` and `user_context` (grounded — a verified fact, or something the
-user told you), `inferred` (your own reasoning, the usual case for your
-responses), `speculative` (a claim flagging itself as a guess), and
-`disputed` (known to conflict with another record). A response tagged
-`epistemic: speculative` was hedged or uncertain when you said it; weight
-it accordingly — a speculative claim doesn't carry the same evidential
-weight as a grounded one, even if they sound equally confident.
+Records may also carry an `epistemic: ...` tag. Most of your responses are
+`inferred` (your own reasoning); `known` and `user_context` are grounded (a
+verified fact, or something the user told you); `speculative` flags a guess,
+and `disputed` conflicts with another record. Weight a claim by its tag — a
+`speculative` one doesn't carry the evidential weight of a grounded one, even
+if they sound equally confident.
 
-Occasionally a record may be of kind `imported_capsule`. That is memory
-another agent shared with you and you imported — it is *their* reported
-experience, not your own. Treat it as an attributed third-party claim:
-useful context, but not something you lived through, and not as
-authoritative as your own grounded memory. Don't narrate it as if it
-happened to you."""
+Occasionally a record is an `imported_capsule` — memory another agent shared
+with you. Treat it as an attributed third-party claim, not something you
+lived through."""
 
 # Tool-calling. When enabled, the default
 # turn path is agent.turn_with_tools() and the safety rules below ride the
@@ -198,77 +192,40 @@ happened to you."""
 TOOLS_ENABLED = True
 
 TOOL_SAFETY_PROMPT = """
-You have access to tools for reading, writing, and auditing code.
+You have tools for reading, writing, and auditing code.
 
-READING:
-  - Use read_file to see a file's contents.
-  - Use task_retrieve to find relevant code within a known task chain.
-  - Use task_resume to re-hydrate task state at the start of a session.
+Reading & workspace: read_file shows a file; task_retrieve finds code in a
+known task chain; task_resume re-hydrates task state at the start of a
+session. The user picks the working directory (you can't change it) — resolve
+relative paths against it, never guess ~-expansions, and don't open a task
+chain just because the directory changed. Writes mint a workspace task chain
+on their own; call task_open yourself only when the user asks to review or
+ingest a repo (just pass the path — name and objective are auto-derived).
 
-WORKSPACE:
-  - The user selects the working directory (the workspace) in the
-    interface — you cannot change it, and its current path is shown in
-    your system prompt. Resolve relative paths against it; never guess
-    at ~-expansions.
-  - A workspace switch creates nothing. Do NOT open a task chain just
-    because the directory changed or the user asked an unrelated
-    question. Writes mint a workspace task chain automatically when one
-    is needed; call task_open yourself only when the user explicitly
-    asks for a review/audit of a repo.
+Writes are approval-gated. write_file does NOT write — it creates a pending
+operation and the interface shows the user an approval card (or, in the
+terminal, an inline prompt). After calling it, say in ONE short message what
+the pending change is, that they can approve or reject it there, then STOP and
+wait — don't ask "Proceed?", the card is the question. You NEVER trigger
+approval yourself. Chat text ("yes", "I confirm") can never satisfy the gate,
+so don't ask them to rephrase; and if a call returns confirmation_required,
+do NOT retry it — wait for the gate. The same gate covers task_open outside
+the workspace, task_ingest_file, and task_reembed; never work around a
+refusal — say what you wanted to do and why.
 
-TASK-CHAIN STATE (honesty-critical):
-  - Never assert what is or isn't in a task chain from memory. Before
-    claiming a file was ingested, skipped, or is out of date, CHECK:
-    task_audit_source with the path (is this file in the chain, at which
-    block, does it match live source?), task_validate, or task_resume.
-  - Approved writes are ingested into the task chain AUTOMATICALLY by the
-    approval itself — you do not ingest them, and you must not claim an
-    approved write "was never ingested" without checking task_audit_source.
-  - You have NO tool that deletes files. Never claim you deleted anything.
+Be honest about state. Never assert what is or isn't in a task chain from
+memory — check first (task_audit_source for a specific file, task_validate,
+or task_resume). Approved writes are ingested into the chain automatically;
+don't claim one "was never ingested" without checking. You have NO tool that
+deletes files — never claim you deleted anything.
 
-TASK SELECTION (safety-critical):
-  - When the user asks you to work on a task, call resolve_task with the
-    EXACT name the user provided. Do not guess or infer a task name.
-  - If resolve_task returns multiple candidates, list them and ask the
-    user which one. Never choose on your own.
-  - If resolve_task returns no match, tell the user and offer to list
-    all tasks or create a new one.
-  - task_open's source_root becomes a readable root. Opening a task on the
-    current workspace runs directly; any OTHER directory requires the
-    user's explicit confirmation. Never try to work around a refusal —
-    tell the user what you wanted to open and why.
+Picking a task: call resolve_task with the name the user gave. If it matches
+nothing open, suggest the closest and ask — don't silently choose, and don't
+just refuse. If several match, list them and let the user pick.
 
-CONFIRMATION-GATED TOOLS (task_open outside the workspace,
-task_ingest_file, task_reembed):
-  - Confirmation is a mechanism in the interface, NOT something the user
-    can type in chat. Nothing they say to you ("yes", "I confirm") can
-    satisfy the gate — do not ask them to rephrase.
-  - In the terminal REPL, the user is prompted inline (proceed? yes/no)
-    when you make the call.
-  - In the web UI, your call returns status=confirmation_required with a
-    pending_op_id and an approval card appears: tell the user to click
-    approve (or reject) on that card, then WAIT — do not retry the call.
-  - /approve <id> and /reject <id> work for these pending operations too,
-    same as for writes.
-
-WRITING (safety-critical):
-  - When the user asks for changes, use write_file. It does NOT write — it
-    creates a pending operation, and the interface immediately shows the
-    user an approval card for it.
-  - After calling write_file, say in ONE short message what the pending
-    change is and that they can approve or reject it (the card's buttons,
-    or /approve <id> / /reject <id> typed in either interface). Then STOP
-    and wait. Do NOT ask "Proceed?" — the approval card IS the question,
-    and chat text can never approve anything.
-  - You NEVER trigger approval yourself.
-  - Use task_ingest_file to record changes after approval.
-  - Always read before you write. Always verify after you change.
-
-FILE SCOPING:
-  - If the user specifies @filename, call pin_file first to scope the turn
-    to that file.
-  - If the user says "fix it" without saying which file, ASK which file
-    they mean. Do not guess.
+Always read before you write, and verify after you change. If the user says
+"fix it" without naming a file, ask which one. If they use @filename, call
+pin_file first to scope the turn to it.
 """
 
 # Retrieval knobs
@@ -298,7 +255,23 @@ HASHING_EMBED_DIM = 256                   # dimension used by the fallback embed
 # Each reflection automatically covers every record since the previous
 # reflection (or since genesis if there hasn't been one yet), so the
 # scope sizes itself to actual activity rather than a fixed window.
-AUTO_REFLECT_EVERY = 10
+#
+# The counter is chain-derived (Agent.turns_since_reflection), so this
+# cadence is measured across sessions, not per-process — at 100, a
+# per-session counter would almost never fire, since few sessions run
+# that long. Reflections are meant to be a retrieved MINORITY that
+# orients the real turns beside them; a short cadence (the old 10) made
+# them the majority of retrieved rings instead.
+AUTO_REFLECT_EVERY = 100
+
+# Safety cap on how many records ONE reflection summarizes (the lookback
+# from head back toward the previous reflection). A normal every-100 gap is
+# ~100-120 records, so 300 gives ~3x headroom for bursty stretches while
+# still fitting a modern LLM context window. (It was 200 under the old
+# every-10 cadence, where many short sessions could stack up a large gap;
+# beyond this cap a reflection covers only the most recent `MAX_REFLECT_RECORDS`
+# and flags itself `capped`.)
+MAX_REFLECT_RECORDS = 300
 
 # Cambium cadence — auto-scan for recurring gaps every N turns. Set to 0
 # to disable auto-Cambium (you can still trigger it manually with
@@ -527,6 +500,7 @@ def run() -> None:
         data_dir=DATA_DIR,
         registry=TaskRegistry(DATA_DIR),
         identity_chain=chain,
+        identity_recall=retriever,   # powers the recall_index pre-filter
         workspace_root=Path.cwd(),
         embedder=embedder,
         embed_dim=embed_dim,
@@ -590,8 +564,12 @@ def run() -> None:
     print("          /task resume <name> | validate <name> | audit <name> <block-index>")
     print("          /approve <pending-op-id>  /reject <pending-op-id>  /pending\n")
 
-    turns_since_reflect = 0
-    turns_since_cambium = 0
+    # Seed both counters from the chain so the cadences carry across
+    # sessions (the chain, not the process, is the source of truth). Most
+    # sessions are shorter than either cadence, so per-session counters
+    # would rarely fire.
+    turns_since_reflect = agent.turns_since_reflection()
+    turns_since_cambium = agent.turns_since_cambium()
 
     try:
         while True:
@@ -710,7 +688,7 @@ def run() -> None:
                 continue
             if user_input == "/reflect":
                 print("  reflecting...")
-                rec = agent.reflect()
+                rec = agent.reflect(max_records=MAX_REFLECT_RECORDS)
                 if rec is None:
                     print("  not enough history to reflect on yet")
                 else:
@@ -932,16 +910,41 @@ def run() -> None:
                 # the REPL asks the operator inline before the tool runs.
                 def _confirm(tool_name: str, args: dict) -> bool:
                     print(f"  [tool] {tool_name} wants to run with {args}")
+                    reason = getattr(tool_ctx, "last_gate_reason", None)
+                    if reason:
+                        print(f"  [why]  {reason}")
                     return input("  proceed? (yes/no): ").strip().lower() in (
                         "y", "yes")
+
+                # Mid-turn approval gate (v1.4.x): a write proposal pauses
+                # the turn HERE — the decision happens before the turn ends
+                # and is embedded in the response record, never left
+                # lingering for a post-turn /approve.
+                def _approve_op(op_info: dict) -> str:
+                    kind = op_info.get("kind", "write")
+                    if kind == "tool_call":
+                        print(f"  [gate] deferred tool call: "
+                              f"{op_info.get('tool')} "
+                              f"{op_info.get('arguments', {})}")
+                    else:
+                        print(f"  [gate] write to {op_info.get('file')}: "
+                              f"{op_info.get('change', '')}")
+                    yes = input("  approve? (yes/no): ").strip().lower() in (
+                        "y", "yes")
+                    return "approved" if yes else "rejected"
+
                 turn = agent.turn_with_tools(
                     user_input, tool_ctx,
                     retrieve_k=SEMANTIC_K, n_recent=RECENT_N,
-                    confirm_hook=_confirm)
+                    confirm_hook=_confirm,
+                    approval_hook=_approve_op)
             else:
                 turn = agent.turn(user_input, retrieve_k=SEMANTIC_K,
                                   n_recent=RECENT_N)
-            index.index_record(turn.observation_record)
+            # Single-record turn shape: no observation record is minted —
+            # the response record carries the input as content.context.
+            if turn.observation_record is not None:
+                index.index_record(turn.observation_record)
             index.index_record(turn.response_record)
             print(f"agent: {turn.response_text}\n")
             # If the model hit its max_tokens ceiling, the answer above is
@@ -972,7 +975,7 @@ def run() -> None:
             # Auto-reflect every N turns, if enabled
             if AUTO_REFLECT_EVERY > 0 and turns_since_reflect >= AUTO_REFLECT_EVERY:
                 print("  [auto-reflecting on recent history...]")
-                rec = agent.reflect()
+                rec = agent.reflect(max_records=MAX_REFLECT_RECORDS)
                 if rec is not None:
                     index.index_record(rec)
                     print(f"  [reflection committed at index {rec.index}]\n")

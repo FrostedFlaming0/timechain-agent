@@ -835,6 +835,52 @@ class TestChunking:
         # self-describing.
         assert all(t.startswith("[file design.md document]") for t in texts)
 
+    def test_incremental_append_matches_full_rebuild(self, workdir, chain, index):
+        # Per-turn writes append the new record's vectors to the live
+        # in-memory matrix instead of invalidating it (the old behavior
+        # made every turn's retrieval pay a full O(chain) rebuild). The
+        # guarantee: results are identical to a cold index that built its
+        # matrix from SQLite in one pass.
+        topics = [
+            "alpha particle scattering experiments",
+            "baroque counterpoint and fugue structure",
+            "compiler register allocation strategies",
+            "deep sea vent ecology and chemosynthesis. " * 200,  # multi-chunk
+        ]
+        for t in topics[:2]:
+            index.index_record(chain.append("note", {"text": t}))
+        index.search("warm up: build the matrix", k=4)
+        assert index._nn is not None
+        for t in topics[2:]:
+            index.index_record(chain.append("note", {"text": t}))
+            assert index._nn is not None  # appended, not invalidated
+        query = "register allocation in compilers"
+        warm = index.search(query, k=4)
+        cold = EmbeddingIndex(workdir / "embed-cold.sqlite",
+                              HashingEmbedder(dim=64), dim=64)
+        try:
+            for rec in chain.iter_records():
+                cold.index_record(rec)
+            assert warm == cold.search(query, k=4)
+        finally:
+            cold.close()
+
+    def test_reindex_falls_back_to_full_rebuild(self, chain, index):
+        # A re-indexed record's OLD rows are already baked into the
+        # matrix, so append is wrong there — index_record must invalidate
+        # and let the next search rebuild, with no duplicate rows.
+        rec = chain.append("note", {"text": "stable reindexed content"})
+        index.index_record(rec)
+        index.search("stable", k=1)
+        assert index._nn is not None
+        index.index_record(rec)  # re-index same record
+        assert index._nn is None  # full rebuild scheduled
+        results = index.search("stable reindexed content", k=1)
+        assert results and results[0][0] == rec.index
+        cur = index._conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM embeddings")
+        assert len(index._idx_to_record) == cur.fetchone()[0]
+
 
 # ---------------------------------------------------------------------------
 # Chunk-aware rendering of long file records (Phase 2)
@@ -1352,21 +1398,26 @@ class TestAgent:
         with pytest.raises(RuntimeError):
             agent.commit_genesis(["b"])
 
-    def test_turn_writes_two_records(self, agent, index):
+    def test_turn_writes_single_record(self, agent, index):
         agent.commit_genesis(["be honest"])
         before = agent.chain.length()
         turn = agent.turn("hello there", retrieve_k=3)
-        index.index_record(turn.observation_record)
         index.index_record(turn.response_record)
         after = agent.chain.length()
-        assert after == before + 2
-        assert turn.observation_record.type == "observation"
+        # Single-record turn shape: ONE response record carries the
+        # whole exchange — the user's input rides in content.context.
+        assert after == before + 1
+        assert turn.observation_record is None
         assert turn.response_record.type == "response"
+        assert turn.response_record.content["context"] == "hello there"
 
     def test_response_refs_include_observation(self, agent, index):
         agent.commit_genesis(["be honest"])
         turn = agent.turn("hello", retrieve_k=3)
-        assert turn.observation_record.record_hash in turn.response_record.refs
+        # Single-record turn shape: no observation record exists; the
+        # input is INSIDE the response record, not ref'd by it.
+        assert turn.observation_record is None
+        assert turn.response_record.content["context"] == "hello"
 
     def test_log_system_prompt_writes_once_then_dedupes(self, agent, index):
         agent.commit_genesis(["be honest"])
@@ -1397,7 +1448,8 @@ class TestAgent:
         agent.commit_genesis(["be honest"])
         for msg in ["hi", "test 1", "test 2", "test 3"]:
             t = agent.turn(msg)
-            index.index_record(t.observation_record)
+            if t.observation_record is not None:
+                index.index_record(t.observation_record)
             index.index_record(t.response_record)
         rec = agent.reflect()
         assert rec is not None
@@ -1409,7 +1461,8 @@ class TestAgent:
     def test_revise_creates_new_record_originalstays(self, agent, index):
         agent.commit_genesis(["be honest"])
         t = agent.turn("hello")
-        index.index_record(t.observation_record)
+        if t.observation_record is not None:
+            index.index_record(t.observation_record)
         index.index_record(t.response_record)
         original_idx = t.response_record.index
         original_content = agent.chain.get(original_idx).content
@@ -1433,7 +1486,8 @@ class TestAgent:
         agent.log_system_prompt()
         for msg in ["hi", "test 1", "test 2", "test 3", "test 4"]:
             t = agent.turn(msg)
-            index.index_record(t.observation_record)
+            if t.observation_record is not None:
+                index.index_record(t.observation_record)
             index.index_record(t.response_record)
         agent.reflect()
         agent.revise(2, "correction")
@@ -1500,7 +1554,8 @@ class TestContextBudget:
         agent.commit_genesis(["x"])
         for i in range(5):
             t = agent.turn(f"msg {i}")
-            index.index_record(t.observation_record)
+            if t.observation_record is not None:
+                index.index_record(t.observation_record)
             index.index_record(t.response_record)
         # Build a normal prompt — should include all small records
         prompt = agent._format_prompt("ping", agent.retriever.build_context("ping"))
@@ -1513,7 +1568,8 @@ class TestContextBudget:
         agent.commit_genesis(["x"])
         for i in range(20):
             t = agent.turn(f"long message number {i} with lots of text padding " * 5)
-            index.index_record(t.observation_record)
+            if t.observation_record is not None:
+                index.index_record(t.observation_record)
             index.index_record(t.response_record)
         prompt = agent._format_prompt(
             "ping",
@@ -1528,7 +1584,8 @@ class TestContextBudget:
         # Add a reflection and many observations
         for i in range(10):
             t = agent.turn(f"long observation {i} " * 10)
-            index.index_record(t.observation_record)
+            if t.observation_record is not None:
+                index.index_record(t.observation_record)
             index.index_record(t.response_record)
         refl = agent.reflect()
         if refl:
@@ -1843,9 +1900,9 @@ class TestProtectedZones:
     def test_can_revise_ordinary_record(self, agent, index):
         agent.commit_genesis(["be honest"])
         t = agent.turn("a normal message")
-        index.index_record(t.observation_record)
-        # Revising an ordinary observation must succeed.
-        rev = agent.revise(t.observation_record.index, "a correction")
+        index.index_record(t.response_record)
+        # Revising an ordinary turn record must succeed.
+        rev = agent.revise(t.response_record.index, "a correction")
         assert rev is not None
         assert rev.type == "revision"
 
@@ -4468,7 +4525,7 @@ class TestWebappToolLoop:
         agent = Agent(chain, retr, llm, system_prompt="web tool test")
         stub = SimpleNamespace(chain=chain, index=index, agent=agent,
                                tool_ctx=ctx, lock=asyncio.Lock(),
-                               active_token="tok",
+                               active_token="tok", approval_waiters={},
                                turns_since_reflect=0, turns_since_cambium=0)
         monkeypatch.setattr(wm, "state", stub)
         monkeypatch.setattr(wm, "TOOLS_ENABLED", True)
@@ -4571,10 +4628,11 @@ class TestWebappToolLoop:
         replay = asyncio.run(asyncio.wait_for(run(), timeout=30))
         done = json.loads(replay[-1]["data"])
         assert "after the tab switch" in done["response"]["content"]["text"]
-        # The chain holds a PAIRED turn — no stranded observation.
+        # Single-record turn shape: ONE record holds the whole turn.
         recs = [r for r in stub.chain.iter_records()
                 if r.type in ("observation", "response")]
-        assert [r.type for r in recs] == ["observation", "response"]
+        assert [r.type for r in recs] == ["response"]
+        assert recs[0].content["context"] == "hello?"
 
     def test_reconnect_never_starts_a_duplicate_turn(self, web_env):
         # An EventSource auto-reconnect repeats the start URL (same input)
@@ -4611,17 +4669,24 @@ class TestWebappToolLoop:
                     == json.loads(events[-1]["data"]))
 
         asyncio.run(asyncio.wait_for(run(), timeout=30))
-        # Exactly ONE turn committed.
+        # Exactly ONE turn committed (single-record turn shape).
         obs = [r for r in stub.chain.iter_records()
                if r.type == "observation"]
-        assert len(obs) == 1
+        assert len(obs) == 0
         resps = [r for r in stub.chain.iter_records()
                  if r.type == "response"]
         assert len(resps) == 1
+        assert resps[0].content["context"] == "same question"
         assert "SECOND TURN RAN" not in resps[0].content["text"]
 
-    def test_stream_write_file_emits_pending_op_and_approve_endpoint_writes(
+    def test_stream_write_file_pauses_for_midturn_approval_then_writes(
             self, web_env):
+        # The mid-turn approval gate: write_file PAUSES the streaming turn
+        # on a pending_op (inline=true); the approve endpoint delivers the
+        # decision lock-free to the parked turn, which executes the write,
+        # emits op_resolved, feeds the REAL outcome to the model, and
+        # embeds the resolution in the response record — never a separate
+        # resolution record.
         import asyncio
         from starlette.requests import Request
         wm, stub, llm, src = web_env
@@ -4629,23 +4694,90 @@ class TestWebappToolLoop:
             '<tool_call>{"name": "write_file", "arguments": {'
             '"path": "out.py", "content": "x = 1\\n", '
             '"change_summary": "add out.py"}}</tool_call>',
-            "Created a pending write; awaiting your approval.",
+            "Wrote out.py after your approval.",
         ]
-        events = self._events(wm, stub, "please write out.py")
-        pend = [e for e in events if e["event"] == "pending_op"]
-        assert pend, "write_file did not surface a pending_op SSE event"
-        op = json.loads(pend[0]["data"])
-        assert op["status"] == "confirmation_required"
-        assert not (src / "out.py").exists()   # nothing written yet
 
-        async def approve():
-            stub.lock = asyncio.Lock()
-            return await wm.pending_op_approve(Request(self._scope()),
-                                               op["pending_op_id"])
-        result = asyncio.run(asyncio.wait_for(approve(), timeout=30))
-        assert result["ok"], result
+        async def run():
+            stub.lock = asyncio.Lock()   # fresh lock per event loop
+            stub.approval_waiters = {}
+            resp = await wm.turn_stream(Request(self._scope()),
+                                        input="please write out.py",
+                                        session="tok")
+            events = []
+            async for ev in resp.body_iterator:
+                events.append(ev)
+                if ev["event"] == "pending_op":
+                    op = json.loads(ev["data"])
+                    assert op["status"] == "confirmation_required"
+                    assert op.get("inline") is True
+                    # turn is parked: nothing written yet
+                    assert not (src / "out.py").exists()
+                    r = await wm.pending_op_approve(
+                        Request(self._scope()), op["pending_op_id"])
+                    assert r["ok"], r
+                    assert "delivered" in r["result"]
+            return events
+
+        events = asyncio.run(asyncio.wait_for(run(), timeout=30))
+        kinds = [e["event"] for e in events]
+        assert "pending_op" in kinds and "op_resolved" in kinds
+        assert kinds[-1] == "done"
+
+        # the write happened INSIDE the turn
         assert (src / "out.py").read_text() == "x = 1\n"
         assert stub.tool_ctx.pending_ops.list_ids() == []
+        # the model saw the real outcome, not a dangling proposal
+        assert "Written" in llm.last_prompt
+
+        # the resolution is embedded in the response record …
+        done = json.loads(events[-1]["data"])
+        res = done["response"]["content"].get("resolutions")
+        assert res and res[0]["decision"] == "approved"
+        assert res[0]["target"].endswith("out.py")
+        # … and NOT sealed as a separate resolution record
+        assert not [r for r in stub.chain.iter_records()
+                    if r.type == "resolution"]
+
+    def test_stream_midturn_reject_feeds_back_and_writes_nothing(
+            self, web_env):
+        # Deny feeds back: the model sees the rejection as the tool result
+        # and finishes the turn; the file is never written; the rejected
+        # decision is embedded in the response record.
+        import asyncio
+        from starlette.requests import Request
+        wm, stub, llm, src = web_env
+        llm.script = [
+            '<tool_call>{"name": "write_file", "arguments": {'
+            '"path": "out.py", "content": "x = 1\\n", '
+            '"change_summary": "add out.py"}}</tool_call>',
+            "Understood — leaving out.py unwritten.",
+        ]
+
+        async def run():
+            stub.lock = asyncio.Lock()
+            stub.approval_waiters = {}
+            resp = await wm.turn_stream(Request(self._scope()),
+                                        input="please write out.py",
+                                        session="tok")
+            events = []
+            async for ev in resp.body_iterator:
+                events.append(ev)
+                if ev["event"] == "pending_op":
+                    op = json.loads(ev["data"])
+                    r = await wm.pending_op_reject(
+                        Request(self._scope()), op["pending_op_id"])
+                    assert r["ok"], r
+            return events
+
+        events = asyncio.run(asyncio.wait_for(run(), timeout=30))
+        assert not (src / "out.py").exists()
+        assert stub.tool_ctx.pending_ops.list_ids() == []
+        assert "rejected" in llm.last_prompt
+        done = json.loads(events[-1]["data"])
+        res = done["response"]["content"].get("resolutions")
+        assert res and res[0]["decision"] == "rejected"
+        assert not [r for r in stub.chain.iter_records()
+                    if r.type == "resolution"]
 
     def test_stream_budget_nudge_and_visible_cap_notice(self, web_env,
                                                         monkeypatch):
@@ -4738,7 +4870,9 @@ class TestWebappToolLoop:
         # exactly one observation AND one response were sealed — no orphan
         new = after[before:]
         types = [r.type for r in new]
-        assert types.count("observation") == 1
+        # Single-record turn shape: no observation record exists; the
+        # turn still commits as one response carrying the input.
+        assert types.count("observation") == 0
         assert types.count("response") == 1
         resp = [r for r in new if r.type == "response"][0]
         from recall import block_text
@@ -4840,10 +4974,14 @@ class TestWebappToolLoop:
                         "\n\nmod.py defines f returning 1.")
         assert "<tool_call>" not in text
 
-    def test_stream_defers_confirm_tools_to_pending_op(self, web_env):
-        # No inline confirm hook over SSE — a confirmation-gated call must
-        # become a pending op (surfaced as a pending_op event), NOT run and
-        # NOT dead-end in a flat refusal the user can never satisfy.
+    def test_stream_gated_tool_call_pauses_then_approve_executes_inline(
+            self, web_env):
+        # No inline confirm hook over SSE — a confirmation-gated call
+        # becomes a pending op AND pauses the turn on the mid-turn gate;
+        # approving mid-stream executes it INSIDE the turn (never left
+        # lingering past turn end).
+        import asyncio
+        from starlette.requests import Request
         wm, stub, llm, src = web_env
         # the precheck requires the task and file to exist before deferring
         stub.tool_ctx.registry.create("t", "audit", str(src))
@@ -4851,19 +4989,38 @@ class TestWebappToolLoop:
             '<tool_call>{"name": "task_ingest_file", "arguments": {'
             '"task_name": "t", "path": "mod.py", "finding": "x"}}'
             '</tool_call>',
-            "Created a pending op; awaiting your approval.",
+            "Ingested mod.py after your approval.",
         ]
-        events = self._events(wm, stub, "ingest mod.py")
-        tr = json.loads(
-            [e for e in events if e["event"] == "tool_result"][0]["data"])
-        parsed = json.loads(tr["result"])
-        assert parsed["status"] == "confirmation_required"
-        assert parsed["tool"] == "task_ingest_file"
-        pend = [e for e in events if e["event"] == "pending_op"]
-        assert pend and json.loads(pend[0]["data"])["kind"] == "tool_call"
-        # deferred, not executed:
-        assert stub.tool_ctx.pending_ops.list_ids() == [
-            parsed["pending_op_id"]]
+
+        async def run():
+            stub.lock = asyncio.Lock()
+            stub.approval_waiters = {}
+            resp = await wm.turn_stream(Request(self._scope()),
+                                        input="ingest mod.py",
+                                        session="tok")
+            events = []
+            async for ev in resp.body_iterator:
+                events.append(ev)
+                if ev["event"] == "pending_op":
+                    op = json.loads(ev["data"])
+                    assert op["kind"] == "tool_call"
+                    assert op["tool"] == "task_ingest_file"
+                    assert op.get("inline") is True
+                    r = await wm.pending_op_approve(
+                        Request(self._scope()), op["pending_op_id"])
+                    assert r["ok"], r
+            return events
+
+        events = asyncio.run(asyncio.wait_for(run(), timeout=30))
+        # executed inside the turn: resolved, gone from the store
+        assert stub.tool_ctx.pending_ops.list_ids() == []
+        kinds = [e["event"] for e in events]
+        assert "op_resolved" in kinds and kinds[-1] == "done"
+        done = json.loads(events[-1]["data"])
+        res = done["response"]["content"].get("resolutions")
+        assert res and res[0]["decision"] == "approved"
+        assert res[0]["kind"] == "tool_call"
+        assert res[0]["target"] == "task_ingest_file"
 
     def test_stream_task_open_outside_workspace_approve_executes(
             self, web_env, workdir):
@@ -4883,22 +5040,35 @@ class TestWebappToolLoop:
             f'"source_root": "{outside}"}}}}</tool_call>',
             "I created a pending operation — approve it to open the task.",
         ]
-        events = self._events(wm, stub, "open a task on the sibling repo")
-        pend = [e for e in events if e["event"] == "pending_op"]
-        assert pend, "gated task_open did not surface a pending_op event"
-        op = json.loads(pend[0]["data"])
-        assert op["kind"] == "tool_call" and op["tool"] == "task_open"
-        assert stub.tool_ctx.registry.get("sib") is None   # not yet
-
-        async def approve():
+        async def run():
             stub.lock = asyncio.Lock()
-            return await wm.pending_op_approve(Request(self._scope()),
-                                               op["pending_op_id"])
-        result = asyncio.run(asyncio.wait_for(approve(), timeout=30))
-        assert result["ok"], result
+            stub.approval_waiters = {}
+            resp = await wm.turn_stream(
+                Request(self._scope()),
+                input="open a task on the sibling repo", session="tok")
+            events = []
+            async for ev in resp.body_iterator:
+                events.append(ev)
+                if ev["event"] == "pending_op":
+                    op = json.loads(ev["data"])
+                    assert op["kind"] == "tool_call"
+                    assert op["tool"] == "task_open"
+                    assert stub.tool_ctx.registry.get("sib") is None  # not yet
+                    r = await wm.pending_op_approve(
+                        Request(self._scope()), op["pending_op_id"])
+                    assert r["ok"], r
+            return events
+
+        events = asyncio.run(asyncio.wait_for(run(), timeout=30))
+        assert any(e["event"] == "pending_op" for e in events), \
+            "gated task_open did not surface a pending_op event"
+        # the approval executed INSIDE the turn
         task = stub.tool_ctx.registry.get("sib")
         assert task and task["source_root"] == str(outside.resolve())
         assert stub.tool_ctx.pending_ops.list_ids() == []
+        done = json.loads(events[-1]["data"])
+        res = done["response"]["content"].get("resolutions")
+        assert res and res[0]["decision"] == "approved"
 
     def test_stream_shares_the_single_tool_driver(self):
         # The async loop must use tools.py's extractor/validator/executor/

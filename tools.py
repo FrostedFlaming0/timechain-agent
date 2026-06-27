@@ -30,6 +30,7 @@ and approve_write/reject_write are USER-triggered, never model-callable.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -39,6 +40,11 @@ from typing import Any, Callable, Optional
 import pending_ops as pending_ops_mod
 from pending_ops import PendingOpStore, sha256_text
 from task_registry import TaskRegistry, TaskRegistryError, resolve_task
+
+# Best-effort steps (embedding, workspace-task minting) must not fail the
+# turn, but their failures must not be invisible either — they warn here so
+# an operator can spot quiet degradation across sessions.
+log = logging.getLogger(__name__)
 
 MAX_TOOL_RESULT_BYTES = 64 * 1024     # reject/truncate oversized tool results
 
@@ -96,7 +102,65 @@ INGEST_BLOB_MAX_BYTES = MAX_INGEST_FILE_BYTES
 # task_reembed is here because it is long-running (a full-chain re-embed
 # through a CPU embedding model can take hours), not because it expands
 # any boundary.
+#
+# task_ingest_path is deliberately ABSENT despite ingesting far more data
+# than task_ingest_file: the volumetric risk is gated once, at root-grant
+# time — a task_open whose source_root expands the allowed roots requires
+# confirmation, and the walk is then bounded to those roots by
+# resolve_read_path. task_ingest_file stays gated per-call because it can
+# surgically target any single file within the approved roots, including
+# ones a walk's extension filter would never touch.
 CONFIRM_TOOLS = frozenset({"task_ingest_file", "task_reembed"})
+
+
+# Volume thresholds for the pre-walk survey: a recursive ingest that would
+# cover more than this ASKS the user first (with the surveyed numbers) —
+# it is never blocked, never trimmed. Catches the accident of opening a
+# task on ~/ with the workspace set to home, where the boundary gate never
+# fires because no new root is granted.
+WALK_CONFIRM_MAX_FILES = 1_000
+WALK_CONFIRM_MAX_BYTES = 1024 ** 3      # 1 GB
+
+
+def survey_walk(root: Path, exts: list) -> dict:
+    """Bounded pre-walk survey: count the files and bytes the walk WOULD
+    ingest, using the walk's own filters (extensions + DEFAULT_SKIP_DIRS,
+    with skip dirs pruned from descent so a huge .git or .venv costs
+    nothing), and stop counting the moment a confirmation threshold is
+    crossed — surveying ~/ must never itself take minutes. Returns
+    {files, bytes, over_threshold}; when over_threshold is True the counts
+    are floors ("1,000+ files"), not totals."""
+    from continuum import DEFAULT_SKIP_DIRS
+    files = 0
+    total = 0
+    exts_set = set(exts)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in DEFAULT_SKIP_DIRS]
+        for name in filenames:
+            if Path(name).suffix not in exts_set:
+                continue
+            files += 1
+            try:
+                total += (Path(dirpath) / name).stat().st_size
+            except OSError:
+                pass
+            if files > WALK_CONFIRM_MAX_FILES or total > WALK_CONFIRM_MAX_BYTES:
+                return {"files": files, "bytes": total, "over_threshold": True}
+    return {"files": files, "bytes": total, "over_threshold": False}
+
+
+def _volume_gate_reason(name: str, root: Path, exts: list,
+                        ctx: "AgentContext") -> Optional[str]:
+    """The ask-never-block volume check shared by task_open (auto-ingest)
+    and task_ingest_path. Returns a human-readable reason naming the
+    surveyed numbers when the walk crosses a threshold, else None."""
+    survey = survey_walk(root, exts)
+    if not survey["over_threshold"]:
+        return None
+    gb = survey["bytes"] / (1024 ** 3)
+    return (f"{name} would ingest {survey['files']:,}+ matching file(s) / "
+            f"~{gb:.1f}+ GB under {root} — large walks need your explicit "
+            f"go-ahead (they are never blocked, just confirmed)")
 
 
 def resolve_source_root(src: str, ctx: "AgentContext") -> Path:
@@ -122,8 +186,21 @@ def requires_confirmation(name: str, arguments: dict,
     expansion. Opening a task on the current workspace (or inside it) grants
     no new authority and runs unconfirmed; any other root — `/`, $HOME, a
     sibling repo — needs the user's explicit yes (and is refused in headless
-    loops that have no confirm hook)."""
+    loops that have no confirm hook).
+
+    task_open and task_ingest_path are ALSO gated on VOLUME (ask, never
+    block): a bounded pre-walk survey counts what the recursive ingest
+    would cover, and crossing WALK_CONFIRM_MAX_FILES / _BYTES requires the
+    user's explicit yes — with the surveyed numbers shown. This fires even
+    inside the workspace, closing the workspace-is-$HOME accident the
+    boundary gate cannot see. The reason (with numbers) is left on
+    ctx.last_gate_reason for the confirmation surfaces to display."""
+    ctx.last_gate_reason = None
     if name in CONFIRM_TOOLS:
+        ctx.last_gate_reason = (
+            "re-embedding a whole task chain can run for hours"
+            if name == "task_reembed"
+            else "reads one exact file into the task chain")
         return True
     if name == "task_open":
         src = arguments.get("source_root") if isinstance(arguments, dict) else None
@@ -132,7 +209,33 @@ def requires_confirmation(name: str, arguments: dict,
                                      # reject it, but never skip the gate
         resolved = resolve_source_root(src, ctx)
         workspace = ctx.workspace_root.resolve()
-        return not (resolved == workspace or workspace in resolved.parents)
+        if not (resolved == workspace or workspace in resolved.parents):
+            ctx.last_gate_reason = (f"source_root {resolved} expands the "
+                                    f"allowed read/ingest boundary beyond "
+                                    f"the workspace")
+            return True
+        if arguments.get("ingest") is False:
+            return False             # no walk, no volume to confirm
+        exts = arguments.get("extensions") or [".py", ".md"]
+        reason = _volume_gate_reason("task_open auto-ingest", resolved,
+                                     exts, ctx)
+        if reason:
+            ctx.last_gate_reason = reason
+            return True
+        return False
+    if name == "task_ingest_path":
+        try:
+            root = resolve_read_path(ctx, str(arguments.get("path") or ""))
+        except (PermissionError, ValueError, OSError):
+            return False             # the executor refuses it anyway
+        if not root.is_dir():
+            return False
+        exts = arguments.get("extensions") or [".py", ".md"]
+        reason = _volume_gate_reason("task_ingest_path", root, exts, ctx)
+        if reason:
+            ctx.last_gate_reason = reason
+            return True
+        return False
     return False
 
 # Executors that exist for the REPL/web approval endpoints but are NEVER
@@ -163,14 +266,70 @@ class AgentContext:
     # --- Session / turn state (NOT persisted to tasks.json) ---
     # active_task is a runtime cursor; persisting it causes stale-pointer
     # bugs. pinned_path is Tier-2 scoping, reset at the START of every turn
-    # so a pin never leaks across turns.
+    # so a pin never leaks across turns. last_gate_reason is set by
+    # requires_confirmation() for the confirmation surfaces (card / REPL
+    # prompt) to display — e.g. the pre-walk survey numbers.
     active_task: Optional[str] = None
     pinned_path: Optional[str] = None
+    last_gate_reason: Optional[str] = None
+    # Record hashes this turn's response should reference at commit:
+    # records the model pulled via recall_fetch, and synthesis records
+    # sealed by think_collapse. Drained into the response record's refs,
+    # so the chain records what informed the answer (mid-turn pulls and
+    # collapses included). Reset at turn start.
+    recalled_refs: list = field(default_factory=list)
+
+    def drain_recalled_refs(self) -> list:
+        refs, self.recalled_refs = self.recalled_refs, []
+        return refs
 
     def __post_init__(self):
         self.data_dir = Path(self.data_dir)
         self.workspace_root = Path(self.workspace_root)
         self.pending_ops = PendingOpStore(self.data_dir)
+        # Staged upload pointers (single-record turn shape): an upload's
+        # CONTENT goes to the artifacts chain / blob store immediately
+        # (durable), but its pointer waits here and seals into the NEXT
+        # turn's response record (content.attachments) — with the
+        # observation it accompanied and the response it received, the
+        # skill's blockspace_refs shape. Persisted to disk so a restart
+        # between upload and message loses nothing.
+        self._staging_path = self.data_dir / "staged_attachments.json"
+        try:
+            self.staged_attachments = json.loads(
+                self._staging_path.read_text(encoding="utf-8"))
+            if not isinstance(self.staged_attachments, list):
+                self.staged_attachments = []
+        except (OSError, ValueError):
+            self.staged_attachments = []
+
+    def _save_staging(self) -> None:
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self._staging_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self.staged_attachments, indent=2),
+                           encoding="utf-8")
+            os.replace(tmp, self._staging_path)
+        except OSError as e:
+            log.warning("could not persist staged attachments (they still "
+                        "ride this session in memory): %s", e)
+
+    def stage_attachment(self, pointer: dict) -> int:
+        """Queue an upload pointer for the next turn's response record.
+        Returns the number of entries now staged."""
+        self.staged_attachments.append(pointer)
+        self._save_staging()
+        return len(self.staged_attachments)
+
+    def drain_staged_attachments(self) -> list:
+        """Hand every staged pointer to the calling turn and clear the
+        staging (memory + disk). The caller seals them into the response
+        record; a crash after drain but before commit loses only the
+        pointers — content stays safe in the artifacts chain."""
+        entries, self.staged_attachments = self.staged_attachments, []
+        if entries:
+            self._save_staging()
+        return entries
 
     # ----- per-task lazy resources -----
 
@@ -259,9 +418,15 @@ class AgentContext:
 
     def task_ingest(self, task_name: str, file_path: str, finding: str = "",
                     content_hash: Optional[str] = None,
-                    operation_id: Optional[str] = None) -> dict:
+                    operation_id: Optional[str] = None,
+                    text_override: Optional[str] = None) -> dict:
         """Ingest ONE live file into a task chain, idempotently when an
-        operation_id is supplied. Returns {"ring_index": int|None, ...}."""
+        operation_id is supplied. Returns {"ring_index": int|None, ...}.
+
+        `text_override` seals the given text INSTEAD of reading/extracting
+        the file — the write-approval path for generated formats uses it so
+        the chain holds the approved SOURCE (searchable markdown) while
+        `content_hash` records the binary that actually landed on disk."""
         if not task_name:
             return {"ring_index": None, "note": "no task — ingest skipped"}
         import continuum as continuum_mod
@@ -278,7 +443,25 @@ class AgentContext:
                 f"{live} is {size} bytes; the single-file ingest cap is "
                 f"{MAX_INGEST_FILE_BYTES} (use task_ingest_path for trees, "
                 f"or split the file)")
-        text = live.read_text(encoding="utf-8", errors="replace")
+        from continuum import EXTRACTABLE_EXTS
+        if text_override is not None:
+            # Generated-format write approval: seal the approved SOURCE
+            # text; the file on disk is its binary rendering (hash in
+            # content_hash).
+            text = text_override
+        elif live.suffix.lower() in EXTRACTABLE_EXTS:
+            # Document formats (PDF / Office): same extraction as the walk
+            # and the upload path — a single ingested agreement must seal
+            # searchable prose, not binary noise.
+            from extractors import extract_text as _extract
+            text, method, _trunc = _extract(live.read_bytes(), live.name)
+            if not text:
+                raise ValueError(
+                    f"{live.name}: no text could be extracted "
+                    f"(method={method!r} — is the extractor library "
+                    f"installed?)")
+        else:
+            text = live.read_text(encoding="utf-8", errors="replace")
         task = self._require_task(task_name)
         rel = file_path
         src = task.get("source_root") or ""
@@ -307,8 +490,10 @@ class AgentContext:
         for rec, _tokens in sealed:
             try:
                 index.index_record(rec)
-            except Exception:        # noqa: BLE001 — embedding is best-effort
-                pass
+            except Exception as e:   # noqa: BLE001 — embedding is best-effort
+                log.warning("embedding failed for ring %s in task %r (sealed "
+                            "but not searchable; task_reembed repairs): %s",
+                            rec.index, task_name, e)
         m = state["metrics"]
         self.registry.update_state(task_name, m["items_done"],
                                    m["items_total"] or m["items_done"])
@@ -407,9 +592,17 @@ TOOLS: list[dict] = [
     },
     {
         "name": "write_file",
-        "description": ("Propose writing content to a file. Does NOT write: it returns a "
-                        "pending_op_id and the USER must approve. After calling this, STOP "
-                        "and show the user exactly what you intend to change."),
+        "description": ("Propose writing content to a file. Does NOT write directly: the "
+                        "USER must approve, via the interface's approval card, an inline "
+                        "terminal prompt, or by typing /approve <id> or /reject <id>. When "
+                        "the approval gate is active the turn "
+                        "pauses and this call's result is the real outcome (written / "
+                        "rejected / expired) — continue from it. If the result instead "
+                        "says confirmation_required, STOP and show the user exactly what "
+                        "you intend to change. A .docx path generates a REAL Word "
+                        "document: write the content as plain markdown (#/## headings, "
+                        "**bold**, *italic*, -/1. lists) and it is converted on "
+                        "approval — ideal for letters, LOIs, agreements."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -426,18 +619,27 @@ TOOLS: list[dict] = [
                         "long-horizon code task AND ingest the source tree "
                         "in the same call (default extensions .py/.md — one "
                         "turn, no separate ingest step). Set ingest=false "
-                        "to open without ingesting."),
+                        "to open without ingesting. Only source_root is "
+                        "required: when name or objective are omitted they "
+                        "are auto-derived from the directory (name = its "
+                        "slug, de-duplicated; objective = 'Audit of <root>'). "
+                        "Just pass the repo path to ingest it. Re-opening the "
+                        "same source_root (without an explicit name) REUSES "
+                        "the existing active task — it does not create a "
+                        "second chain or re-ingest — so you can safely call "
+                        "this again to keep working on a repo you already "
+                        "opened."),
         "parameters": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "Short slug for the task directory"},
-                "objective": {"type": "string"},
+                "name": {"type": "string", "description": "Optional short slug for the task directory; defaults to the source_root directory name (de-duplicated against existing tasks)."},
+                "objective": {"type": "string", "description": "Optional one-line goal; defaults to 'Audit of <source_root>'."},
                 "source_root": {"type": "string", "description": "Absolute path to the live source repository. Required for audits and post-write verification."},
                 "extensions": {"type": "array", "items": {"type": "string"},
                                "description": "File extensions to ingest, e.g. ['.py', '.md'] (the default)"},
                 "ingest": {"type": "boolean", "description": "Set false to open the task without ingesting the tree"},
             },
-            "required": ["name", "objective", "source_root"],
+            "required": ["source_root"],
         },
     },
     {
@@ -584,6 +786,39 @@ TOOLS: list[dict] = [
                 "blob_sha256": {"type": "string", "description": "SHA-256 hash from an attachment/file record — full hash preferred; a unique prefix (8+ hex chars, e.g. from a truncated display) also resolves"},
             },
             "required": ["blob_sha256"],
+        },
+    },
+    {
+        "name": "recall_index",
+        "description": ("Second-look memory: a compact MAP of the identity chain (your "
+                        "own past turns and reflections) — one line per record with "
+                        "index, type, age, salience, and a snippet. Automatic retrieval "
+                        "already put relevant memory in your context; call this ONLY "
+                        "when you need memory you don't see — an earlier discussion, a "
+                        "decision, a name. YOU judge relevance from the map, then pull "
+                        "full records with recall_fetch. Read-only."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What you are looking for — shortlists the map semantically. Omit to see the most recent records."},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "recall_fetch",
+        "description": ("Pull FULL identity-chain records chosen from the recall_index "
+                        "map (by understanding, not just keyword overlap). Superseded "
+                        "records arrive with their corrections. Fetched records are "
+                        "ref'd by this turn's sealed response — the chain records what "
+                        "informed the answer. Read-only."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "indices": {"type": "array", "items": {"type": "integer"},
+                            "description": "Record indices to fetch (at most 12)"},
+            },
+            "required": ["indices"],
         },
     },
     {
@@ -844,6 +1079,24 @@ def tools_prompt(include: Optional[list[str]] = None) -> str:
         "queries — emit them ALL in one response instead of one per "
         "round. Go round-by-round only when a call's arguments depend on "
         "an earlier call's result.",
+        "SECOND-LOOK MEMORY: your context already carries automatically "
+        "retrieved records from your identity chain. If the user refers "
+        "to something you don't see there — an earlier discussion, a "
+        "decision, a person, a number — do NOT guess and do NOT say you "
+        "don't remember: call recall_index (optionally with a query), "
+        "judge which records relate from the map, and recall_fetch the "
+        "ones that do. Honest uncertainty only AFTER a recall came back "
+        "empty.",
+        "DEEP THINK: for a hard, high-stakes, or genuinely ambiguous "
+        "question, do not answer from one angle. Fork perspectives of "
+        "yourself IN THIS RESPONSE: name 3-5 distinct lenses (e.g. "
+        "correctness, risk, user-intent, simplest-thing, devil's "
+        "advocate), reason each to its OWN conclusion, score each 0-255 "
+        "on coherence, relevance, novelty, consistency, depth, covenant, "
+        "then call think_collapse with all of them. Build your answer on "
+        "the sealed winner; the rejected forks stay preserved on the "
+        "chain, and your response will reference the sealed synthesis. "
+        "Routine questions skip this — one good answer needs no forks.",
         "",
         "Your final answer is the ONLY record of this turn's tool work in "
         "your long-term memory — individual tool calls are not stored. "
@@ -899,18 +1152,36 @@ def execute_write_file(kwargs: dict, ctx: AgentContext) -> str:
         # registry hiccup must not block the write proposal itself.
         try:
             ensure_workspace_task(ctx)
-        except Exception:        # noqa: BLE001
-            pass
+        except Exception as e:   # noqa: BLE001
+            log.warning("workspace task minting failed (write will proceed "
+                        "but its provenance ingest will be skipped): %s", e)
+    # Generated formats: a .docx target converts the model's MARKDOWN to a
+    # real Word document at proposal time. The binary is what gets written
+    # and hashed; the markdown source is what every approval surface shows
+    # (and what the post-approval ingest seals — searchable prose).
+    binary = None
+    generated_format = ""
+    from docx_writer import GENERATED_FORMATS
+    converter = GENERATED_FORMATS.get(target.suffix.lower())
+    if converter is not None:
+        try:
+            binary, backend = converter(kwargs["content"])
+            generated_format = f"{target.suffix.lstrip('.')} ({backend})"
+        except Exception as e:           # noqa: BLE001 — surface, don't crash
+            return (f"ERROR: could not generate {target.suffix} from the "
+                    f"content: {type(e).__name__}: {e}")
     try:
         op = ctx.pending_ops.create(
             task_name=ctx.active_task or "",
             file_path=str(target),
             proposed_content=kwargs["content"],
             change_summary=kwargs["change_summary"],
+            binary=binary,
+            generated_format=generated_format,
         )
     except ValueError as e:
         return f"REFUSED: {e}"
-    return json.dumps({
+    out = {
         "status": "confirmation_required",
         "pending_op_id": op.id,
         "task": op.task_name or "(no active task)",
@@ -918,7 +1189,13 @@ def execute_write_file(kwargs: dict, ctx: AgentContext) -> str:
         "change": op.change_summary,
         "new_file": not op.target_existed,
         "expires_in_seconds": int(op.expires_at - op.created_at),
-    }, indent=2)
+    }
+    if generated_format:
+        out["generated_format"] = generated_format
+        out["note"] = ("the markdown you provided will be converted to a "
+                       "real document on approval — describe it to the "
+                       "user as the document, not as markdown")
+    return json.dumps(out, indent=2)
 
 
 def _walk_and_index(ctx: AgentContext, task_name: str, ingest_root: Path,
@@ -943,7 +1220,10 @@ def _walk_and_index(ctx: AgentContext, task_name: str, ingest_root: Path,
     # result.sealed — each embedded once, failures skipped.
     try:
         indexed = index.index_chain(ctx.get_task_chain(task_name))
-    except Exception:                # noqa: BLE001 — embedding is best-effort
+    except Exception as e:           # noqa: BLE001 — embedding is best-effort
+        log.warning("embedding walk results failed for task %r (blocks are "
+                    "sealed but not searchable; task_reembed repairs): %s",
+                    task_name, e)
         indexed = 0
     m = result.state["metrics"] if result.state else {"items_done": 0,
                                                       "items_total": 0}
@@ -971,16 +1251,48 @@ def execute_task_open(kwargs: dict, ctx: AgentContext) -> str:
     if not source_root.is_dir():
         return (f"ERROR: source_root {kwargs['source_root']!r} is not an "
                 f"existing directory")
+    # Auto-fill name and objective when the caller omits them: the source
+    # directory is a perfectly good task name and "Audit of <root>" a fine
+    # objective, so ingesting a repo never has to cost a round-trip just to
+    # name it. Mirrors the workspace auto-mint path (derive_task_slug + the
+    # same collision loop). An EXPLICIT name keeps the old behavior — it is
+    # NOT de-duplicated, so a clash still surfaces as a TaskRegistryError.
+    name = str(kwargs.get("name") or "").strip()
+    if not name:
+        # Reuse an existing active task already bound to this source_root
+        # instead of minting a duplicate. task_open is the explicit twin of
+        # the workspace auto-mint path (ensure_workspace_task), which already
+        # reuses by source_root. Without this, calling task_open twice on the
+        # same repo ("ingest it", then "review it") re-derived the same slug,
+        # hit the collision loop below, and silently created a '<slug>-2'
+        # second chain for the identical folder. Reuse does NOT re-ingest —
+        # the repo is already in the chain, and a re-walk would duplicate
+        # blocks. Pass an EXPLICIT name to force a separate chain on the
+        # same repo.
+        for _n, existing in ctx.registry.list_all():
+            if (existing.get("source_root") == str(source_root)
+                    and existing.get("status") == "active"):
+                ctx.active_task = existing["name"]
+                done = existing.get("items_done") or 0
+                return (f"Reusing existing task '{existing['name']}' for "
+                        f"{source_root} ({done} item(s) already ingested) "
+                        f"instead of opening a duplicate. Pass an explicit "
+                        f"name to force a separate chain on the same repo.")
+        base = derive_task_slug(source_root.name)
+        name, n = base, 2
+        while ctx.registry.get(name) is not None:
+            name, n = f"{base}-{n}", n + 1
+    objective = (str(kwargs.get("objective") or "").strip()
+                 or f"Audit of {source_root}")
     try:
-        task = ctx.registry.create(kwargs["name"], kwargs["objective"],
-                                   str(source_root))
+        task = ctx.registry.create(name, objective, str(source_root))
     except TaskRegistryError as e:
         return f"ERROR: {e}"
     cont = ctx.get_task_continuum(task["name"])
-    state, _rec = cont.open_task(kwargs["objective"], items_total=None)
+    state, _rec = cont.open_task(objective, items_total=None)
     ctx.active_task = task["name"]
     opened = (f"Task '{task['name']}' opened (root {task['root']}). "
-              f"Objective: {kwargs['objective']}.")
+              f"Objective: {objective}.")
     if kwargs.get("ingest") is False:
         return f"{opened} Ingestion skipped (ingest=false)."
     # Open-and-ingest in ONE call: setup must not cost the user a second
@@ -1169,6 +1481,158 @@ def execute_pin_file(kwargs: dict, ctx: AgentContext) -> str:
     return f"Pinned this turn's writes to {ctx.pinned_path}."
 
 
+def _record_age(rec, now: float) -> str:
+    """Compact human age for recall_index lines ('3h', '2d', '5w')."""
+    s = max(0, now - rec.timestamp / 1000)
+    if s < 3600:
+        return f"{int(s // 60)}m"
+    if s < 86400:
+        return f"{int(s // 3600)}h"
+    if s < 86400 * 14:
+        return f"{int(s // 86400)}d"
+    return f"{int(s // (86400 * 7))}w"
+
+
+RECALL_INDEX_LIMIT = 50          # map lines per call (pre-filter size)
+RECALL_FETCH_MAX = 12            # records per fetch
+RECALL_FETCH_CHAR_BUDGET = 24_000   # stay well under the tool-result cap
+
+
+def _recall_snippet(rec) -> str:
+    """One-line summary of a record for the map: who said what. The model
+    judges relevance from THIS, so it leads with the human-meaningful
+    parts (context = the user's words, text = the agent's)."""
+    c = rec.content if isinstance(rec.content, dict) else {}
+    bits = []
+    if c.get("context"):
+        bits.append("user: " + " ".join(str(c["context"]).split())[:90])
+    if c.get("text"):
+        bits.append("agent: " + " ".join(str(c["text"]).split())[:90]
+                    if rec.type == "response"
+                    else " ".join(str(c["text"]).split())[:120])
+    if not bits:
+        bits.append(" ".join(json.dumps(c, ensure_ascii=False).split())[:110])
+    if c.get("attachments"):
+        names = ",".join(str(a.get("filename", "?"))
+                         for a in c["attachments"] if isinstance(a, dict))
+        bits.append(f"[attached: {names}]")
+    return " | ".join(bits)[:220]
+
+
+def execute_recall_index(kwargs: dict, ctx: AgentContext) -> str:
+    """The second-look map of identity memory. Baseline automatic retrieval
+    is untouched — this exists for the model to PULL what that pass missed,
+    mid-turn, with its own understanding as the relevance judge (the
+    skill's recall.index, riding the agent's guarantees: quarantine is
+    invisible, the pre-filter is the existing hybrid scorer)."""
+    from metadata import read_meta, EXPOSURE_QUARANTINE
+    chain = ctx.identity_chain
+    if chain is None:
+        return "ERROR: no identity chain available."
+    import time as _time
+    now = _time.time()
+    query = str(kwargs.get("query") or "").strip()
+    recs = []
+    seen = set()
+    if query and ctx.identity_recall is not None:
+        try:
+            hits = ctx.identity_recall.index.search(query,
+                                                    k=RECALL_INDEX_LIMIT)
+        except Exception as e:       # noqa: BLE001 — fall back to recent
+            log.warning("recall_index semantic shortlist failed: %s", e)
+            hits = []
+        for idx, _score in hits:
+            rec = chain.get(idx)
+            if rec is not None and idx not in seen:
+                recs.append(rec)
+                seen.add(idx)
+    # Always include the most recent records: temporal context the
+    # semantic shortlist can miss, and the whole map when there is no
+    # query (or no retriever).
+    head = chain.length() - 1
+    for idx in range(head, max(-1, head - (RECALL_INDEX_LIMIT // 2)), -1):
+        if idx in seen:
+            continue
+        rec = chain.get(idx)
+        if rec is not None:
+            recs.append(rec)
+            seen.add(idx)
+    superseded = chain.superseded_indices()
+    lines = []
+    for rec in recs[:RECALL_INDEX_LIMIT]:
+        meta = read_meta(rec)
+        if meta.exposure == EXPOSURE_QUARANTINE:
+            continue                 # quarantine is invisible, period
+        tag = rec.type + (", SUPERSEDED" if rec.index in superseded else "")
+        lines.append(f"[{rec.index:>4}] {tag:<22} {_record_age(rec, now):>3} "
+                     f"sal={meta.salience:.2f}  {_recall_snippet(rec)}")
+    if not lines:
+        return "No matching records." if query else "The chain is empty."
+    header = (f"MAP OF MEMORY ({len(lines)} records"
+              + (f", shortlisted for {query!r}" if query else ", most recent")
+              + ") — judge relevance by understanding, then "
+                "recall_fetch the indices you need:")
+    return header + "\n" + "\n".join(lines)
+
+
+def execute_recall_fetch(kwargs: dict, ctx: AgentContext) -> str:
+    """Pull full identity records the model chose from the map. Same
+    protections as automatic retrieval: quarantined records are refused,
+    superseded records arrive WITH their corrections, and every fetched
+    record is ref'd by this turn's sealed response (what informed the
+    answer is on the chain)."""
+    from metadata import read_meta, EXPOSURE_QUARANTINE
+    chain = ctx.identity_chain
+    if chain is None:
+        return "ERROR: no identity chain available."
+    indices = kwargs.get("indices") or []
+    if len(indices) > RECALL_FETCH_MAX:
+        return (f"ERROR: at most {RECALL_FETCH_MAX} records per fetch "
+                f"(you asked for {len(indices)}) — choose the most relevant")
+    superseded = chain.superseded_indices()
+    out = []
+    used = 0
+    for idx in indices:
+        rec = chain.get(int(idx))
+        if rec is None:
+            out.append(f"[{idx}] no such record")
+            continue
+        if read_meta(rec).exposure == EXPOSURE_QUARANTINE:
+            out.append(f"[{idx}] quarantined — not retrievable (by design)")
+            continue
+        display = {k: v for k, v in rec.content.items() if k != "_meta"} \
+            if isinstance(rec.content, dict) else rec.content
+        body = json.dumps(display, ensure_ascii=False, indent=1)
+        if used + len(body) > RECALL_FETCH_CHAR_BUDGET:
+            out.append(f"[{idx}] omitted — fetch budget reached; "
+                       f"call recall_fetch again with fewer indices")
+            continue
+        used += len(body)
+        header = f"[{idx}] {rec.type}"
+        if rec.index in superseded:
+            header += "  (SUPERSEDED — correction follows)"
+        out.append(header + "\n" + body)
+        ctx.recalled_refs.append(rec.record_hash)
+        if rec.index in superseded:
+            # The correction travels with the original (the same covenant
+            # the automatic retriever honors via revision pull-in).
+            try:
+                rev_idxs = chain.find_indices_by_content_field(
+                    "$.revises_index", rec.index)
+            except Exception:        # noqa: BLE001 — JSON1-less sqlite
+                rev_idxs = []
+            for ridx in rev_idxs[-1:]:
+                rev = chain.get(ridx)
+                if rev is not None and isinstance(rev.content, dict):
+                    out.append(f"[{ridx}] revision (corrects #{rec.index})\n"
+                               + json.dumps({k: v for k, v in
+                                             rev.content.items()
+                                             if k != "_meta"},
+                                            ensure_ascii=False, indent=1))
+                    ctx.recalled_refs.append(rev.record_hash)
+    return "\n\n".join(out) if out else "Nothing fetched."
+
+
 def execute_build_attachment(kwargs: dict, ctx: AgentContext) -> str:
     if ctx.identity_chain is None:
         return "ERROR: no identity chain available."
@@ -1183,19 +1647,30 @@ def execute_build_attachment(kwargs: dict, ctx: AgentContext) -> str:
         # resolve a unique prefix instead of dead-ending.
         rec = ctx.identity_chain.find_file_by_sha_prefix(sha)
     if rec is not None and isinstance(rec.content, dict):
-        meta = {k: rec.content.get(k) for k in
+        c = rec.content
+        if rec.type == "response":
+            # Single-record turn shape: the pointer is an entry in the
+            # response record's content.attachments — find the one whose
+            # sha matches (prefix-tolerant, same contract as the lookup).
+            c = next((e for e in (c.get("attachments") or [])
+                      if isinstance(e, dict)
+                      and str(e.get("blob_sha256", "")).startswith(sha)),
+                     None)
+            if c is None:
+                return f"No attachment record found for blob {sha[:12]}…"
+        meta = {k: c.get(k) for k in
                 ("filename", "kind", "mime_type", "approx_bytes",
                  "artifact_path")
-                if rec.content.get(k) is not None}
-        text = str(rec.content.get("extracted_text") or "")[:8000]
-        if not text and rec.content.get("artifact_rings"):
-            # Pointer ring (v1.4.2 artifacts routing): the content lives
-            # in the artifacts chain — fetch its blocks on demand.
+                if c.get(k) is not None}
+        text = str(c.get("extracted_text") or "")[:8000]
+        if not text and c.get("artifact_rings"):
+            # Pointer (v1.4.2 artifacts routing): the content lives in
+            # the artifacts chain — fetch its blocks on demand.
             try:
                 art_chain = ctx.get_task_chain(
-                    rec.content.get("artifact_task") or ARTIFACTS_TASK_NAME)
+                    c.get("artifact_task") or ARTIFACTS_TASK_NAME)
                 parts: list[str] = []
-                for idx in rec.content["artifact_rings"]:
+                for idx in c["artifact_rings"]:
                     block = art_chain.get(idx)
                     data = (block.content.get("data")
                             if block is not None
@@ -1353,9 +1828,12 @@ def execute_ingest_blob(kwargs: dict, ctx: AgentContext) -> str:
         for rec, _tok in sealed:
             try:
                 index.index_record(rec)
-            except Exception:    # noqa: BLE001 — embedding is best-effort
-                pass             # (the block is sealed; erroring here would
-                                 # invite a duplicate re-ingest)
+            except Exception as e:   # noqa: BLE001 — embedding is best-effort
+                # (the block is sealed; erroring here would invite a
+                # duplicate re-ingest)
+                log.warning("embedding failed for ring %s in task %r (sealed "
+                            "but not searchable; task_reembed repairs): %s",
+                            rec.index, task_name, e)
         first_ring = sealed[0][0].index if sealed else "?"
         ctx.active_task = task_name
         return (f"Ingested '{safe_name}' into task '{task_name}' "
@@ -1409,18 +1887,23 @@ def execute_ingest_blob(kwargs: dict, ctx: AgentContext) -> str:
     for rec, _tok in sealed:
         try:
             index.index_record(rec)
-        except Exception:        # noqa: BLE001 — embedding is best-effort
-            pass
+        except Exception as e:   # noqa: BLE001 — embedding is best-effort
+            log.warning("embedding failed for ring %s (sealed but not "
+                        "searchable; task_reembed repairs): %s",
+                        rec.index, e)
     artifact_rings = [rec.index for rec, _tok in sealed]
     # NOTE: ctx.active_task is deliberately NOT touched — an upload must
     # never hijack the session's task cursor.
 
-    # 4. ONE tiny pointer ring on the identity chain — filename, mime,
-    #    sha, and where the content lives. NO extracted text: the
-    #    pointer is a couple of embedding chunks of mostly filename, so
-    #    it can surface in retrieval without crowding anything; the
-    #    agent pulls content from the artifacts chain (build_attachment)
-    #    or disk (read_file on artifact_path) on demand.
+    # 4. ONE tiny pointer — filename, mime, sha, and where the content
+    #    lives. NO extracted text: the agent pulls content from the
+    #    artifacts chain (build_attachment) or disk (read_file on
+    #    artifact_path) on demand. Since the single-record turn shape the
+    #    pointer is STAGED, not sealed standalone: it embeds in the next
+    #    turn's response record (content.attachments), with the
+    #    observation it accompanied and the response it received — the
+    #    skill's blockspace_refs shape. Legacy standalone `attachment`
+    #    records still read fine.
     pointer = {
         "filename": safe_name,
         "mime_type": mime_type,
@@ -1432,16 +1915,16 @@ def execute_ingest_blob(kwargs: dict, ctx: AgentContext) -> str:
         "artifact_rings": artifact_rings,
         "artifact_path": str(dest),
     }
-    rec = ctx.identity_chain.append("attachment", pointer)
+    staged = ctx.stage_attachment(pointer)
     ring_span = (f"rings {artifact_rings[0]}–{artifact_rings[-1]}"
                  if len(artifact_rings) > 1
                  else f"ring {artifact_rings[0]}" if artifact_rings
                  else "no rings")
     return (f"Attached '{safe_name}' ({mime_type}, {len(raw)} bytes): "
             f"content in the '{ARTIFACTS_TASK_NAME}' chain ({ring_span}), "
-            f"file at {dest}, pointer record {rec.index}, "
-            f"blob {content_hash[:12]}…. "
-            f"{description or 'No description provided.'}")
+            f"file at {dest}, blob {content_hash[:12]}…. Pointer staged "
+            f"({staged} pending) — it seals into the next turn's response "
+            f"record. {description or 'No description provided.'}")
 
 
 def execute_defense_status(kwargs: dict, ctx: AgentContext) -> str:
@@ -1501,14 +1984,19 @@ def execute_think_collapse(kwargs: dict, ctx: AgentContext) -> str:
     from chronosynaptic import ChronosynapticTree
     notes = {"query": kwargs["query"], "perspectives": kwargs["perspectives"]}
     tree = ChronosynapticTree(ctx.identity_chain)
-    result, _rec = tree.collapse_explicit_notes(
+    result, rec = tree.collapse_explicit_notes(
         notes, query=kwargs["query"], winner=kwargs.get("winner"), do_seal=True)
+    if rec is not None:
+        # The turn's response must reference the synthesis it rests on —
+        # same drain as recall_fetch (commit picks these up as refs).
+        ctx.recalled_refs.append(rec.record_hash)
     chosen = result.get("chosen") or {}
     rejected = result.get("rejected") or []
     return json.dumps({
         "chosen": chosen.get("name") if isinstance(chosen, dict) else chosen,
         "rejected": [p.get("name", str(p)) for p in rejected],
         "synthesis": str(result.get("synthesis", ""))[:500],
+        "sealed_record": rec.index if rec is not None else None,
     })
 
 
@@ -1528,6 +2016,8 @@ EXECUTORS: dict[str, Callable[[dict, AgentContext], str]] = {
     "resolve_task": execute_resolve_task,
     "pin_file": execute_pin_file,
     "build_attachment": execute_build_attachment,
+    "recall_index": execute_recall_index,
+    "recall_fetch": execute_recall_fetch,
     "think_collapse": execute_think_collapse,
     "defense_status": execute_defense_status,
     "ingest_blob": execute_ingest_blob,
@@ -1716,8 +2206,9 @@ def defer_tool_call(call: dict, ctx: AgentContext) -> str:
     if problem:
         return (f"ERROR: {problem} (no pending operation was created — "
                 f"correct the call or ask the user)")
+    reason = getattr(ctx, "last_gate_reason", None)
     try:
-        op = ctx.pending_ops.create_tool_call(name, arguments)
+        op = ctx.pending_ops.create_tool_call(name, arguments, reason=reason)
     except ValueError as e:
         return f"REFUSED: {e}"
     return json.dumps({
@@ -1726,12 +2217,14 @@ def defer_tool_call(call: dict, ctx: AgentContext) -> str:
         "pending_op_id": op.id,
         "tool": name,
         "arguments": arguments,
+        "reason": reason or "",
         "expires_in_seconds": int(op.expires_at - op.created_at),
-        "message": (f"{name} requires explicit user confirmation. A "
-                    f"pending operation was created — ask the user to "
-                    f"approve or reject it (the approval card's buttons, "
-                    f"or /approve {op.id} typed in either interface). "
-                    f"Do NOT retry the call; wait for their decision."),
+        "message": ((f"{name} requires explicit user confirmation"
+                     + (f" — {reason}" if reason else "") + ". A "
+                     f"pending operation was created — ask the user to "
+                     f"approve or reject it (the approval card's buttons, "
+                     f"or /approve {op.id} typed in either interface). "
+                     f"Do NOT retry the call; wait for their decision.")),
     }, indent=2)
 
 

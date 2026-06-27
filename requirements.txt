@@ -26,6 +26,9 @@ anthropic>=0.40
 
 # Optional - content extraction for uploads (extractors.py). Each library
 # unlocks one format; missing ones degrade to a descriptive placeholder.
+# python-docx ALSO upgrades .docx OUTPUT (write_file on a .docx path uses
+# proper Heading/List styles when it is installed; a stdlib writer
+# otherwise).
 # pypdf>=4.0
 # python-docx>=1.0
 # openpyxl>=3.1

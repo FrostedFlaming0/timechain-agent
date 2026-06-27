@@ -135,24 +135,29 @@ def _retry_with_backoff(
 # ---------------------------------------------------------------------------
 
 def make_claude_client(
-    model: str = "claude-fable-5",
+    model: str = "claude-opus-4-8",
     max_tokens: int = 1024,
     timeout_s: float = 600.0,
 ) -> LLMCall:
     """
     Anthropic Claude client.
 
-    Default model is claude-fable-5 (Anthropic's most capable model as of
-    June 2026). For cost-sensitive workloads use claude-opus-4-8,
-    claude-sonnet-4-6, or claude-haiku-4-5.
+    Default model is claude-opus-4-8 (the most capable Opus-tier model).
+    For other tiers use claude-sonnet-4-6 or claude-haiku-4-5; for
+    Anthropic's most capable model use claude-fable-5 (different API
+    surface — see the thinking note below).
     Set ANTHROPIC_API_KEY in the environment.
 
-    Fable 5 API notes (why this client looks the way it does):
+    Opus 4.8 API notes (why this client looks the way it does):
     - No `temperature`/`top_p`/`top_k` — sampling parameters are removed on
-      Fable 5 and sending any of them returns a 400.
-    - No `thinking` parameter — thinking is always on (adaptive); an
-      explicit config is rejected, so the parameter is simply omitted.
-    - Turns can run for minutes (thinking is always on), hence the
+      Opus 4.7/4.8 (and Fable 5); sending any of them returns a 400.
+    - `thinking={"type": "adaptive"}` is set EXPLICITLY. Unlike Fable 5
+      (thinking always on, param omitted), on Opus 4.8 omitting `thinking`
+      turns it OFF — and with thinking off Opus 4.8 tends to write its
+      reasoning into the visible answer, which we would then seal into the
+      chain as the response text. Adaptive keeps reasoning in (empty,
+      display-omitted) thinking blocks, out of the answer.
+    - Turns can run for minutes (adaptive thinking), hence the
       10-minute default timeout instead of the old 60s.
     - Safety classifiers can decline a request: HTTP 200 with
       stop_reason == "refusal" and empty (or partial) content. Surfaced
@@ -213,6 +218,9 @@ def make_claude_client(
             kwargs = dict(
                 model=model,
                 max_tokens=max_tokens,
+                # Explicit adaptive thinking — on Opus 4.8 omitting this
+                # turns thinking OFF (see the Opus 4.8 API notes above).
+                thinking={"type": "adaptive"},
                 messages=[{"role": "user", "content": content_blocks}],
             )
             if system:
@@ -264,6 +272,11 @@ def make_claude_client(
         kwargs = dict(
             model=model,
             max_tokens=max_tokens,
+            # Explicit adaptive thinking — on Opus 4.8 omitting this turns
+            # thinking OFF (see the Opus 4.8 API notes above). The stream
+            # yields only text deltas, so thinking blocks never reach the
+            # answer text.
+            thinking={"type": "adaptive"},
             messages=[{"role": "user", "content": content_blocks}],
         )
         if system:

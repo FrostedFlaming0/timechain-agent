@@ -462,6 +462,7 @@ class EmbeddingIndex:
         self._conn.executescript(EMBED_SCHEMA)
         self._conn.commit()
         self._nn: Optional[NearestNeighbors] = None
+        self._matrix: Optional[np.ndarray] = None
         self._idx_to_record: list[int] = []
         # Per-call cache: `{record_idx: [(chunk_idx, similarity), ...]}` for
         # records returned by the most recent search(), sorted by similarity
@@ -614,7 +615,11 @@ class EmbeddingIndex:
         chunks = self._record_chunks(rec)
         chunk_count = len(chunks)
         cur = self._conn.cursor()
+        cur.execute("SELECT 1 FROM embeddings WHERE record_idx = ? LIMIT 1",
+                    (rec.index,))
+        reindex = cur.fetchone() is not None
         cur.execute("DELETE FROM embeddings WHERE record_idx = ?", (rec.index,))
+        vecs: list[np.ndarray] = []
         for ci, chunk in enumerate(chunks):
             vec = self.embedder(chunk).astype(np.float32)
             if vec.shape != (self.dim,):
@@ -627,8 +632,15 @@ class EmbeddingIndex:
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (rec.index, ci, chunk_count, rec.record_hash, vec.tobytes(), chunk),
             )
+            vecs.append(vec)
         self._conn.commit()
-        self._nn = None  # invalidate
+        if reindex:
+            # The record's OLD chunk rows are baked into the in-memory
+            # matrix; removing rows in place isn't worth the bookkeeping
+            # for this rare path. Full rebuild on next search.
+            self._nn = None
+        else:
+            self._append_ann(rec.index, vecs)
 
     def index_chain(self, chain: Chain) -> int:
         """
@@ -777,6 +789,41 @@ class EmbeddingIndex:
         return {"records": len(per_record), "chunks": total,
                 "failed_records": len(failed)}
 
+    def _append_ann(self, record_idx: int, vecs: list[np.ndarray]) -> None:
+        """
+        Incrementally add one NEW record's chunk vectors to the in-memory
+        ANN instead of invalidating it.
+
+        Before this existed, index_record set `self._nn = None` and the
+        next search() paid a full O(chain) rebuild — SELECT every embedding
+        row, decode, stack, normalize — to add ONE record. Since every turn
+        writes records, every turn's retrieval paid that rebuild, and it
+        was the only per-turn cost growing with chain size. Appending the
+        new rows to the existing matrix yields the same matrix content a
+        rebuild would produce (new records have the highest record_idx, so
+        append order matches the rebuild's ORDER BY), and the brute-force
+        cosine fit just re-stores the matrix — search results are
+        identical, the O(chain) decode loop is gone.
+
+        Caller must guarantee `record_idx` has no rows already in the
+        matrix (index_record checks; a re-indexed record takes the full
+        invalidate path instead). No-op when the matrix isn't built —
+        the next search lazily builds it from SQLite, which includes
+        these rows.
+        """
+        if self._nn is None or not vecs:
+            return
+        new = np.stack(vecs)
+        norms = np.linalg.norm(new, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        new = new / norms
+        self._matrix = np.vstack([self._matrix, new])
+        self._idx_to_record.extend(
+            (record_idx, ci) for ci in range(len(vecs)))
+        self._nn = NearestNeighbors(
+            n_neighbors=min(50, len(self._idx_to_record)), metric="cosine")
+        self._nn.fit(self._matrix)
+
     def _rebuild_ann(self) -> None:
         cur = self._conn.cursor()
         cur.execute(
@@ -786,6 +833,7 @@ class EmbeddingIndex:
         rows = cur.fetchall()
         if not rows:
             self._nn = None
+            self._matrix = None
             self._idx_to_record = []
             return
         # Each ANN sample is a chunk. Map matrix row -> (record_idx,
@@ -1598,8 +1646,16 @@ class Retriever:
         #   - Budget-safe: both halves are pinned, so `_truncate_to_budget`
         #     keeps the pair together (or drops it together) rather than
         #     splitting it under prompt-budget pressure.
+        #
+        # LEGACY-ONLY since the single-record turn shape: a response that
+        # carries the user's input as content.context IS the whole Q&A unit
+        # — there is no partner to pull in. Stitching remains for old
+        # chains' observation/response pairs, which read forever.
         stitched_in: list[Record] = []
         for rec in list(merged):
+            if (rec.type == "response" and isinstance(rec.content, dict)
+                    and "context" in rec.content):
+                continue                     # single-record turn: complete
             if rec.type == "observation":
                 partner_idx, partner_type = rec.index + 1, "response"
             elif rec.type == "response":

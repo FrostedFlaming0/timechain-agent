@@ -69,6 +69,8 @@ except ImportError:
 from chain import Chain, load_or_create_key
 from retrieval import EmbeddingIndex, Retriever, open_or_rebuild_index
 from agent import Agent, ProtectedZoneError
+from pending_ops import (PENDING_TTL_SECONDS,
+                         resolve_inline as pending_ops_resolve_inline)
 
 # (The tool-loop round budget is tools.DEFAULT_MAX_TOOL_ROUNDS — read
 # fresh at each turn, the same knob the REPL loop reads, so an override
@@ -82,6 +84,7 @@ from run import (
     RECENT_N,
     OLLAMA_EMBED_MODEL,
     AUTO_REFLECT_EVERY,
+    MAX_REFLECT_RECORDS,
     AUTO_CAMBIUM_EVERY,
     MAX_CAMBIUM_RECORDS,
     PER_TURN_MODALITY_CAP,
@@ -136,6 +139,14 @@ class AppState:
         self.tool_ctx = None
         # Serialize all chain-touching work; the chain assumes single-writer.
         self.lock = asyncio.Lock()
+        # Mid-turn approval gate (v1.4.x): pending_op_id -> asyncio.Future.
+        # While a streaming turn is PAUSED on a pending op, its future sits
+        # here; the approve/reject endpoints deliver the decision by
+        # resolving the future WITHOUT touching state.lock (the turn holds
+        # that lock for its whole duration — going through the lock would
+        # deadlock). Execution then happens inside the turn, which already
+        # owns the lock.
+        self.approval_waiters: dict = {}
         # Session token — only one tab is "active" at a time.
         self.active_token: Optional[str] = None
         # Counter for auto-reflection (mirrors run.py's behavior).
@@ -212,6 +223,7 @@ class AppState:
                 data_dir=DATA_DIR,
                 registry=TaskRegistry(DATA_DIR),
                 identity_chain=self.chain,
+                identity_recall=retriever,   # powers recall_index pre-filter
                 workspace_root=Path.cwd(),
                 embedder=embedder,
                 embed_dim=embed_dim,
@@ -244,6 +256,17 @@ class AppState:
         if sp_record:
             self.index.index_record(sp_record)
             print(f"[boot] logged system prompt change at index {sp_record.index}")
+
+        # Seed both auto-cadence counters from the chain so they carry
+        # across sessions (mirrors run.py). At every-100 / every-30 turns a
+        # per-session counter would rarely fire — few web sessions run that
+        # long — so the chain, not the process, is the source of truth.
+        self.turns_since_reflect = self.agent.turns_since_reflection()
+        self.turns_since_cambium = self.agent.turns_since_cambium()
+        print(f"[boot] turns since last reflection: {self.turns_since_reflect} "
+              f"(auto-reflect every {AUTO_REFLECT_EVERY}); "
+              f"since last cambium scan: {self.turns_since_cambium} "
+              f"(auto-cambium every {AUTO_CAMBIUM_EVERY})")
 
         print(f"[boot] chain length: {self.chain.length()}")
         print(f"[boot] ready at http://{HOST}:{PORT}")
@@ -732,6 +755,21 @@ async def run_command(request: Request, body: dict):
     if not cmd:
         raise HTTPException(400, "empty command")
 
+    # /approve & /reject BEFORE the lock: while a streaming turn is parked
+    # on its approval gate it HOLDS state.lock, so the legacy path below
+    # would deadlock the very command meant to unblock it. Deliver the
+    # decision to the waiter lock-free (same as the card buttons); fall
+    # through to the legacy locked path when no turn is waiting.
+    _parts = cmd.split()
+    if _parts[0] in ("/approve", "/reject") and len(_parts) == 2:
+        _require_tools()
+        delivered = _deliver_to_waiter(
+            _parts[1], "approve_write" if _parts[0] == "/approve"
+            else "reject_write")
+        if delivered is not None:
+            return {"kind": "pending_op_action", "ok": True,
+                    "message": delivered["result"]}
+
     async with state.lock:
         if cmd == "/verify":
             ok, msg = state.chain.verify(expected_pubkey=state.chain.pubkey_hex)
@@ -766,7 +804,7 @@ async def run_command(request: Request, body: dict):
             return {"kind": "sysprompt", "entries": entries}
 
         if cmd == "/reflect":
-            rec = state.agent.reflect()
+            rec = state.agent.reflect(max_records=MAX_REFLECT_RECORDS)
             if rec is None:
                 return {"kind": "reflect", "result": "not_enough_history"}
             state.index.index_record(rec)
@@ -1113,11 +1151,13 @@ async def _turn_events(user_input: str):
             _screen = agent.immune.screen(user_input)
             if _screen.get("blocked"):
                 refused = agent._refused_turn(user_input, _screen)
-                state.index.index_record(refused.observation_record)
+                # Single-record turn shape: the refused turn is ONE
+                # quarantined record (input as content.context + refusal).
                 state.index.index_record(refused.response_record)
                 yield {
                     "event": "observation",
-                    "data": json.dumps(_record_to_dict(refused.observation_record)),
+                    "data": json.dumps({"type": "observation",
+                                        "content": {"text": user_input}}),
                 }
                 yield {
                     "event": "done",
@@ -1130,25 +1170,27 @@ async def _turn_events(user_input: str):
                 }
                 return
 
-        # 1. Pre-LLM half: commit observation, retrieve, build prompt.
-        # `prepare_turn` is the SAME method `Agent.turn` uses, so the
-        # streaming path can never silently diverge in metadata or
-        # quarantine handling. It does NOT index the observation —
-        # that waits until after retrieval, so the just-asked question
-        # cannot be retrieved as context for its own prompt.
+        # 1. Pre-LLM half: retrieve, build prompt. `prepare_turn` is the
+        # SAME method `Agent.turn` uses, so the streaming path can never
+        # silently diverge in metadata or quarantine handling.
+        # Single-record turn shape: NO observation record is committed —
+        # the user's input seals into the response record as
+        # content.context at commit. The browser still gets its YOU
+        # bubble immediately via a synthetic observation event.
         prep = agent.prepare_turn(
             user_input, retrieve_k=SEMANTIC_K, n_recent=RECENT_N
         )
-        obs = prep.observation_record
 
-        # Now safe to index — retrieval has already run against the
-        # pre-existing chain. The browser can still see the obs
-        # index immediately via the SSE event below.
-        state.index.index_record(obs)
+        # Uploads staged since the last turn ride THIS turn: prompt note
+        # + native payloads now, pointer entries sealed into the response
+        # record at commit (content.attachments).
+        staged_attachments = agent.consume_staged_attachments(
+            prep, state.tool_ctx)
 
         yield {
             "event": "observation",
-            "data": json.dumps(_record_to_dict(obs)),
+            "data": json.dumps({"type": "observation",
+                                "content": {"text": user_input}}),
         }
 
         # 2. Call the model — via inner helpers, because the tool loop
@@ -1288,6 +1330,7 @@ async def _turn_events(user_input: str):
         llm_kwargs = dict(prep.llm_kwargs)
         if tools_on:
             state.tool_ctx.pinned_path = None
+            state.tool_ctx.recalled_refs = []   # refs never leak across turns
             base_system = llm_kwargs.get("system") or ""
             llm_kwargs["system"] = (
                 base_system + "\n\n" + tools_mod.tools_prompt()
@@ -1316,6 +1359,7 @@ async def _turn_events(user_input: str):
         # turn_with_tools): the committed response is ALL of it plus the
         # final answer, matching what streamed to the browser.
         prose_segments: list = []
+        resolutions: list = []
         rounds = 0
         reflected = False
         budget_exhausted = False
@@ -1386,17 +1430,43 @@ async def _turn_events(user_input: str):
                                    else result[:4000] + "…"),
                     }),
                 }
-                # Surface a freshly created pending op (a write_file
-                # proposal OR a deferred confirmation-gated tool call) so
-                # the UI can pop its approve/reject dialog immediately.
+                # Mid-turn approval gate (v1.4.x). A freshly created pending
+                # op (a write_file proposal OR a deferred confirmation-gated
+                # tool call) PAUSES the turn: the UI pops its approve/reject
+                # card (pending_op event, inline=true), the loop parks on a
+                # future the endpoints resolve lock-free, and the REAL
+                # outcome — written/rejected/expired — is what the model
+                # sees as the tool result. The turn cannot end with the op
+                # unresolved: no decision within the op's TTL auto-expires
+                # it (recommendation: never leave requests lingering).
                 try:
                     parsed = json.loads(result)
-                    if (isinstance(parsed, dict) and parsed.get(
-                            "status") == "confirmation_required"):
-                        yield {"event": "pending_op",
-                               "data": json.dumps(parsed)}
                 except (ValueError, TypeError):
-                    pass
+                    parsed = None
+                if (isinstance(parsed, dict)
+                        and parsed.get("status") == "confirmation_required"
+                        and parsed.get("pending_op_id")):
+                    parsed["inline"] = True   # tells the UI the turn waits
+                    yield {"event": "pending_op",
+                           "data": json.dumps(parsed)}
+                    op_id = parsed["pending_op_id"]
+                    fut = asyncio.get_running_loop().create_future()
+                    state.approval_waiters[op_id] = fut
+                    try:
+                        decision = await asyncio.wait_for(
+                            fut, timeout=parsed.get("expires_in_seconds")
+                            or PENDING_TTL_SECONDS)
+                    except asyncio.TimeoutError:
+                        decision = "expired"
+                    finally:
+                        state.approval_waiters.pop(op_id, None)
+                    entry, result = await asyncio.to_thread(
+                        pending_ops_resolve_inline,
+                        op_id, decision, state.tool_ctx)
+                    if entry is not None:
+                        resolutions.append(entry)
+                        yield {"event": "op_resolved",
+                               "data": json.dumps(entry)}
                 prompt += tools_mod.format_tool_result(name, result)
             if rounds >= max_tool_rounds:
                 # The next LLM call is the last one this turn gets — tell
@@ -1467,8 +1537,18 @@ async def _turn_events(user_input: str):
         # _format_prompt's continue-after-budget handling).
         if budget_exhausted:
             response_meta_kwargs["tool_budget_exhausted"] = True
+        # Late drain: a model-initiated ingest_blob DURING this turn staged
+        # its pointer after the turn-start drain — fold those in too, so a
+        # pointer never waits a turn it didn't have to.
+        if state.tool_ctx is not None:
+            staged_attachments += state.tool_ctx.drain_staged_attachments()
+        recalled = (state.tool_ctx.drain_recalled_refs()
+                    if state.tool_ctx is not None else [])
         response = agent.commit_response(
-            prep, response_text, response_meta_kwargs
+            prep, response_text, response_meta_kwargs,
+            resolutions=resolutions,
+            attachments=staged_attachments,
+            extra_refs=recalled,
         )
         state.index.index_record(response)
         state.turns_since_reflect += 1
@@ -1496,7 +1576,7 @@ async def _turn_events(user_input: str):
         # Auto-reflection. The reflect() call makes an LLM call internally,
         # so it blocks the loop briefly; acceptable, and mirrors the REPL.
         if AUTO_REFLECT_EVERY > 0 and state.turns_since_reflect >= AUTO_REFLECT_EVERY:
-            reflection_rec = agent.reflect()
+            reflection_rec = agent.reflect(max_records=MAX_REFLECT_RECORDS)
             if reflection_rec is not None:
                 state.index.index_record(reflection_rec)
                 yield {
@@ -1621,6 +1701,9 @@ def _pending_op_to_dict(op) -> dict:
         "new_file": not op.target_existed,
         "content_chars": len(op.proposed_content),
         "proposed_content": op.proposed_content,
+        # Generated formats (docx): proposed_content above is the readable
+        # SOURCE; this names the binary that will actually be written.
+        "generated_format": getattr(op, "generated_format", ""),
         "expired": op.expired(),
         "expires_at": op.expires_at,
     }
@@ -1674,19 +1757,47 @@ async def workspace_set(request: Request):
 async def pending_ops_list(request: Request):
     _require_session(request)
     _require_tools()
-    async with state.lock:
-        ops = []
-        for op_id in state.tool_ctx.pending_ops.list_ids():
-            op = state.tool_ctx.pending_ops.load(op_id)
-            if op is not None:
-                ops.append(_pending_op_to_dict(op))
+    # Deliberately NOT under state.lock: a turn paused on its mid-turn
+    # approval gate HOLDS the lock, and this endpoint is how the UI's
+    # banner learns there is something to approve — locking here would
+    # deadlock the very refresh that renders the approve button. Reading
+    # is safe lock-free: the store's writes are atomic (tmp + os.replace),
+    # so a concurrent load sees either the old or the new file, never a
+    # torn one.
+    ops = []
+    for op_id in state.tool_ctx.pending_ops.list_ids():
+        op = state.tool_ctx.pending_ops.load(op_id)
+        if op is not None:
+            ops.append(_pending_op_to_dict(op))
     return {"pending": ops}
+
+
+def _deliver_to_waiter(op_id: str, action: str) -> Optional[dict]:
+    """Mid-turn decision delivery. If a streaming turn is parked on this
+    op, resolve its future and return the response — WITHOUT acquiring
+    state.lock (the turn holds it; the legacy path below would deadlock).
+    The turn itself executes the approval under the lock it already owns.
+    Returns None when no turn is waiting (legacy post-turn op)."""
+    fut = getattr(state, "approval_waiters", {}).get(op_id)
+    if fut is None or fut.done():
+        return None
+    decision = "approved" if action == "approve_write" else "rejected"
+    fut.set_result(decision)
+    # delivered=True tells the UI to stay quiet: the turn's op_resolved
+    # event reports the real outcome, and two messages for one decision
+    # read as two events.
+    return {"ok": True, "delivered": True,
+            "result": f"decision ({decision}) delivered to the running "
+                      f"turn — it resolves the operation and continues"}
 
 
 async def _pending_op_action(request: Request, op_id: str,
                              action: str) -> dict:
     _require_session(request)
     _require_tools()
+    delivered = _deliver_to_waiter(op_id, action)
+    if delivered is not None:
+        return delivered
     import tools as tools_mod
     # The lock is held for the whole approve (atomic write + idempotent
     # ingest + audit) — same single-writer guarantee the REPL gets for
@@ -1771,14 +1882,16 @@ async def upload(request: Request, file: UploadFile = File(...),
         )
         if tools_mod.is_error_result(result):
             raise HTTPException(400, result)
-        # Identity-route ingests seal an attachment record the UI can render;
-        # task-route ingests land in the task chain (no identity record).
-        rec_dict = None
-        head = state.chain.head()
-        if head is not None and head.type == "attachment":
-            state.index.index_record(head)
-            rec_dict = _record_to_dict(head)
-    return {"record": rec_dict, "result": result}
+        # Identity-route ingests STAGE a pointer (single-record turn
+        # shape): it seals into the next turn's response record, with the
+        # message it accompanied. The UI renders its chip from `staged`.
+        # Task-route ingests land in the task chain (no staging).
+        staged_entry = None
+        staged = getattr(state.tool_ctx, "staged_attachments", None) or []
+        if staged and not task.strip():
+            staged_entry = staged[-1]
+    return {"record": None, "staged": staged_entry,
+            "staged_count": len(staged), "result": result}
 
 
 @app.get("/blobs/{sha}")
@@ -1810,19 +1923,33 @@ async def serve_blob(sha: str, session: Optional[str] = None,
     if path is None:
         raise HTTPException(404, "no such blob")
     # Recover the MIME type from the record that sealed this blob: indexed
-    # O(1) via blob_index (which covers file AND attachment records), with a
-    # linear-scan fallback for attachments sealed before the index covered
-    # the attachment type.
+    # O(1) via blob_index (which covers file/attachment records AND
+    # attachment entries embedded in response records), with a linear-scan
+    # fallback for attachments sealed before the index covered them.
+    def _pointer_for(record) -> Optional[dict]:
+        c = record.content if isinstance(record.content, dict) else None
+        if c is None:
+            return None
+        if record.type in ("file", "attachment") and c.get("blob_sha256") == sha:
+            return c
+        if record.type == "response":
+            for e in c.get("attachments") or []:
+                if isinstance(e, dict) and e.get("blob_sha256") == sha:
+                    return e
+        return None
+
     media_type = "application/octet-stream"
+    pointer = None
     rec = state.chain.find_file_by_sha(sha) if state.chain is not None else None
-    if rec is None and state.chain is not None:
+    if rec is not None:
+        pointer = _pointer_for(rec)
+    if pointer is None and state.chain is not None:
         for r in state.chain.iter_records():
-            if (r.type == "attachment" and isinstance(r.content, dict)
-                    and r.content.get("blob_sha256") == sha):
-                rec = r
+            pointer = _pointer_for(r)
+            if pointer is not None:
                 break
-    if rec is not None and isinstance(rec.content, dict):
-        media_type = rec.content.get("mime_type") or media_type
+    if pointer is not None:
+        media_type = pointer.get("mime_type") or media_type
     return FileResponse(path, media_type=media_type)
 
 

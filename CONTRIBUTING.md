@@ -5,7 +5,7 @@ Thanks for considering a contribution. This is a prototype, so the bar for
 the integrity guarantees of the chain" is high. Most of the rules below are
 aimed at that distinction.
 
-This document tracks the current codebase (v1.4.0). For the release-by-release
+This document tracks the current codebase (v1.5.0). For the release-by-release
 history — what each version added and why — see `CHANGELOG.md`. If you're
 working from an older mental model of the project, start there.
 

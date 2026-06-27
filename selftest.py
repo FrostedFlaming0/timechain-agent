@@ -312,11 +312,16 @@ def main() -> None:
               out.startswith("Attached") and "artifacts" in out
               and "into task 'selftest-task'" not in out
               and (tools_mod.ARTIFACTS_DIR / "note.txt").exists(), out)
-        head = chain.head()
-        check("identity pointer ring carries no content",
-              head.type == "attachment"
-              and "extracted_text" not in head.content
-              and head.content.get("artifact_rings"), str(head.content)[:120])
+        # Single-record turn shape: the pointer is STAGED (no standalone
+        # attachment record) and seals into the next turn's response.
+        staged = ctx.staged_attachments
+        check("identity pointer staged, carries no content",
+              [r for r in chain.iter_records()
+               if r.type == "attachment"] == []
+              and bool(staged)
+              and "extracted_text" not in staged[-1]
+              and staged[-1].get("artifact_rings"),
+              str(staged[-1] if staged else None)[:120])
         out = _call(ctx, "ingest_blob", content="task-scoped note",
                     name="task-note.txt", mime_type="text/plain",
                     task_name="selftest-task")

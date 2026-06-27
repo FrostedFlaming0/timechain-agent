@@ -302,7 +302,13 @@ DEFAULT_HALF_LIFE_DAYS_BY_TYPE = {
     "genesis":       NO_DECAY_DAYS,
     "system_prompt": NO_DECAY_DAYS,
     "principle":     NO_DECAY_DAYS,  # extracted rules are durable identity
-    "reflection":    180.0,    # ~6 months
+    "reflection":    75.0,     # ~2.5 months — a reflection orients RECENT
+    #                            work; a long half-life let old reflections
+    #                            accumulate as persistent retrieval magnets.
+    #                            Salience stays high (0.85) so the lone
+    #                            orienting reflection still surfaces; the
+    #                            shorter half-life keeps it a recent-context
+    #                            minority rather than a standing one.
     "revision":      365.0,    # ~1 year — corrections should hold
     "proposal":      120.0,    # ~4 months — a pending suggestion goes stale
     "proposal_status": 365.0,  # ~1 year — an escalation should hold

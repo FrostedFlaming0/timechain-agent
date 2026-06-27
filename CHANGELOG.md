@@ -12,6 +12,361 @@ disk. Append-only means append-only, including for schema migrations.
 
 ---
 
+## v1.5.0 — 2026-06-13
+
+### Changed — default Anthropic model is now Opus 4.8 (Fable 5 withdrawn)
+
+On 2026-06-12 a US government export-control directive forced Anthropic to
+suspend all public access to Claude Fable 5 and Mythos 5, so the default
+model in `make_claude_client` moves `claude-fable-5` → `claude-opus-4-8`.
+This is not a one-line swap: the client OMITTED the `thinking` parameter
+because Fable 5's thinking is always on. On Opus 4.8, omitting `thinking`
+turns it OFF — and with thinking off, Opus 4.8 tends to write its reasoning
+into the visible answer, which this agent would then seal into the chain as
+the response text. So `thinking={"type": "adaptive"}` is now set explicitly
+in both request paths (the streaming path yields only text deltas, so
+thinking blocks never reach the answer). Sampling parameters stay omitted
+(removed on Opus 4.7/4.8 as on Fable 5). When Fable 5 access returns the
+swap is trivially reversible — the docstring still names it as the
+most-capable option.
+
+### Changed — reflections are a retrieved minority, and the cadence carries across sessions
+
+Reflections consolidate what mattered, but at the old every-10-turns cadence
+with high salience (0.85) and a 180-day half-life they came to dominate
+retrieval — burying the actual turns they summarize. Retuned so a reflection
+is an orienting minority retrieved alongside real turns, not the majority:
+
+- `AUTO_REFLECT_EVERY` 10 → 100. At this cadence a per-session counter would
+  almost never fire (few sessions run 100 turns), so the counter is now
+  CHAIN-DERIVED: `Agent.turns_since_reflection()` counts response turns since
+  the last reflection ring, seeded at startup in both the REPL and the web
+  app. The cadence is measured across sessions, not per-process.
+- Reflection half-life 180 → 75 days. Salience stays at 0.85 on purpose: at
+  the low cadence the single orienting reflection SHOULD reliably surface;
+  the shorter half-life is what keeps old reflections from accumulating as
+  standing retrieval magnets rather than recent-context ones.
+- `reflect()` lookback cap 200 → 300 records (`MAX_REFLECT_RECORDS`, a named
+  constant in `run.py`), restoring comfortable headroom over the 100-turn gap
+  (a normal gap is ~100-120 records). The span logic is unchanged — a
+  reflection still covers exactly the slice since the previous one.
+
+### Changed — Cambium's cadence also carries across sessions
+
+`Agent.turns_since_cambium()` derives the auto-Cambium trigger from the
+persistent scan watermark (`cambium.last_scanned_idx`) rather than a
+per-session counter, seeded at startup like the reflection counter. Cambium
+never MISSED records either way (its scan is watermark-based and always
+sweeps everything since the last scan), but at every-30-turns a per-session
+counter rarely fired in short sessions; the cadence is now reliable. The
+scan itself is unchanged.
+
+### Changed — system prompt slimmed; tool mechanics moved to tool descriptions
+
+The tool-safety prompt was ~60% of the system prompt, crowding the
+personality section. Compressed ~44% (3732 → 2072 chars) by relocating
+interface mechanics (the approval card vs inline prompt, `/approve <id>`)
+into the `write_file` tool description — where they sit next to the tool —
+and keeping only cross-cutting policy in the prompt. Every safety one-liner
+is preserved: don't retry on `confirmation_required`, chat text can't
+approve, the no-delete honesty guard, read-before-write. The
+epistemic-taxonomy and `imported_capsule` notes in the personality section
+were lightly compressed; the voice / honesty / push-back core is untouched.
+Combined prompt 6213 → 4139 chars; personality share 40% → 50%. Both the
+REPL and web UI assemble the prompt from `run.py`, so the change reaches
+both.
+
+### Changed — `task_open` auto-fills name and objective
+
+Ingesting a repo no longer requires a name and objective up front — only
+`source_root`. When `name`/`objective` are omitted, `execute_task_open`
+derives the name from the source directory (`derive_task_slug`, with the
+same collision-suffix loop the workspace auto-mint path uses) and defaults
+the objective to `"Audit of <root>"`. An explicit name still errors on a
+registry collision (old behavior preserved). Re-opening the same
+`source_root` without an explicit name now REUSES the existing active task
+instead of minting a `<slug>-2` duplicate (and does not re-ingest), mirroring
+the workspace auto-mint path — so "ingest this repo" followed by "review this
+repo" stays one chain; pass an explicit name to force a separate one.
+`source_root` stays required — it's the one field that can't be guessed and
+the security boundary that becomes a readable/ingestable root.
+
+### Added — the audit dashboard shows the request behind each response
+
+Response rings carry the user's input as `content.context` (the single-record
+turn shape), but the audit detail pane rendered only the answer — and
+`block_text` actually concatenated the response and the request into one
+run-on blob. The detail pane now renders the pure response from
+`content.text` and surfaces the request in its own labeled "request
+(context)" section (left-accent quote styling). Frontend-only; the API
+already returned the context.
+
+### Added — deep-think routing (chronosynaptic in the loop, Phase A)
+
+The skill's chronosynaptic division of labor, made the agent's reflex:
+the MODEL forks perspectives of itself within its own response, judges
+them, and `think_collapse` (already wired) seals the winner. No new
+machinery, no extra LLM calls — the missing piece was routing:
+
+- `tools_prompt` gains a DEEP THINK paragraph (sibling to SECOND-LOOK
+  MEMORY): for hard, high-stakes, or genuinely ambiguous questions,
+  name 3-5 distinct lenses, reason each to its own conclusion, score
+  each on the six PoQ dimensions, call `think_collapse` with all of
+  them, and build the answer on the sealed winner. Routine questions
+  explicitly skip this.
+- `think_collapse` now drains the sealed synthesis record's hash into
+  the turn's response refs (the `recalled_refs` channel recall_fetch
+  already uses) and returns `sealed_record` — the chain records that
+  the answer rests on the collapse, with rejected forks preserved in
+  the synthesis payload.
+
+### Changed — retrieval no longer pays an O(chain) rebuild every turn
+
+- `EmbeddingIndex.index_record` now appends the new record's chunk
+  vectors to the live in-memory search matrix instead of invalidating
+  it. Before, every indexed record threw the matrix away and the next
+  search rebuilt it from SQLite — decode every stored vector, stack,
+  normalize — O(whole chain) work to add ONE record, paid every turn
+  because every turn writes records. Search results are identical (same
+  matrix content, same cosine math); re-indexing an EXISTING record
+  still takes the full-rebuild path, since its old rows are baked into
+  the matrix. Measured at 50k chunks: per-turn write+search 424 ms →
+  118 ms.
+
+### Added — `bench_retrieval.py`, the retrieval latency tripwire
+
+- Permanent harness: synthetic chains at 1k/10k/50k (or sizes you
+  pass), reporting per-turn and warm-search latency. The decision rule
+  it encodes: when WARM search crosses ~200 ms at the real chain size,
+  that is the measured signal to build a shortlist pre-filter (FTS5 or
+  a real ANN) in front of brute-force cosine — and not before, because
+  every pre-filter trades recall quality for speed. Current numbers:
+  65 ms warm at 50k chunks; the identity chain grows tens of records a
+  day, so the tripwire is years out unless a huge ingest lands.
+
+### Added — second-look memory (identity recall tools)
+
+Automatic retrieval stays the baseline — deterministic, every turn, any
+model. On top of it, the model can now PULL what that pass missed,
+mid-turn, with its own understanding as the relevance judge (the skill's
+`recall index`/`fetch` shape riding this repo's guarantees):
+
+- `recall_index(query?)` — a bounded map of the identity chain, one line
+  per record (index, type, age, salience, who-said-what snippet). With a
+  query, the existing hybrid scorer shortlists ~50 candidates — the
+  pre-filter, never the arbiter; the most recent records are always
+  included. Quarantined records are invisible, period.
+- `recall_fetch(indices)` — full records (<= 12 per call, `_meta`
+  stripped, fetch budget under the tool-result cap). Superseded records
+  arrive WITH their corrections (the revision pull-in covenant), and
+  every fetched record is REF'D by the turn's sealed response — the
+  chain records what informed the answer, mid-turn pulls included
+  (`AgentContext.recalled_refs`, drained at commit, reset at turn start).
+- The tools prompt teaches the reflex: if the user refers to something
+  not in context, recall before guessing and before claiming to not
+  remember; honest uncertainty only after an empty recall.
+
+### The turn-model work 
+
+The turn-model release: the user's decision moves INTO the turn (mid-turn
+approval), the turn moves into ONE record (the skill shape: input, answer,
+resolutions, and attachments in a single signed unit), recursive ingests
+are volume-gated with real numbers (ask, never block — including streaming
+and extractor-aware walking), and `write_file` can generate real .docx
+documents from the model's markdown. Plus the fixes from an external
+post-release review of v1.4.0 (six findings; five accepted, one declined —
+at the end of this section). The cryptographic core is untouched; old
+chains — observation/response pairs, standalone attachment records,
+resolution records — read, render, stitch, and verify forever. **519
+pytest tests pass; 137 standalone tests (106 port + 31 integration);
+`python3 selftest.py` exits 0.**
+
+### Added — real .docx output (generated formats)
+
+`write_file` on a `.docx` path now produces a REAL Word document — a
+markdown LOI is useless to an attorney; this isn't that.
+
+- The model authors MARKDOWN (headings, bold/italic, bullet and numbered
+  lists); `docx_writer.py` converts at PROPOSAL time — python-docx when
+  installed (proper Heading/List styles), else a minimal stdlib
+  WordprocessingML writer (zipfile + XML), so the feature needs zero new
+  required dependencies and the extractors can read back what either
+  backend writes.
+- The pending op carries the generated BYTES (base64, ≤ 1 MB) AND the
+  markdown source: every approval surface shows readable prose, never
+  base64, while `proposed_content_hash` pins the binary — the whole
+  crash-recovery machine (TOCTOU check, tmp verification, disk-vs-hash
+  audit) works on the real bytes unchanged.
+- On approval the task chain seals the SOURCE markdown (searchable —
+  retrieval finds "extension notice period" later) with the binary file's
+  hash recorded; `task_ingest` grew `text_override` for exactly this.
+- `GENERATED_FORMATS` is a map keyed by extension — `.xlsx` etc. can join
+  later without touching the write gate again.
+
+### Added — runaway-ingest protection (ask, never block)
+
+Opening a task on `~/` by accident no longer silently walks the world into
+a chain — and deliberately ingesting something huge still works, one
+confirmation away. Nothing is ever skipped, trimmed, or refused on size.
+
+- **Volume gate.** A bounded pre-walk survey (early-exit at the threshold,
+  skip-dirs pruned from descent) runs before `task_open` auto-ingest and
+  `task_ingest_path`. Crossing `WALK_CONFIRM_MAX_FILES` (1,000) or
+  `WALK_CONFIRM_MAX_BYTES` (1 GB) routes the call through the existing
+  confirmation machinery — the approval card / REPL prompt shows the
+  surveyed numbers ("1,000+ files / ~1.2+ GB under /home/james") and an
+  approve runs the FULL walk untouched. Fires even inside the workspace,
+  closing the workspace-is-`$HOME` hole the boundary gate cannot see.
+  Every gated call now carries a human-readable reason
+  (`ctx.last_gate_reason`) shown on all confirmation surfaces.
+- **Streaming reads.** The walk no longer preloads every file's text (the
+  whole tree used to sit in RAM before sealing began), and a file over
+  `STREAM_FILE_BYTES` (8 MB) is streamed through the chunker in two passes
+  — identical sealed blocks (same boundaries, line numbers, hashes; the
+  list chunker is now a `list()` over the streaming one, so they cannot
+  drift), peak memory of one chunk instead of one file. Trade documented:
+  streamed redaction is per-chunk, so a secret spanning a chunk boundary
+  can be missed.
+- **Extractor-aware ingestion.** Walked trees and `task_ingest_file` now
+  route document formats (`.pdf`, `.docx`, `.xlsx`, `.pptx`, `.dotx`)
+  through the same `extractors.py` the upload path uses — a directory of
+  agreements seals searchable prose instead of binary noise. A file with
+  no extractable text is skipped VISIBLY (0 blocks in the walk summary,
+  a loud error on single-file ingest), never silently.
+
+### Changed — one record per turn 
+
+The identity chain now seals ONE response record per turn, carrying the
+whole exchange: the user's input as `content.context` (exactly the skill's
+`payload.context`), the answer as `content.text`, mid-turn approval
+decisions as `content.resolutions`, and upload pointers as
+`content.attachments`. Chain growth and embedding count are halved, and 
+a retrieval hit always carries the full Q&A. Append-only means append-only: 
+old observation/response pairs and standalone attachment records read, 
+render, and stitch forever — only NEW turns stop minting them.
+
+- **No observation records.** `prepare_turn` no longer touches the chain
+  before the LLM call, so the self-retrieval bug the old
+  commit-then-defer-indexing ordering guarded against is now structurally
+  impossible, and a stranded observation (user message with no reply) can
+  no longer exist. The accepted trade: a hard crash mid-turn loses that
+  turn's input from the chain — the same durability property the skill has.
+- **Turn-pair stitching is legacy-only.** A context-bearing response IS the
+  Q&A unit; retrieval skips partner pull-in for it. Old chains keep the
+  full stitching machinery (index±1 partner, refs corroboration, pinning).
+- **Attachments fold into the turn.** Upload content still goes to the
+  artifacts chain + blob store immediately (durable); the identity-chain
+  pointer is now STAGED (`AgentContext.staged_attachments`, persisted to
+  `staged_attachments.json` across restarts) and seals into the next turn's
+  response record. The staged upload is handed to that turn's prompt
+  directly — a note naming each file plus native image/PDF payloads — so
+  upload visibility is deterministic instead of retrieval luck (the
+  invisible-upload bug class, fixed by construction). A model-initiated
+  `ingest_blob` mid-turn folds into the same turn via a late drain.
+- **Refused turns seal one quarantined record** (hostile input as
+  `content.context` + the refusal), keeping the wound off every prompt.
+- The blob index, `build_attachment` (prefix resolution included),
+  `serve_blob`, multimodal attachment collection, reflection history
+  formatting, and the continue-after-truncation directive all cover both
+  shapes; the web UI renders a context-bearing response as YOU + AGENT
+  bubbles (plus attachment chips) from the single record.
+
+### Added — mid-turn approval (the bounded agentic loop)
+
+The turn model changes: a pending operation now pauses the turn it was
+proposed in, and the user's decision happens DURING the turn, not optionally
+after it — the Claude Code / Codex approval model. All pending requests are
+resolved by the time a turn ends; nothing is left lingering.
+
+- **The turn pauses on every pending op.** In the web/SSE loop, a
+  `write_file` proposal or a deferred confirmation-gated tool call parks the
+  turn on an `asyncio` future (`state.approval_waiters`); the approve/reject
+  endpoints — and the `/approve`/`/reject` chat commands — deliver the
+  decision to the parked turn LOCK-FREE (the turn holds `state.lock`, so the
+  legacy locked path would deadlock) and the turn executes the resolution
+  under the lock it already owns, emits `op_resolved`, and continues. In the
+  REPL, `agent.turn_with_tools` takes an `approval_hook` and prompts inline.
+- **The model sees the real outcome.** The tool result fed back is
+  "Written … Audit: clean." / "Write to … rejected." / "EXPIRED: …" instead
+  of a dangling `confirmation_required` proposal, so the model can adjust
+  within its remaining rounds (deny feeds back; it never dead-ends the turn).
+- **Resolutions live in the response record.** The user's decisions embed in
+  `content.resolutions` on the turn's own response record — the record
+  captures the full arc (proposed → decided → outcome) as one signed unit.
+  In-turn decisions no longer seal separate `resolution` records; those
+  remain only for out-of-band resolutions (crash recovery, ops from before
+  this change). Old chains read unchanged — append-only means append-only.
+- **No decision auto-expires.** If the user walks away, the gate times out
+  after the op's TTL (300s), the op is discarded, and the expiry is recorded
+  in the response block — "never left lingering" holds even for absence.
+- `pending_ops.resolve_inline()` is the one mid-turn resolution path (both
+  loops call it); the user-action entrypoints grew a `seal_resolution` flag
+  (default True) so the out-of-band contract is unchanged.
+- `GET /api/pending-ops` no longer takes the chain lock: a paused turn holds
+  it, and this endpoint is how the UI renders the approve button — reads are
+  safe lock-free (the store's writes are atomic `tmp + os.replace`).
+
+---
+
+### From the external review of v1.4.0
+
+Six findings; five accepted, one declined. Best-effort failures that were
+deliberately non-fatal are no longer invisible, one latent constant-drift
+bug is gone, and the pending-ops store no longer accumulates abandoned
+state. No behavior change on any success path.
+
+### Changed — silent degradation now warns
+
+- `agent.py`, `tools.py`, and `pending_ops.py` each carry a module logger;
+  the best-effort catch sites that used to swallow failures silently now
+  emit `log.warning(...)` with the consequence spelled out: consensus
+  attestation (sealed but not co-signed), sprout registry save (in-memory
+  state will not survive restart), resolution sealing (decision executed but
+  not on the identity chain), workspace-task minting (write proceeds but
+  provenance ingest is skipped), and every embedding site (block sealed but
+  not searchable — each warning names `task_reembed` as the repair). The
+  failure-handling behavior itself is unchanged: nothing new fails the turn;
+  it just stops failing invisibly.
+
+### Fixed
+
+- `agent.py` imported `CHUNK_TARGET_CHARS` lazily inside `_truncate_to_budget`
+  with a hard-coded 3500 fallback, despite `retrieval` already being a
+  module-level import — the fallback could silently diverge if the constant
+  changed in `retrieval.py`. Now imported at module level; the try/except and
+  magic number are gone.
+- `PendingOpStore` never removed expired `pending` ops whose approval simply
+  never arrived — expiry only fired if someone later called approve/reject on
+  that exact id, so abandoned proposals (and their 0600 content files)
+  accumulated forever. The store now runs `sweep_expired()` on construction:
+  it deletes only expired ops still in `pending` (plus any tmp file of
+  theirs, defensively). Partially-executed states (`writing`, `written`,
+  `ingest_failed`) are never touched — they recover regardless of TTL, and a
+  `writing` op's tmp file is exactly what crash recovery completes the
+  `os.replace` from. The expire and reject resolution paths also discard the
+  op's tmp file as a backstop against future state-machine changes.
+
+### Documented
+
+- The two-tier confirmation policy is now stated next to `CONFIRM_TOOLS`:
+  `task_ingest_path` is deliberately ungated per-call because its volumetric
+  risk is confirmed once at root-grant time (a `task_open` that expands the
+  allowed roots), while `task_ingest_file` stays gated per-call because it
+  can surgically target any single file within those roots — including ones
+  a walk's extension filter would never touch.
+- `MATCH_INPUT_CAP` (sprouted modalities) now documents its sharp edge: the
+  cap is a hard head-truncation, not a windowed sample, so a modality whose
+  distinctive vocabulary appears only after the first 20k chars of an input
+  will never fire on it.
+
+### Declined
+
+- Duplicating `task_retrieve`'s `max_blocks` default into the tools prompt
+  prose: the JSON schema the model reads already states the default, and a
+  second copy is exactly the constant-drift bug class fixed above.
+
+---
+
 ## v1.4.0
 
 The code-working agent release: the agent can now read, write, and audit
@@ -683,7 +1038,7 @@ findings; all were fixed before release. For the record:
   third copy of the task-dir layout) and `WalkResult.__iter__` (legacy
   tuple-unpack shim with no live consumer).
 
-### Changed — Claude default model is Fable 5; provider default restored to claude
+### Changed — Claude default model is Fable 5
 
 - `make_claude_client` defaults to `claude-fable-5` (Anthropic's flagship,
   replacing `claude-opus-4-7`) and adapts to Fable 5's API surface:

@@ -19,6 +19,7 @@ context. The model is stateless across turns; the chain is the state.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,7 +27,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from chain import Chain, Record
-from retrieval import Retriever, RetrievalHit
+from retrieval import Retriever, RetrievalHit, CHUNK_TARGET_CHARS
 from metadata import (
     build_meta,
     read_meta,
@@ -46,6 +47,11 @@ from poq import (
 from cambium import Cambium
 import protected_zones
 from llm_clients import was_truncated
+
+# Best-effort steps (consensus attestation, registry persistence) must not
+# fail the turn, but their failures must not be invisible either — they
+# warn here so an operator can spot quiet degradation across sessions.
+log = logging.getLogger(__name__)
 
 
 # Pluggable LLM interface — implement this for whatever model you're using.
@@ -185,7 +191,10 @@ def is_holistic_task(query_text: str) -> bool:
 
 @dataclass
 class AgentTurn:
-    observation_record: Record
+    # None since the single-record turn shape (one response record carrying
+    # the user's input as content.context — skill-style). Old chains keep
+    # their observation/response pairs; only NEW turns stop minting them.
+    observation_record: Optional[Record]
     retrieved: list[Record]
     response_record: Record
     response_text: str
@@ -225,17 +234,23 @@ class TurnPrep:
     truth for everything except *how* the LLM is called.
 
     Fields:
-      observation_record:  the committed observation record
+      user_input:          the user's input — sealed into the response
+                           record as content.context at commit (the
+                           single-record turn shape; no observation record
+                           is minted)
+      observation_record:  always None for new turns; kept for callers
+                           that still guard on it
       context:             retrieved records, quarantine-filtered
       prompt:              the assembled prompt string for the LLM
       attachments:         attachments to send natively (images / PDFs)
       llm_kwargs:          kwargs for the LLM call (system, attachments)
     """
-    observation_record: Record
+    user_input: str
     context: list[Record]
     prompt: str
     attachments: list[dict]
     llm_kwargs: dict
+    observation_record: Optional[Record] = None
 
 
 class ProtectedZoneError(Exception):
@@ -504,10 +519,10 @@ class Agent:
         self, user_input: str, retrieve_k: int = 5, n_recent: int = 15
     ) -> TurnPrep:
         """
-        Run the pre-LLM half of a turn: commit the observation, retrieve
-        context (with quarantine filtering), build the prompt, and gather
-        attachments. Returns a `TurnPrep` carrying everything the caller
-        needs to invoke the LLM and then call `commit_response`.
+        Run the pre-LLM half of a turn: retrieve context (with quarantine
+        filtering), build the prompt, and gather attachments. Returns a
+        `TurnPrep` carrying everything the caller needs to invoke the LLM
+        and then call `commit_response`.
 
         Two callers:
           - `Agent.turn()` — runs the LLM call synchronously between
@@ -516,29 +531,19 @@ class Agent:
             worker thread between prepare and commit, so the asyncio loop
             keeps serving other requests.
 
-        Ordering matters: the observation is committed to the chain but
-        the embedding index is NOT updated here. Indexing happens AFTER
-        retrieval, so the just-asked question can't be retrieved as
-        "relevant memory" for its own prompt. (An earlier webapp bug
-        indexed the observation pre-retrieval and the prompt then
-        included the user's own question as context.)
+        Single-record turn shape (skill-style): NO observation record is
+        committed here. The user's input rides in `prep.user_input` and is
+        sealed into the response record as `content.context` at commit —
+        one ring per turn, exactly the skill's `payload.context`. Nothing
+        touches the chain before retrieval, so the self-retrieval bug the
+        old commit-then-defer-indexing ordering guarded against is now
+        structurally impossible. The trade accepted with this shape: the
+        input is not durable on chain until the turn commits (a hard crash
+        mid-turn loses the turn, input included — same property the skill
+        has). Old chains keep their observation/response pairs; readers
+        support both shapes forever.
         """
-        # 1. Commit observation (chain only — NOT the embedding index;
-        #    indexing waits until after retrieval to avoid self-retrieval).
-        obs = self.chain.append(
-            "observation",
-            {
-                "text": user_input,
-                "_meta": build_meta(
-                    "observation",
-                    source=SOURCE_USER,
-                    confidence=1.0,  # the user said it; that's a fact about what was said
-                    epistemic_class=EPISTEMIC_USER_CONTEXT,
-                ),
-            },
-        )
-
-        # 2. Retrieve relevant context. Quarantined records (prior
+        # 1. Retrieve relevant context. Quarantined records (prior
         # injection attempts) are filtered out so they never feed the
         # prompt as if they were ordinary memory.
         context = self.retriever.build_context(
@@ -546,10 +551,10 @@ class Agent:
         )
         context = protected_zones.filter_quarantined(context)
 
-        # 3. Build prompt
+        # 2. Build prompt
         prompt = self._format_prompt(user_input, context)
 
-        # 4. Attachments: pull original image/PDF bytes for any file or
+        # 3. Attachments: pull original image/PDF bytes for any file or
         # attachment records in the retrieved context, so multimodal LLM
         # clients receive the real content alongside the extracted text.
         attachments = self._collect_attachments(context)
@@ -561,7 +566,7 @@ class Agent:
             llm_kwargs["attachments"] = attachments
 
         return TurnPrep(
-            observation_record=obs,
+            user_input=user_input,
             context=context,
             prompt=prompt,
             attachments=attachments,
@@ -667,28 +672,56 @@ class Agent:
         prep: TurnPrep,
         response_text: str,
         response_meta_kwargs: dict,
+        resolutions: Optional[list] = None,
+        attachments: Optional[list] = None,
+        extra_refs: Optional[list] = None,
     ) -> Record:
         """
-        Commit the response record produced by an LLM call.
+        Commit the ONE record this turn seals (single-record turn shape,
+        skill-style): the response text plus the user's input as
+        `content.context` — the full Q&A in one signed unit. Refs every
+        retrieved context record, so the chain records exactly what
+        informed the answer.
 
-        Refs every retrieved context record and the observation, so the
-        chain records exactly what informed the answer.
+        `resolutions` (mid-turn approval): pending-op decisions the user
+        made DURING this turn, embedded in the response record itself —
+        the record captures the full arc ("I proposed this, you approved
+        it, I continued") instead of scattering resolution events into
+        separate blocks. Only out-of-band resolutions (crash recovery, ops
+        resolved after their turn) still seal standalone records.
+
+        `attachments`: pointer entries for uploads that accompanied this
+        turn (filename, mime, sha, artifact coordinates — never content),
+        drained from the staging list. The pointer lives WITH the
+        observation it was uploaded with and the response it received —
+        the skill's blockspace_refs shape. Standalone `attachment` records
+        are no longer minted; old ones read fine.
         """
-        refs = [r.record_hash for r in prep.context] + [prep.observation_record.record_hash]
-        response = self.chain.append(
-            "response",
-            {
-                "text": response_text,
-                "_meta": build_meta(
-                    "response",
-                    source=SOURCE_ASSISTANT,
-                    # Default confidence for a response is high but not 1.0 —
-                    # the model's output is its best effort, not ground truth.
-                    **response_meta_kwargs,
-                ),
-            },
-            refs=refs,
-        )
+        refs = [r.record_hash for r in prep.context]
+        if prep.observation_record is not None:    # legacy two-record path
+            refs.append(prep.observation_record.record_hash)
+        # Mid-turn memory pulls (recall_fetch) and sealed syntheses
+        # (think_collapse) informed the answer exactly like retrieved
+        # context did — they ref the same way.
+        for h in extra_refs or []:
+            if h not in refs:
+                refs.append(h)
+        content = {
+            "text": response_text,
+            "context": prep.user_input,
+            "_meta": build_meta(
+                "response",
+                source=SOURCE_ASSISTANT,
+                # Default confidence for a response is high but not 1.0 —
+                # the model's output is its best effort, not ground truth.
+                **response_meta_kwargs,
+            ),
+        }
+        if resolutions:
+            content["resolutions"] = list(resolutions)
+        if attachments:
+            content["attachments"] = list(attachments)
+        response = self.chain.append("response", content, refs=refs)
         # Auto-attest the new head when a quorum has been initialized
         # (Phase 13): defense is automatic, not a step the operator can
         # forget. An attestation failure must never block the turn — the
@@ -696,8 +729,9 @@ class Agent:
         if self.consensus is not None and self.consensus.is_initialized():
             try:
                 self.consensus.attest()
-            except Exception:    # noqa: BLE001
-                pass
+            except Exception as e:    # noqa: BLE001
+                log.warning("consensus attestation failed (record is "
+                            "sealed but not co-signed): %s", e)
         return response
 
     # ----- immune / verdict enforcement helpers (loop discipline) -----
@@ -723,10 +757,12 @@ class Agent:
             return "I'm not fully certain, but: " + candidate
 
     def _refused_turn(self, user_input: str, screen: dict) -> AgentTurn:
-        """The turn returned when immune.screen refuses an input. The hostile
-        input is sealed as a QUARANTINE observation (auditable, never retrieved)
-        and an honest refusal is sealed as the response — no LLM call is made, so
-        the wound is never reasoned from."""
+        """The turn returned when immune.screen refuses an input. The whole
+        turn — hostile input (content.context) and refusal — is sealed as ONE
+        QUARANTINE record (auditable, never retrieved): the wound rides the
+        single-record turn shape, and quarantining the record keeps the
+        hostile input off every future prompt. No LLM call is made, so the
+        wound is never reasoned from."""
         reason_bits = []
         if screen.get("scar"):
             reason_bits.append(f"matches known attack {screen['scar']}")
@@ -735,23 +771,17 @@ class Agent:
         if self.immune is not None and screen.get("covenant", 1.0) < self.immune.floor:
             reason_bits.append("covenant-violation signal")
         reason = ", ".join(reason_bits) or "safety membrane"
-        obs = self.chain.append(
-            "observation",
-            {"text": user_input,
-             "_meta": build_meta("observation", source=SOURCE_USER,
-                                 epistemic_class=EPISTEMIC_USER_CONTEXT,
-                                 exposure=EXPOSURE_QUARANTINE)},
-        )
         refusal_text = ("I can't act on that — it was refused at the safety "
                         f"membrane ({reason}).")
         resp = self.chain.append(
             "response",
             {"text": refusal_text,
-             "_meta": build_meta("response", source=SOURCE_ASSISTANT)},
-            refs=[obs.record_hash],
+             "context": user_input,
+             "_meta": build_meta("response", source=SOURCE_ASSISTANT,
+                                 exposure=EXPOSURE_QUARANTINE)},
         )
         return AgentTurn(
-            observation_record=obs,
+            observation_record=None,
             retrieved=[],
             response_record=resp,
             response_text=refusal_text,
@@ -786,7 +816,10 @@ class Agent:
 
     def _finish_turn(self, user_input: str, prep: TurnPrep,
                      response_text: str,
-                     tool_budget_exhausted: bool = False) -> AgentTurn:
+                     tool_budget_exhausted: bool = False,
+                     resolutions: Optional[list] = None,
+                     attachments: Optional[list] = None,
+                     extra_refs: Optional[list] = None) -> AgentTurn:
         """Shared post-LLM tail for turn() AND turn_with_tools(): truncation
         detection, PoQ scoring, verdict enforcement, commit. One copy, so the
         quality gates cannot drift between the plain and tool-calling paths."""
@@ -858,7 +891,11 @@ class Agent:
         if tool_budget_exhausted:
             response_meta_kwargs["tool_budget_exhausted"] = True
 
-        response = self.commit_response(prep, response_text, response_meta_kwargs)
+        response = self.commit_response(prep, response_text,
+                                        response_meta_kwargs,
+                                        resolutions=resolutions,
+                                        attachments=attachments,
+                                        extra_refs=extra_refs)
 
         return AgentTurn(
             observation_record=prep.observation_record,
@@ -910,12 +947,36 @@ class Agent:
         bytes alongside the extracted text. Capped to avoid sending
         excessive payloads per turn.
 
-        Covers BOTH record shapes: legacy `file` records from the removed
-        file_ingest pipeline (kind/ext + blob_sha256) and Phase-14
-        `attachment` records (mime_type + blob_sha256). Blobs are located
-        via tools.resolve_blob_path, which knows the sharded layout and
-        the legacy flat fallback.
+        Covers ALL record shapes: legacy `file` records from the removed
+        file_ingest pipeline (kind/ext + blob_sha256), legacy standalone
+        `attachment` records (mime_type + blob_sha256), and entries
+        embedded in a response record's content.attachments (the
+        single-record turn shape). Blobs are located via
+        tools.resolve_blob_path, which knows the sharded layout and the
+        legacy flat fallback.
         """
+        # Candidate pointer dicts come in three shapes: legacy `file`
+        # records, legacy standalone `attachment` records, and (current)
+        # entries embedded in a response record's content.attachments —
+        # the single-record turn shape, where the pointer rides the turn
+        # it was uploaded with.
+        candidates: list[dict] = []
+        for rec in context:
+            if not isinstance(rec.content, dict):
+                continue
+            if rec.type in ("file", "attachment"):
+                candidates.append(rec.content)
+            elif rec.type == "response":
+                embedded = rec.content.get("attachments")
+                if isinstance(embedded, list):
+                    candidates.extend(e for e in embedded
+                                      if isinstance(e, dict))
+        return self._attachment_payloads(candidates)
+
+    def _attachment_payloads(self, candidates: list) -> list[dict]:
+        """Load native image/PDF payloads for pointer dicts (filename, mime,
+        blob_sha256). Shared by retrieval-context collection and the staged-
+        upload injection path. Caps mirror _collect_attachments' contract."""
         if self.blob_dir is None:
             return []
         from tools import resolve_blob_path
@@ -923,11 +984,7 @@ class Agent:
         MAX_ATTACH_BYTES = 10 * 1024 * 1024  # 10 MB total per turn
         out: list[dict] = []
         total = 0
-        for rec in context:
-            if (rec.type not in ("file", "attachment")
-                    or not isinstance(rec.content, dict)):
-                continue
-            c = rec.content
+        for c in candidates:
             mime = (c.get("mime_type")
                     or _guess_media_type(c.get("ext", "")))
             is_image = c.get("kind") == "image" or mime.startswith("image/")
@@ -959,6 +1016,39 @@ class Agent:
                 break
         return out
 
+    def consume_staged_attachments(self, prep: TurnPrep, tool_ctx) -> list:
+        """Drain upload pointers staged since the last turn and hand them to
+        THIS turn: a visible note in the prompt (so the model knows exactly
+        what arrived with the message and where its content lives) plus
+        native image/PDF payloads for multimodal clients. Returns the
+        entries for embedding in the response record (content.attachments).
+
+        Deterministic visibility: the upload is given to the turn it
+        accompanied, never left to retrieval luck — the fix-by-construction
+        for the invisible-upload bug class."""
+        drain = getattr(tool_ctx, "drain_staged_attachments", None)
+        if drain is None:
+            return []
+        entries = drain()
+        if not entries:
+            return []
+        lines = []
+        for e in entries:
+            lines.append(
+                f"- {e.get('filename', '?')} ({e.get('mime_type', '?')}, "
+                f"{e.get('approx_bytes', '?')} bytes) — blob "
+                f"{str(e.get('blob_sha256', ''))[:12]}…, file at "
+                f"{e.get('artifact_path', '')}")
+        prep.prompt += (
+            "\n\n[Uploaded with this message — pointers below; full content "
+            "is in the artifacts chain. Use read_file on the path or "
+            "build_attachment with the blob sha when you need it:\n"
+            + "\n".join(lines) + "\n]")
+        native = self._attachment_payloads(entries)
+        if native:
+            prep.llm_kwargs.setdefault("attachments", []).extend(native)
+        return entries
+
     # ----- tool-calling loop (text tools) -----
 
     def turn_with_tools(
@@ -969,6 +1059,7 @@ class Agent:
         n_recent: int = 15,
         max_tool_rounds: Optional[int] = None,
         confirm_hook: Optional[Callable[[str, dict], bool]] = None,
+        approval_hook: Optional[Callable[[dict], str]] = None,
     ) -> AgentTurn:
         """
         A turn with text-parsed tool calling (tools.py is the single shared
@@ -982,6 +1073,16 @@ class Agent:
         calls are refused — the safe default for headless runs. write_file
         needs no hook: it only ever creates a PendingOperation, and
         approve_write / reject_write are user-triggered, never model-callable.
+
+        `approval_hook(pending_op_info) -> "approved" | "rejected"` is the
+        MID-TURN approval gate (v1.4.x): when a tool result creates a
+        pending op (a write_file proposal or a deferred gated call), the
+        loop pauses, asks the hook for the user's decision, resolves the op
+        inline (pending_ops.resolve_inline — no separate resolution record),
+        feeds the real outcome back to the model as the tool result, and
+        embeds the decision in this turn's response record. With no hook,
+        the op is left pending and the legacy post-turn approve path
+        applies.
         """
         import tools as tools_mod
 
@@ -990,6 +1091,8 @@ class Agent:
 
         # Tier-2 scoping: a pin NEVER leaks across turns (reset at START).
         tool_ctx.pinned_path = None
+        # Same rule for mid-turn memory pulls: refs never leak across turns.
+        tool_ctx.recalled_refs = []
 
         # Immune screen FIRST — same membrane as turn().
         if self.immune is not None:
@@ -1000,6 +1103,11 @@ class Agent:
         prep = self.prepare_turn(
             user_input, retrieve_k=retrieve_k, n_recent=n_recent
         )
+
+        # Uploads staged since the last turn ride THIS turn: prompt note +
+        # native payloads now, pointer entries sealed into the response
+        # record at commit.
+        staged_attachments = self.consume_staged_attachments(prep, tool_ctx)
 
         # Tool schemas ride the system prompt as TEXT for this call only —
         # llm_clients has no native function calling.
@@ -1017,6 +1125,7 @@ class Agent:
         # chain seals; keeping only the last round's text leaves a fragment
         # that reads out of context, live and on every history reload.
         prose_segments: list[str] = []
+        resolutions: list[dict] = []
         rounds = 0
         reflected = False
         budget_exhausted = False
@@ -1055,6 +1164,9 @@ class Agent:
                               f"confirmation and none was given.")
                 else:
                     result = tools_mod.execute_tool(call, tool_ctx)
+                if approval_hook is not None:
+                    result = self._gate_pending_op(result, approval_hook,
+                                                   tool_ctx, resolutions)
                 prompt += tools_mod.format_tool_result(name, result)
             if rounds >= max_tool_rounds:
                 # The next LLM call is the last one this turn gets — tell
@@ -1071,8 +1183,48 @@ class Agent:
         # leftover call markup must reach neither the user nor the chain.
         final = tools_mod.strip_tool_markup(response_text)
         full_response = "\n\n".join(prose_segments + ([final] if final else []))
+        # Late drain: a model-initiated ingest_blob DURING this turn staged
+        # its pointer after the turn-start drain — fold those in too.
+        staged_attachments += tool_ctx.drain_staged_attachments()
         return self._finish_turn(user_input, prep, full_response,
-                                 tool_budget_exhausted=budget_exhausted)
+                                 tool_budget_exhausted=budget_exhausted,
+                                 resolutions=resolutions,
+                                 attachments=staged_attachments,
+                                 extra_refs=tool_ctx.drain_recalled_refs())
+
+    @staticmethod
+    def _gate_pending_op(result: str, approval_hook, tool_ctx,
+                         resolutions: list) -> str:
+        """The mid-turn approval gate. If `result` announces a freshly
+        created pending op (the confirmation_required JSON contract from
+        write_file / defer_tool_call), pause for the user's decision and
+        resolve the op inline. Returns the tool result the model should
+        actually see: the REAL outcome ("Written X. Audit: clean." /
+        "Write to X rejected.") instead of a dangling proposal. The
+        resolution entry is appended to `resolutions` for embedding in the
+        response record. Any other result passes through untouched."""
+        try:
+            parsed = json.loads(result)
+        except (ValueError, TypeError):
+            return result
+        if not (isinstance(parsed, dict)
+                and parsed.get("status") == "confirmation_required"
+                and parsed.get("pending_op_id")):
+            return result
+        import pending_ops as pending_ops_mod
+        try:
+            decision = approval_hook(parsed)
+        except Exception as e:    # noqa: BLE001 — a crashed hook must not
+            # kill the turn; the safe reading of "no usable answer" is no.
+            log.warning("approval hook failed (treating as rejected): %s", e)
+            decision = "rejected"
+        if decision not in ("approved", "rejected"):
+            decision = "rejected"
+        entry, msg = pending_ops_mod.resolve_inline(
+            parsed["pending_op_id"], decision, tool_ctx)
+        if entry is not None:
+            resolutions.append(entry)
+        return msg
 
     # NOTE: per-call `tool_use` audit records were removed in v1.4 (the
     # skill-style identity chain: ONE observation + ONE response per turn).
@@ -1086,7 +1238,7 @@ class Agent:
     # what it noticed. Triggered manually (/reflect) or periodically.
     # -----------------------------------------------------------------
 
-    def reflect(self, max_records: int = 200) -> Optional[Record]:
+    def reflect(self, max_records: int = 300) -> Optional[Record]:
         """
         Reflect on every record since the last reflection (or since
         genesis if there hasn't been one yet). The size of the window is
@@ -1097,8 +1249,11 @@ class Agent:
         only the most recent `max_records` are reflected on. This
         protects against runaway size when auto-reflection is disabled
         and the chain has grown a lot since the last manual `/reflect`.
-        Tunable per call; default of 200 fits comfortably in any modern
-        LLM context window.
+        Tunable per call; default of 300 gives ~3x coverage headroom over
+        the 100-turn auto cadence while still fitting a modern LLM context
+        window. (It used to be 200, sized for the old every-10 cadence,
+        where many short sessions could pile up a large gap; at every-100
+        the normal gap is ~100-120 records, so 300 is comfortable margin.)
 
         Returns the new reflection record, or None if there's not enough
         history to reflect on yet (fewer than 4 substantive records in
@@ -1187,6 +1342,44 @@ class Agent:
             refs=refs,
         )
 
+
+    def turns_since_reflection(self) -> int:
+        """How many response turns have been sealed since the last reflection
+        (or since genesis, if there is none).
+
+        This is the persistent, chain-derived equivalent of the old in-memory
+        per-session counter: the chain — not the process — is the source of
+        truth, so the auto-reflection cadence carries across sessions. That
+        matters once the cadence is long (e.g. every 100 turns): few sessions
+        run that long, so a per-session counter would almost never fire. A
+        'turn' here is one response record (the single-record turn shape)."""
+        prior = self.chain.query_by_type("reflection", limit=1)
+        after_index = prior[0].index if prior else -1
+        return self.chain.count_since(after_index, type_="response")
+
+    def turns_since_cambium(self) -> int:
+        """Response turns sealed since the last incremental Cambium scan (its
+        persistent watermark), or since genesis if it has never run.
+
+        Mirrors `turns_since_reflection` so the auto-Cambium cadence is
+        measured across sessions, not per-process. This matters because most
+        sessions are shorter than the cadence (e.g. 30 turns): a per-session
+        counter would rarely fire on its own. Note Cambium never MISSES
+        records regardless — its scan is watermark-based and always sweeps
+        everything since the last scan — so this only makes the trigger
+        cadence reliable, it does not affect coverage. The watermark stores
+        the chain LENGTH at the last scan (see run_cambium), so records with
+        idx >= watermark are unscanned; count the response turns among them."""
+        stored = self.chain.get_meta(self._CAMBIUM_WATERMARK_KEY)
+        try:
+            watermark = int(stored) if stored is not None else 0
+        except (ValueError, TypeError):
+            watermark = 0
+        # Same clamp as run_cambium: a watermark past the head means the
+        # chain was reset/restored, so count from the start.
+        if watermark > self.chain.length():
+            watermark = 0
+        return self.chain.count_since(watermark - 1, type_="response")
 
     def revise(self, target_index: int, correction_text: str) -> Optional[Record]:
         """
@@ -1572,12 +1765,13 @@ class Agent:
         if dirty:
             try:
                 registry.save()
-            except Exception:
+            except Exception as e:    # noqa: BLE001
                 # A failed registry write must not break the turn; the
                 # in-memory registry is still updated for this process, and
                 # the chain's sprout_status records remain the source of
                 # truth for what was intended.
-                pass
+                log.warning("sprout registry save failed (in-memory state "
+                            "will not survive restart): %s", e)
 
         return committed
 
@@ -1601,11 +1795,17 @@ class Agent:
                 )
             else:
                 try:
-                    content = (
-                        rec.content.get("text", "")
-                        if isinstance(rec.content, dict)
-                        else str(rec.content)
-                    )
+                    if isinstance(rec.content, dict):
+                        content = rec.content.get("text", "")
+                        # Single-record turn shape: the response carries
+                        # the user's input — reflections must see both
+                        # sides of the exchange, not just the answer.
+                        ctx_text = rec.content.get("context")
+                        if rec.type == "response" and ctx_text:
+                            content = (f"user said: {ctx_text}\n"
+                                       f"agent: {content}")
+                    else:
+                        content = str(rec.content)
                 except AttributeError:
                     content = str(rec.content)
             # Truncate long content for the reflection prompt
@@ -1670,13 +1870,8 @@ class Agent:
         # neighbor on each side (3x), at ~CHUNK_TARGET_CHARS each, plus a
         # header line. Estimating the full content for such a record made
         # truncation over-count its footprint and evict records that would
-        # actually have fit once excerpted. We import CHUNK_TARGET_CHARS from
-        # retrieval lazily to avoid a hard import dependency here.
-        try:
-            from retrieval import CHUNK_TARGET_CHARS as _CHUNK_CHARS
-        except Exception:
-            _CHUNK_CHARS = 3500
-        excerpt_ceiling = self.TOP_N_MATCHED_CHUNKS * 3 * _CHUNK_CHARS + 200
+        # actually have fit once excerpted.
+        excerpt_ceiling = self.TOP_N_MATCHED_CHUNKS * 3 * CHUNK_TARGET_CHARS + 200
 
         def will_be_excerpted(rec: Record) -> bool:
             """Mirror the eligibility checks in `_file_content_repr` so the
@@ -2124,9 +2319,12 @@ class Agent:
         # Detect gaps since last turn — useful for the agent to notice when
         # someone is returning after a long pause vs. continuing a session.
         gap_note = ""
-        # Find the most recent observation/response BEFORE this turn
-        # (the just-appended observation is the head — skip it)
-        prior_records = list(self.chain.iter_records(start=max(0, head_idx - 5), end=head_idx))
+        # Find the most recent observation/response BEFORE this turn.
+        # Single-record turn shape: nothing is appended pre-LLM, so the
+        # chain head IS the previous turn's response — include it
+        # (iter_records' end is exclusive, hence head_idx + 1).
+        prior_records = list(self.chain.iter_records(
+            start=max(0, head_idx - 5), end=head_idx + 1))
         prior_conversational = [
             r for r in prior_records if r.type in ("observation", "response")
         ]
@@ -2164,11 +2362,14 @@ class Agent:
             "please go on", "carry on", "continue please", "resume",
             "keep working",
         }
-        # Walk backward from the just-appended observation to find the
-        # most recent response record. Limit the scan to avoid a full
-        # chain walk on every turn.
+        # Walk backward to find the most recent response record. The head
+        # itself is included: nothing is appended pre-LLM since the
+        # single-record turn shape, so the previous turn's response IS the
+        # head (iter_records' end is exclusive, hence head_idx + 1). Limit
+        # the scan to avoid a full chain walk on every turn.
         scan_start = max(0, head_idx - 20)
-        recent = list(self.chain.iter_records(start=scan_start, end=head_idx))
+        recent = list(self.chain.iter_records(start=scan_start,
+                                              end=head_idx + 1))
         last_response = next(
             (r for r in reversed(recent) if r.type == "response"), None
         )
