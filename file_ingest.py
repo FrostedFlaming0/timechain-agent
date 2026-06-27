@@ -88,7 +88,13 @@ class IngestResult:
     kind: str
     size_bytes: int
     blob_sha256: str
-    blob_path: str  # relative to data dir
+    # NOTE: `blob_path` stores the BASENAME of the on-disk blob (i.e. the
+    # sha256 hex), not a full path. It's named "blob_path" because that's
+    # the field name committed on every file record in existing chains
+    # since v1 — renaming it would silently break readers of those
+    # chains. Treat it as "blob filename" mentally; resolve to a full
+    # path via `Path(blob_dir) / blob_path`.
+    blob_path: str  # basename of the blob on disk; resolve via blob_dir
     extracted_text: str
     extraction_method: str
     extraction_truncated: bool
@@ -352,10 +358,12 @@ def _extract_image_metadata(raw: bytes, ext: str, filename: str) -> tuple[str, s
     except ImportError:
         return f"[image: {filename} ({len(raw):,} bytes, {ext})]", "missing-dep"
     try:
-        img = Image.open(io.BytesIO(raw))
-        return (
-            f"[image: {filename} ({img.width}x{img.height} {img.mode}, "
-            f"format={img.format}, {len(raw):,} bytes)]"
-        ), "pillow-metadata"
+        # `with` releases the underlying file/buffer deterministically;
+        # without it the handle stays open until the next GC pass.
+        with Image.open(io.BytesIO(raw)) as img:
+            return (
+                f"[image: {filename} ({img.width}x{img.height} {img.mode}, "
+                f"format={img.format}, {len(raw):,} bytes)]"
+            ), "pillow-metadata"
     except Exception as e:
         return f"[image: {filename} (could not parse: {e})]", "pillow-failed"

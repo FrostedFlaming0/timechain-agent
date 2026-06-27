@@ -57,6 +57,15 @@
       overflow-y: auto;
       padding: 20px 18px;
     }
+    .load-earlier {
+      display: block;
+      margin: 0 auto 16px;
+      background: none; border: 1px solid var(--line);
+      padding: 6px 14px; border-radius: 4px; cursor: pointer;
+      color: var(--muted); font-size: 12px;
+    }
+    .load-earlier:hover { background: var(--bg); color: var(--ink); }
+    .load-earlier:disabled { opacity: 0.5; cursor: default; }
     .turn {
       max-width: 760px;
       margin: 0 auto 14px;
@@ -237,7 +246,7 @@
       <textarea id="composer" placeholder="message... (or /command)" rows="1"></textarea>
       <button class="send" id="sendbtn">send</button>
     </div>
-    <div class="hint">enter to send, shift+enter for newline. drag files anywhere to ingest. /verify /reflect /seal /sysprompt /length /revise N text /file path</div>
+    <div class="hint">enter to send, shift+enter for newline. drag files anywhere to ingest. /verify /reflect /cambium /proposals /seal /sysprompt /length /revise N text /file path</div>
   </div>
 
 <script>
@@ -268,6 +277,19 @@ async function claimSession() {
 // =========================================================================
 // Rendering
 // =========================================================================
+// Where a freshly-built turn node goes. Default is "append to the
+// bottom and scroll down" (live conversation). History loading passes
+// {anchor: node} to insert *before* an existing node instead, and skips
+// the scroll so the user's reading position is preserved.
+function placeTurn(div, opts) {
+  if (opts.anchor) {
+    main.insertBefore(div, opts.anchor);
+  } else {
+    main.appendChild(div);
+    main.scrollTop = main.scrollHeight;
+  }
+}
+
 function addTurn(role, text, opts={}) {
   const div = document.createElement('div');
   div.className = 'turn ' + role;
@@ -282,12 +304,11 @@ function addTurn(role, text, opts={}) {
   body.className = 'body';
   body.textContent = text;
   div.appendChild(body);
-  main.appendChild(div);
-  main.scrollTop = main.scrollHeight;
+  placeTurn(div, opts);
   return body;  // so streaming can append
 }
 
-function addFileTurn(rec) {
+function addFileTurn(rec, opts={}) {
   const div = document.createElement('div');
   div.className = 'turn you';
   const r = document.createElement('div');
@@ -305,12 +326,149 @@ function addFileTurn(rec) {
   meta.className = 'file-meta';
   meta.textContent = `${c.filename} — ${c.kind}, ${c.size_bytes.toLocaleString()} bytes, sha256 ${c.blob_sha256.slice(0,12)}…`;
   div.appendChild(meta);
-  main.appendChild(div);
-  main.scrollTop = main.scrollHeight;
+  placeTurn(div, opts);
 }
 
 function addSystemTurn(text) { return addTurn('system', text); }
 function addErrorTurn(text)  { return addTurn('error', text); }
+
+// =========================================================================
+// History — load the persisted chain into the chat view on boot, with a
+// "load earlier" button for paging further back. Uses the append-only,
+// stable-index pagination from GET /api/chain/records.
+// =========================================================================
+
+// Render one persisted chain record into the chat view. `opts` is passed
+// through to the turn renderers (notably {anchor} for prepending). Record
+// types map to roles the same way live turns do:
+//   observation (user said it)      -> "you"
+//   response    (agent said it)     -> "agent"
+//   file        (ingested upload)   -> file turn
+// Everything else (genesis, system_prompt, reflection, revision,
+// proposal*) is chain bookkeeping, not conversation. We show those as a
+// compact system note so the timeline is honest about what's on the
+// chain, rather than silently dropping them.
+function renderHistoryRecord(rec, opts={}) {
+  const c = rec.content || {};
+  switch (rec.type) {
+    case 'observation':
+      addTurn('you', c.text ?? '', opts);
+      break;
+    case 'response':
+      addTurn('agent', c.text ?? '', opts);
+      break;
+    case 'file':
+      // addFileTurn expects the raw record (reads rec.content itself).
+      addFileTurn(rec, opts);
+      break;
+    case 'genesis':
+      addTurn('system', 'genesis — founding commitments sealed', opts);
+      break;
+    case 'system_prompt':
+      addTurn('system', 'system prompt updated', opts);
+      break;
+    case 'reflection':
+      addTurn('system', 'reflection written to chain', opts);
+      break;
+    case 'revision':
+      addTurn('system', 'revision: ' + (c.text ?? c.correction ?? ''), opts);
+      break;
+    default:
+      addTurn('system', rec.type + ' record #' + rec.index, opts);
+  }
+}
+
+// Lowest record index currently shown, and whether older pages exist.
+let historyOldestIndex = null;
+let historyHasMore = false;
+let historyLoading = false;
+
+// The "load earlier" button lives at the very top of <main>, above all
+// turns. We keep a single instance and move/remove it as needed.
+let loadEarlierBtn = null;
+
+function ensureLoadEarlierButton() {
+  if (!historyHasMore) {
+    if (loadEarlierBtn) { loadEarlierBtn.remove(); loadEarlierBtn = null; }
+    return;
+  }
+  if (!loadEarlierBtn) {
+    loadEarlierBtn = document.createElement('button');
+    loadEarlierBtn.id = 'load-earlier';
+    loadEarlierBtn.className = 'load-earlier';
+    loadEarlierBtn.textContent = 'load earlier messages';
+    loadEarlierBtn.addEventListener('click', () => loadHistory({ older: true }));
+  }
+  // Always keep it as the first child of <main>.
+  if (main.firstChild !== loadEarlierBtn) {
+    main.insertBefore(loadEarlierBtn, main.firstChild);
+  }
+}
+
+// Fetch one page and render it. With {older:true} we page backward from
+// historyOldestIndex and PREPEND (preserving scroll position); otherwise
+// it's the initial newest page, appended in order.
+async function loadHistory({ older = false } = {}) {
+  if (historyLoading) return;
+  if (older && !historyHasMore) return;
+  historyLoading = true;
+  if (loadEarlierBtn) { loadEarlierBtn.disabled = true; loadEarlierBtn.textContent = 'loading…'; }
+
+  try {
+    const params = new URLSearchParams({ limit: '50' });
+    if (older && historyOldestIndex !== null) {
+      params.set('before', String(historyOldestIndex));
+    }
+    const r = await fetch('/api/chain/records?' + params.toString());
+    const d = await r.json();
+    const recs = d.records || [];  // newest-first from the server
+
+    if (older) {
+      // Anchor below the button so prepended turns land above existing
+      // messages but below the button itself. Render oldest-last so the
+      // visual order ends up ascending. Because each insert goes just
+      // before `anchor`, iterating newest->oldest yields correct order.
+      const anchor = loadEarlierBtn ? loadEarlierBtn.nextSibling : main.firstChild;
+      const prevHeight = main.scrollHeight;
+      const prevTop = main.scrollTop;
+      for (const rec of recs) {
+        renderHistoryRecord(rec, { anchor });
+      }
+      // Keep the viewport pinned to what the user was reading: grow from
+      // the top, so add the height delta to scrollTop.
+      main.scrollTop = prevTop + (main.scrollHeight - prevHeight);
+    } else {
+      // Initial load: render ascending (oldest at top) and scroll to
+      // bottom so the newest message is visible, like a fresh session.
+      for (const rec of recs.slice().reverse()) {
+        renderHistoryRecord(rec);
+      }
+      main.scrollTop = main.scrollHeight;
+    }
+
+    if (d.oldest_index !== null && d.oldest_index !== undefined) {
+      historyOldestIndex = d.oldest_index;
+    }
+    historyHasMore = !!d.has_more;
+  } catch (e) {
+    addErrorTurn('could not load history: ' + e);
+  } finally {
+    historyLoading = false;
+    if (loadEarlierBtn) { loadEarlierBtn.disabled = false; loadEarlierBtn.textContent = 'load earlier messages'; }
+    ensureLoadEarlierButton();
+  }
+}
+
+// Shown after a response that hit the model's max_tokens ceiling. The
+// answer above it is cut off mid-thought; this tells the user so that
+// typing "continue" is an informed action rather than a guess.
+function showTruncationNotice() {
+  addSystemTurn(
+    'response cut off at the model\u2019s max_tokens limit \u2014 ' +
+    'type "continue" to have the agent pick up where it left off, ' +
+    'or raise LLM_MAX_TOKENS in run.py for longer responses.'
+  );
+}
 
 // =========================================================================
 // Chain status + sidebar
@@ -451,6 +609,29 @@ function renderCommandResult(d) {
   } else if (d.kind === 'reflect') {
     if (d.result === 'not_enough_history') addSystemTurn('reflect: not enough history yet');
     else addSystemTurn(`reflection committed at #${d.record.index}:\n\n${d.record.content.text}`);
+  } else if (d.kind === 'cambium') {
+    const lines = [];
+    (d.proposals || []).forEach(p =>
+      lines.push(`  new proposal #${p.index} [${p.proposal_kind}] ${p.title}`));
+    (d.recurrences || []).forEach(r =>
+      lines.push(`  recurrence: proposal #${r.recurs_proposal_index} seen again`));
+    (d.escalations || []).forEach(e =>
+      lines.push(`  ** ESCALATED ** proposal #${e.marks_proposal_index} recurred ${e.recurrence_count}x — flagged for review`));
+    if (lines.length === 0) {
+      addSystemTurn('cambium: no recurring patterns crossed a threshold');
+    } else {
+      addSystemTurn(`cambium scan:\n${lines.join('\n')}`);
+    }
+  } else if (d.kind === 'proposals') {
+    if (d.entries.length === 0) addSystemTurn('no proposal records on chain yet');
+    else {
+      const lines = d.entries.map(e => {
+        const flag = e.escalated ? ' ** ESCALATED **' : '';
+        const rc = e.recurrence_count > 1 ? ` x${e.recurrence_count}` : '';
+        return `  #${e.index} [${e.proposal_kind}] (${e.status}${rc})${flag} ${e.title}`;
+      });
+      addSystemTurn(`${d.entries.length} proposal record(s) (escalated first):\n${lines.join('\n')}`);
+    }
   } else if (d.kind === 'revise') {
     if (d.result === 'no_such_record') addErrorTurn(`no record at index ${d.target}`);
     else addSystemTurn(`revision at #${d.record.index} corrects #${d.target_index}`);
@@ -499,6 +680,21 @@ async function runTurn(text) {
     es.addEventListener('reflection', () => {
       addSystemTurn('[auto-reflection committed]');
     });
+    es.addEventListener('cambium', (ev) => {
+      try {
+        const d = JSON.parse(ev.data);
+        const lines = [];
+        (d.proposals || []).forEach(p =>
+          lines.push(`  new proposal #${p.index} [${p.proposal_kind}] ${p.title}`));
+        (d.recurrences || []).forEach(r =>
+          lines.push(`  recurrence: proposal #${r.recurs_proposal_index} seen again`));
+        (d.escalations || []).forEach(e =>
+          lines.push(`  ** ESCALATED ** proposal #${e.marks_proposal_index} recurred ${e.recurrence_count}x`));
+        if (lines.length > 0) {
+          addSystemTurn(`[auto-cambium scan:]\n${lines.join('\n')}`);
+        }
+      } catch (e) {}
+    });
     es.addEventListener('error', (ev) => {
       // EventSource fires generic 'error' on stream end too; only surface
       // if we got a real error message.
@@ -510,10 +706,17 @@ async function runTurn(text) {
         }
       } catch (e) {}
     });
-    es.addEventListener('done', () => {
+    es.addEventListener('done', (ev) => {
       // If the stream finished without a single token (rare — empty response),
       // clean up the indicator so the user isn't left staring at dancing dots.
       if (!firstTokenSeen) agentBody.textContent = '(no response)';
+      // If the model hit its max_tokens ceiling, the answer just shown is
+      // cut off mid-thought. Surface a marker so the user knows to ask the
+      // agent to continue.
+      try {
+        const d = JSON.parse(ev.data);
+        if (d && d.truncated) showTruncationNotice();
+      } catch (e) {}
       es.close();
       resolve();
     });
@@ -606,6 +809,7 @@ document.addEventListener('drop', (e) => {
   await claimSession();
   await refreshStatus();
   await refreshSidebar();
+  await loadHistory();  // replay persisted chain into the chat view
   // Periodic sidebar refresh (cheap; reflections/revisions don't change often)
   setInterval(refreshSidebar, 30_000);
 })();

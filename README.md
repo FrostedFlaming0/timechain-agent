@@ -3,10 +3,10 @@
 A persistent-memory AI agent built on a hash-chained, cryptographically signed,
 append-only memory substrate. Memory survives across sessions, is tamper-evident,
 and can be cryptographically verified at any time. Provider-agnostic: works with
-Claude, GPT, Gemini, or local models via Ollama.
+Claude, GPT, Gemini, DeepSeek, any model on OpenRouter, or local models via Ollama.
 
-**Version: 1.1.** See [What changed in v1.1](#what-changed-in-v11) below if
-you're upgrading from v1 (https://github.com/frostedflaming0/timechain-agent).
+**Version: 1.2.1.** See [CHANGELOG.md](CHANGELOG.md) for the full release
+history.
 
 ## What this is
 
@@ -29,16 +29,45 @@ remembered exchange happened, and when there's been a long gap between sessions.
 - **Merkle batching** for periodic integrity summaries
 - **OpenTimestamps anchoring to Bitcoin** (optional, for long-horizon
   third-party-verifiable integrity)
-- **Per-record metadata** (v1.1) — every record carries a `_meta` block
+- **Per-record metadata** — every record carries a `_meta` block
   with `source` (user / assistant / system / tool), `salience`,
   `confidence`, and `schema_version`. Source is the load-bearing
   distinction: the LLM can see "this is what the user said" vs "this is
   what I inferred" rather than treating all records as equivalent.
+  Response records also record `modalities_activated` — which analysis
+  capabilities fired in producing the response — as a data layer for
+  later retrieval, and `senses_activated` — the *felt qualities* of the
+  turn (`uncertainty`, `insight_markers`, `cognitive_weather`, etc.) —
+  not used for retrieval but readable when the agent revisits its own
+  history.
 - **Hybrid retrieval** with explicit, named score components: semantic
   similarity, per-record salience, and per-kind half-life recency decay.
   Observations decay over weeks; reflections over months; genesis and
-  system prompts effectively never decay.
-- **Revision-aware retrieval** (v1.1) — when a record has been corrected
+  system prompts effectively never decay. When the query carries a domain
+  mode (e.g. pasted code), a fourth **modality-anchoring** term
+  preferentially surfaces records produced in the same mode — so a coding
+  query pulls up the agent's past code more readily than conversational
+  chatter. Opt-in and neutral when no mode is present. The domain set is
+  extensible at runtime: Cambium detects a recurring *kind* of the agent's
+  own output and **auto-sprouts** a new pattern-based modality for it (a name
+  + deterministically-derived regex specs in `sprouted_modalities.json`)
+  without a code change or restart. A new sprout must clear a diversity gate
+  (≥5 distinct triggers, ≥2h spread, interleaved) to be created, lands as
+  *tentative* at half weight, and only graduates to full weight after
+  repeated confirmation — and two further dampers (a per-turn cap and an
+  anti-echo saturation check) guard against the feedback loop of an agent
+  reshaping its own retrieval. See `/modalities`.
+- **Tiered embedder** — the embedder is resolved at startup with a
+  fallback chain: a local Ollama server if one is reachable, otherwise a
+  dependency-free hashing embedder. No required embedding model, no heavy
+  ML stack, and the agent never fails to start for lack of an embedder.
+- **Chunked retrieval** — long records are split into chunks at
+  index time so content past the embedder's input cap is still searchable.
+  A group-collapse step scores each record by its single most relevant
+  chunk, so long records don't crowd out short ones, and retrieved records
+  are rendered whole. Index-only; the signed chain is untouched. See
+  [Chunked retrieval](#chunked-retrieval-v121).
+- **Revision-aware retrieval** — when a record has been corrected
   by a later revision, retrieval demotes the original and pulls in the
   correction so the model sees both together.
 - **Sealed founding commitments** at genesis (immutable identity record)
@@ -54,7 +83,7 @@ remembered exchange happened, and when there's been a long gap between sessions.
   retrieved records carry human-readable relative-time labels.
 - **Context budget** — retrieved records are truncated to fit a configurable
   character budget before being sent to the LLM, with lowest-salience
-  records dropped first. As of v1.1 truncation is driven by per-record
+  records dropped first. Truncation is driven by per-record
   salience read from the `_meta` block, not a hardcoded type table.
 - **Test suite** — pytest coverage of chain integrity, tamper detection,
   Merkle proofs, retrieval, agent workflows, drift detection, and budget
@@ -84,12 +113,56 @@ The first run commits a genesis record with your founding commitments,
 logs your system prompt, and drops you into a REPL. Subsequent runs
 reuse the same chain.
 
+`requirements.txt` uses `>=` lower bounds so the project picks up
+security patches in its dependencies. For long-running deployments
+that need reproducibility, freeze your working set with
+`pip freeze > requirements-lock.txt` and install from the lock file
+afterwards.
+
+### Embeddings (optional but recommended)
+
+There is no required embedding dependency. At startup the agent
+picks an embedder with a tiered fallback:
+
+1. **Ollama**, if a local server is reachable — real semantic embeddings,
+   runs entirely on your machine. To enable it, install
+   [Ollama](https://ollama.com/download), pull an embedding model, and make
+   sure `requests` is installed:
+
+   ```bash
+   pip install requests
+   ollama pull nomic-embed-text
+   ```
+
+2. **Hashing fallback**, otherwise — a dependency-free bag-of-trigrams
+   embedder. No install, no model. Retrieval still works but is lexical
+   rather than semantic, so recall on differently-worded queries is weaker.
+
+`run.py` prints which embedder it selected at startup. You don't configure
+this — it's automatic — but you can change the Ollama model or URL via
+`OLLAMA_EMBED_MODEL` / `OLLAMA_BASE_URL` in `run.py`.
+
+The embedding store (`embeddings.sqlite`) is a **derived index, not part of
+the chain.** It is rebuilt automatically from the chain whenever it is
+missing, so deleting it is always safe — the chain, the signing key, and
+all records are untouched. If retrieval ever looks wrong after changing the
+embedder, or the agent reports an embedder-identity or dimension mismatch at
+startup, delete the store and let it rebuild:
+
+```bash
+rm timechain_data/embeddings.sqlite*
+python run.py   # re-embeds the whole chain
+```
+
 Slash commands inside the REPL:
 - `/verify` — cryptographically validate the entire chain
 - `/length` — current record count
 - `/seal` — create a Merkle batch over recent records
 - `/sysprompt` — show the system prompt history on chain
 - `/reflect` — trigger a reflection over recent history
+- `/cambium` — run a Cambium scan for recurring gaps now
+- `/proposals` — list proposal records (escalated first, with recurrence counts)
+- `/modalities` — list baked-in and sprouted modalities (status, domain flag, weight)
 - `/revise N <text>` — append a correction record targeting record N
 - `/file <path>` — ingest a file (document, image, spreadsheet, code, etc.)
 
@@ -101,126 +174,93 @@ python view_chain.py --type reflection
 python view_chain.py --verify
 ```
 
-## What changed in v1.1
+### Diagnosing embedding issues
 
-v1.1 sharpens the "records are evidence, beliefs are derived" principle that
-v1 already implemented in spirit. The cryptographic core is unchanged — the
-chain, signing, hashing, Merkle batching, and verification all work
-identically. What changed is how records are written and how retrieval
-ranks them.
+If the app hangs or errors during startup indexing, run `python
+diagnose_index.py`. It embeds every chain record one at a time —
+chunking each record exactly as the real index path does, so a failure
+here corresponds to a real boot-time indexing failure — and prints
+OK/FAILED with timing and chunk count for each, so a problem record (or
+a slow embedder) is pinned down immediately rather than appearing as a
+silent hang.
 
-### Summary of changes
+### Reviewing Cambium proposals
 
-| Area | v1 | v1.1 |
-|------|----|------|
-| Record metadata | None on most records; `schema_version: 1` on a few | Every record carries a `_meta` block with `schema_version`, `source`, `salience`, `confidence`, `supersedes` |
-| Salience | Per-type, hardcoded in `Retriever.DEFAULT_SALIENCE` | Per-record, written at append time; type-based defaults still kick in for v1 records |
-| Recency | Linear blend `1 - (head - idx) / total` | Per-kind half-life decay: `0.5 ** (age_days / half_life_days)` |
-| Source tracking | Not represented | Every record tagged `user` / `assistant` / `system` / `tool` |
-| Superseded records | Surfaced equally with their corrections | Demoted with a `-0.30` penalty so corrections rank above them |
-| Revision pull-in | Done in prompt rendering | Done in retrieval — superseded targets always pull their corrections |
-| Truncation order | Hardcoded `_RETENTION_PRIORITY` table | Per-record salience |
-| Reflection window | Fixed lookback (`REFLECT_WINDOW = 20`) | Dynamic: every record since the previous reflection, with a `max_records=200` safety cap |
-| Files added | — | `metadata.py` (new) |
-| Files changed | — | `agent.py`, `retrieval.py`, `run.py`, `test_timechain.py`, `timechain_web/webapp.py` |
-| Files unchanged | — | `chain.py`, `file_ingest.py`, `llm_clients.py`, `view_chain.py`, `run_tests.py`, `timechain_web/static/index.html` |
+`apply_proposal.py` is the operator-run tool for acting on the proposals
+Cambium produces. Cambium proposes; this tool is how a human reviews and
+decides. It is never called by the agent.
 
-### Why source matters
-
-In v1, retrieval surfaced records but didn't distinguish "the user told me X"
-from "I inferred X" from "a reflection concluded X." The LLM had to figure
-that out from context. In v1.1, every record carries an explicit source tag
-that the agent renders in the prompt:
-
-```
-[record 7 | observation       | user      | 3 hours ago] {"text": "I work at Acme"}
-[record 8 | response          | assistant | 3 hours ago] {"text": "Got it — Acme."}
-[record 12 | reflection       | assistant | 2 hours ago] {"text": "User mentioned working at Acme..."}
+```bash
+python apply_proposal.py --list        # all proposals, escalated first
+python apply_proposal.py --show 12     # full detail for proposal #12
+python apply_proposal.py --accept 12   # scaffold a stub + record the decision
+python apply_proposal.py --decline 12  # record a decline
+python apply_proposal.py --decline 12 --reason "out of scope"
 ```
 
-This isn't cosmetic. Reflection-of-reflection drift — the doc-cited failure
-mode where summaries of summaries become "telephone with yourself" — is
-much harder to fall into when the model can see at a glance that a claim
-came from its own past inference rather than from the user.
+`--accept` on a modality or sense proposal scaffolds a detector *stub* into
+`signals.py` — correct signature, registered in the right registry, but
+with a `# TODO` body and a harmless return. A human writes the real
+detector logic and adds a test; the tool never writes working code. Every
+decision is recorded on the chain as a `proposal_status` record, so the
+audit trail shows who decided what.
 
-### Per-kind half-lives
+This manual path is for modalities that need real detector logic. For simple
+*pattern-based* modalities there is now a second path — runtime sprouting
+(see `sprouted_modalities.py` and `/modalities`) — where the agent adds a
+regex-spec modality to a data file with no code change and no human review.
+That deliberately relaxes the "human in the loop" boundary that
+`apply_proposal` enforces, for the narrow pattern-based case only; it was an
+explicit owner decision, and the regex surface is bounded at validation time
+(patterns must compile, catastrophic-backtracking shapes are rejected,
+lengths/counts capped) so a sprouted pattern can never hang the process. The
+`apply_proposal` path above is unchanged and remains the route for anything
+that needs logic beyond pattern matching. The autonomous path is not
+unconditional: Cambium only auto-sprouts a mode that clears a diversity gate
+(repeated, time-spread, interleaved evidence), the sprout enters at half
+weight as *tentative*, and it reaches full weight only after repeated
+confirmation — so review is replaced by evidence thresholds, not removed
+outright.
 
-v1 treated all records as decaying at the same rate. v1.1 acknowledges that
-"user told me their name" and "user mentioned the weather" should not decay
-identically. Defaults (in `metadata.py`):
-
-| Type | Half-life |
-|------|-----------|
-| `genesis` | effectively never |
-| `system_prompt` | effectively never |
-| `revision` | 1 year |
-| `reflection` | 6 months |
-| `file` | 3 months |
-| `observation`, `response` | 2 weeks |
-
-Tunable in `metadata.py`. The point is that defaults respect the kind of
-information rather than applying a single uniform decay.
-
-### Revision-aware retrieval
-
-When you correct an earlier record with `/revise`, v1 wrote the revision
-and called it done — both records would surface together at retrieval, but
-with no preference. v1.1 demotes the superseded original (`-0.30` to its
-score, applied after the weighted sum) and `build_context` automatically
-pulls in any revision whose target appears in the result set. The model
-always sees the original *and* the correction, with the correction
-ranking higher.
-
-### Migration: drop in the new files
-
-If you're upgrading an existing chain:
-
-1. Add `metadata.py` (new file).
-2. Replace `agent.py`, `retrieval.py`, `run.py`, `test_timechain.py`, and
-   `timechain_web/webapp.py`.
-3. Leave `chain.py`, `file_ingest.py`, `llm_clients.py`, `view_chain.py`,
-   `run_tests.py`, and `timechain_web/static/index.html` alone.
-
-If you had customized `REFLECT_WINDOW` in `run.py`, that constant no longer
-exists in v1.1 — the dynamic window in `agent.py`'s `reflect()` makes it
-unnecessary. If you want a tighter cap on the maximum reflection size,
-the new control is the `max_records` parameter on `Agent.reflect()`
-(default 200, plenty for any normal cadence). `AUTO_REFLECT_EVERY` still
-works the same way. 
-
-Your existing chain works without modification. v1 records (no `_meta`
-block) get sensible defaults at read time via `metadata.read_meta()`,
-which inspects record type and synthesizes appropriate values without
-ever rewriting the record on disk. New records appended after the upgrade
-carry the v1.1 `_meta` block. The two coexist in the same chain
-indefinitely; `/verify` still passes.
-
-This is deliberate: append-only means append-only, including for schema
-migrations. Old records stay as they were.
+Two things to expect. First, `--list` shows `no proposal records on chain
+yet` until Cambium has actually found a recurring pattern — the same
+correction, failure, or confusion showing up 3+ times. A fresh or
+smoothly-running chain genuinely has nothing to propose; that is normal.
+You can prompt a scan with `/cambium` in the REPL rather than waiting for
+the auto-scan. Second, the tool reads the chain from the `timechain_data/`
+directory next to the script — the same default `run.py` uses. If you have
+customized `DATA_DIR` in `run.py`, update the matching constant near the
+top of `apply_proposal.py` so both point at the same chain.
 
 ## Switching LLM providers
 
-The default is Claude. To switch to OpenAI, Gemini, or a local Ollama model:
+The default is Claude. The agent also supports OpenAI, OpenRouter, DeepSeek,
+Gemini, and local Ollama models.
 
 **1. Install the SDK:**
 
 ```bash
-pip install openai           # for GPT
+pip install openai           # covers OpenAI, OpenRouter, AND DeepSeek
 pip install google-genai     # for Gemini
 pip install requests         # for Ollama
 ```
+
+OpenRouter and DeepSeek both expose OpenAI-compatible APIs, so the single
+`openai` package serves all three — no separate dependency for either.
 
 **2. Set the API key** (skip for Ollama — it runs locally):
 
 ```bash
 export OPENAI_API_KEY=sk-...
+export OPENROUTER_API_KEY=sk-or-...
+export DEEPSEEK_API_KEY=sk-...
 export GEMINI_API_KEY=...
 ```
 
 **3. Edit `LLM_PROVIDER` in `run.py`:**
 
 ```python
-LLM_PROVIDER = "openai"   # or "gemini", "ollama", "claude"
+LLM_PROVIDER = "openai"   # or "openrouter", "deepseek", "gemini", "ollama", "claude"
 ```
 
 That's it. The chain, retrieval, and web UI all carry over — your existing
@@ -230,6 +270,20 @@ For Ollama, install the [Ollama app](https://ollama.com/download), pull a
 model (`ollama pull llama3.1:8b`), and make sure the local server is
 running before you start `run.py`.
 
+**OpenRouter** routes to hundreds of models behind one endpoint and one key.
+Its model strings are provider-namespaced — `anthropic/claude-opus-4.7`,
+`deepseek/deepseek-chat`, `meta-llama/llama-3.3-70b-instruct`, and so on (see
+[openrouter.ai/models](https://openrouter.ai/models)). The default is
+`anthropic/claude-opus-4.7`; override it via `build_llm()` as shown below.
+
+**DeepSeek** offers `deepseek-chat` (default) and `deepseek-reasoner`. The
+reasoner model produces a separate chain-of-thought trace; this client keeps
+things simple and uses only the final answer — the reasoning trace is
+discarded, so the agent treats `deepseek-reasoner` like any other model.
+Note that DeepSeek's API is operated from China; as with any hosted
+provider, prompt content (including retrieved memory) is sent to the
+provider. Use Ollama if nothing should leave your machine.
+
 To override the default model for a provider, edit `build_llm()` in
 `run.py`:
 
@@ -237,6 +291,10 @@ To override the default model for a provider, edit `build_llm()` in
 def build_llm():
     if LLM_PROVIDER == "ollama":
         return make_ollama_client(model="qwen3:8b")
+    if LLM_PROVIDER == "openrouter":
+        return make_openrouter_client(model="deepseek/deepseek-chat")
+    if LLM_PROVIDER == "deepseek":
+        return make_deepseek_client(model="deepseek-reasoner")
     # ...
 ```
 
@@ -249,10 +307,24 @@ A few practical notes:
   them.
 - Different providers will give different answers to the same prompt.
   Same memory, different reasoner.
-- Streaming works on all four providers in the web UI.
+- Streaming works on all six providers in the web UI.
 - Default model names in `llm_clients.py` may go stale as providers
   release new versions. If you get a "model not found" error, look up
   the current name and pass it explicitly via `make_X_client(model=...)`.
+- **Response length.** `LLM_MAX_TOKENS` in `run.py` caps a single
+  response (default 4096 ≈ 3000 words); `build_llm()` feeds it to whatever
+  provider is selected. If a response does hit the ceiling, it is cut off
+  mid-thought and the REPL / web UI show a "response was cut off" marker so
+  you know to type `continue`. The marker appears for Claude, OpenAI,
+  OpenRouter, and DeepSeek (the providers that report a finish reason).
+  `LLM_MAX_TOKENS` only sets a ceiling — you are billed for tokens actually
+  generated, so raising it costs nothing on short replies.
+- **Context budget.** `CONTEXT_BUDGET_CHARS` in `run.py` (default 80,000)
+  caps how much retrieved memory is packed into one prompt. It is a
+  ceiling, not a target: turns with little relevant history use less. The
+  two knobs are related — a long response becomes a large record that then
+  competes for this budget on later turns — so the comments in `run.py`
+  explain how to keep them balanced if you raise either.
 
 ## Web UI
 
@@ -285,6 +357,7 @@ All slash commands from the REPL work the same way:
 
 - `/verify` `/length` `/seal` `/sysprompt`
 - `/reflect`
+- `/cambium` `/proposals` `/modalities`
 - `/revise N <text>`
 - `/file <path>`
 
@@ -304,21 +377,67 @@ A few things worth knowing:
   This protects the chain's single-writer guarantee. Concurrent requests
   to the same chain are also serialized internally regardless of session
   state.
-- Responses stream token-by-token via Server-Sent Events. All four
-  providers in `llm_clients.py` (Claude, OpenAI, Gemini, Ollama) expose
-  a `.stream()` method; the UI uses it automatically. Custom clients
-  without a `.stream()` method fall back to non-streaming gracefully —
-  the response just appears all at once instead of progressively.
+- Responses stream token-by-token via Server-Sent Events. All six
+  providers in `llm_clients.py` (Claude, OpenAI, OpenRouter, DeepSeek,
+  Gemini, Ollama) expose a `.stream()` method; the UI uses it
+  automatically. Custom clients without a `.stream()` method fall back to
+  non-streaming gracefully — the response just appears all at once instead
+  of progressively.
 - The web server doesn't append records that the REPL wouldn't append.
   Same record types, same retrieval, same reflection cadence
   (`AUTO_REFLECT_EVERY` from `run.py`). It's an I/O layer, not a
-  different agent. As of v1.1 the streaming endpoint also writes the
+  different agent. The streaming endpoint also writes the
   same `_meta` block as `agent.turn()` — there's no path through the
   app that produces a v1 record.
 
 You can run `run.py` and `webapp.py` against the same chain at different
 times, but not simultaneously — both want exclusive access to the SQLite
 database and the signing key. Pick one interface per session.
+
+## Limitations
+
+A short list of things the codebase doesn't try to do, so deployment
+choices are informed.
+
+- **Signal detectors are English-only.** The lexicons in `signals.py`
+  (intent verbs, vulnerability markers, confusion markers, resolution
+  cues, ...) are deliberately small English word lists. PoQ
+  brightness and Cambium pattern-detection both ride on these
+  signals, so on a chain conducted in another language the
+  detectors fire weakly and erratically — the architecture handles
+  multilingual content fine (the cryptography and storage don't
+  care), but the *behavioral* signals depend on word-list hits.
+  Extending to additional languages means swapping or supplementing
+  the per-language lexicon constants near the top of `signals.py`;
+  the detector functions themselves don't need changes.
+
+- **Single-operator security model.** The webapp assumes you bind it
+  to `127.0.0.1` and that exactly one human at a time is the
+  legitimate operator. There is no multi-user auth, no per-user
+  permissions, no transport encryption built in. `/api/session/claim`
+  is rate-limited but a co-located attacker could still bump your
+  tab off the chain. For exposure beyond localhost, put it behind a
+  reverse proxy with real auth.
+
+- **Cambium scan windows are bounded by default.** The periodic
+  Cambium scan uses an incremental watermark plus a `MAX_CAMBIUM_RECORDS`
+  lookback (see `run.py`). This makes scans cheap and bounded, but
+  patterns whose recurrence gap exceeds the lookback can only be
+  detected by an explicit `/cambium-full` deep scan, which is linear
+  in chain length.
+
+- **Provider-specific truncation reporting.** Claude, GPT, and
+  DeepSeek surface a finish reason that `was_truncated()` reads;
+  Gemini and Ollama now report it as well. Other providers
+  back-plumbed through OpenAI-compatible endpoints may or may not
+  set the field — the truncation marker silently doesn't fire if
+  they don't.
+
+- **English-style topic signatures.** Cambium's recurrence detection
+  groups records by a coarse keyword fingerprint extracted from the
+  text. The keyword extractor is the same English lexicon machinery
+  as above; recurring patterns in another language will not cluster
+  reliably under the same signature.
 
 ## Tests
 
@@ -338,9 +457,27 @@ python run_tests.py
 
 Coverage includes chain signing and verification, tamper detection across
 content/signature/prior-hash/deletion vectors, Merkle proof correctness,
-retrieval semantics, full agent workflow integrity, genesis drift detection,
-context-budget truncation, and time formatting. The v1 test suite passes
-unchanged on v1.1 — the upgrade is non-breaking by design.
+retrieval semantics, the tiered embedder fallback and dimension-mismatch
+guard, chunked-embedding behavior (boundary splitting, group-collapse, and
+buried-content retrieval), per-record `modalities_activated` (write/read
+round-trip and the legacy-defaults-to-empty path), content-aware response
+salience (artifact detection, the boost/demotion composition, and the
+end-to-end boost on a code response), modality-anchored retrieval (query
+modality detection, overlap scoring, and the opt-in guarantee that anchoring
+off matches historical scoring), runtime sprouted modalities (schema
+validation, ReDoS-pattern rejection, load/save, and live anchoring on a
+sprouted mode), the anti-echo saturation damper and per-turn modality cap,
+auto-sprouting (the recurring-output-mode detector, the diversity gate's
+pass/fail paths, deterministic pattern derivation, tentative staging, and
+cooling-off graduation), per-record `senses_activated` (the round-trip
+through `_meta`, `injection_scan` exclusion, end-to-end recording on a
+turn, and per-detector discrimination across all six new senses),
+chunk-aware rendering of long file records (intent detection across
+inflected verb forms, the short/holistic/no-match fall-through paths to
+full text, the excerpt's matched/context labeling, and verified ~70%
+budget savings on a 66k-char document with a targeted query), full
+agent workflow integrity, genesis drift detection, context-budget
+truncation, and time formatting. 256 tests pass.
 
 ## How it differs from "chatbot with memory"
 
@@ -373,9 +510,9 @@ Intelligence License. Their work motivated this project.
 This implementation is an independent, simplified take on one specific piece
 of that broader architecture: the hash-chained memory substrate itself, plus
 the retrieval, reflection, revision, and agent-loop layers needed to make it
-useful in practice. It deliberately omits components of the original (e.g.
-qualia scoring) in favor of a minimal, testable foundation. The goal here is
-engineering tractability, not theoretical completeness.
+useful in practice. It deliberately omits components of the original in
+favor of a minimal, testable foundation. The goal here is engineering
+tractability, not theoretical completeness.
 
 The technical building blocks (Ed25519, SHA-256, Merkle trees, append-only
 hash-linked logs, retrieval-augmented generation) are all standard and
@@ -395,5 +532,5 @@ original architect. This project preserves that attribution above.
 
 ## Status
 
-Prototype, version 1.1. Works end-to-end. Not production-hardened. Issues
+Prototype, version 1.2.1. Works end-to-end. Not production-hardened. Issues
 and PRs welcome.

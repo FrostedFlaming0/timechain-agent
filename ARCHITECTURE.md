@@ -2,7 +2,9 @@
 
 A guide to the files that make up the timechain agent, what each is responsible for, and how they fit together.
 
-**Version: 1.1.** See [What changed in v1.1](#what-changed-in-v11) at the bottom for the diff against v1 (https://github.com/frostedflaming0/timechain-agent).
+**Version: 1.2.1.** This document describes the system as it currently
+stands. For the release-by-release history of how it got here, see
+[CHANGELOG.md](CHANGELOG.md).
 
 ## The mental model
 
@@ -30,11 +32,29 @@ Think of this as a four-layer system:
 └─────────────────────────────────────────────────────────┘
 
   llm_clients.py    PLUGGABLE — LLM provider clients
-                    (Claude, OpenAI, Gemini, Ollama)
+                    (Claude, OpenAI, OpenRouter, DeepSeek, Gemini, Ollama)
                     with optional system prompt and attachment support
 
   file_ingest.py    INGEST — read documents/images/spreadsheets/code
                     files into chain records + content-addressed blobs
+
+  signals.py        ANALYSIS — modalities & senses: pure text detectors
+                    (intent, coherence, integrity/injection, ...) → SignalReport
+  sprouted_modalities.py  RUNTIME MODALITIES — data-driven (regex-spec)
+                    modalities the agent can sprout without a code change;
+                    validated + ReDoS-screened, fed into signals.py
+  poq.py            QUALITY GATE — Proof-of-Quality: scores a candidate
+                    response before commit; reads signals.py
+  protected_zones.py  MEMBRANE — protected-zone policy: what may be
+                    revised, what is quarantined; reads metadata.py
+  cambium.py        GROWTH — scans history for recurring gaps, emits
+                    skill / modality / sense / principle proposals;
+                    tracks recurrence and escalates persistent ones;
+                    also detects recurring OUTPUT modes and emits
+                    auto-sprout specs (diversity-gated)
+  apply_proposal.py REVIEW TOOL — operator-run: lists/shows proposals,
+                    scaffolds detector stubs into signals.py, records
+                    accept/decline decisions on the chain
 
   timechain_web/    OPTIONAL UI — FastAPI server + browser frontend
     webapp.py       Same agent, same chain, alternate I/O layer
@@ -84,7 +104,7 @@ Helper functions: `canonical_json` for stable serialization, `sha256` for hashin
 | `revision` | `/revise N <text>` | Correction to a prior record (original is preserved) |
 | `file` | `/file <path>` | Ingested file: metadata + extracted text on chain, raw bytes in `blobs/` |
 
-As of v1.1, every record's `content` dict carries a `_meta` block (see `metadata.py`). The chain itself is unaware of this — `_meta` is just JSON inside `content` from the chain's perspective — but reader code uses it to distinguish source, salience, and supersession.
+Every record's `content` dict carries a `_meta` block (see `metadata.py`). The chain itself is unaware of this — `_meta` is just JSON inside `content` from the chain's perspective — but reader code uses it to distinguish source, salience, and supersession.
 
 **When you'd touch this file:** rarely. The schema is intentionally minimal so it doesn't need to change as your application evolves. You'd touch it if you wanted to add a new query pattern at the storage level, change the cryptography (e.g. add post-quantum signatures), or alter how Merkle batches are anchored.
 
@@ -99,26 +119,60 @@ As of v1.1, every record's `content` dict carries a `_meta` block (see `metadata
 **Knows about:** record types and their semantic meaning. Salience and decay defaults.
 **Does not know about:** SQLite, embeddings, LLMs, prompts, the chain, the retriever, the agent. Pure schema.
 
-This module is the centerpiece of the v1.1 upgrade. It exists to make a single architectural distinction explicit: **records are evidence, beliefs are derived.** A record's `_meta` block tags it with the metadata needed for retrieval and the agent to treat different kinds of evidence appropriately.
+This module exists to make a single architectural distinction explicit: **records are evidence, beliefs are derived.** A record's `_meta` block tags it with the metadata needed for retrieval and the agent to treat different kinds of evidence appropriately.
 
 **The `_meta` block:**
 
-Every v1.1 record carries a `_meta` dict inside its `content`:
+Every current-schema record carries a `_meta` dict inside its `content`:
 
 ```python
 {
     "_meta": {
-        "schema_version": 2,
-        "source":         "user" | "assistant" | "system" | "tool",
-        "salience":       0.0..1.0,    # write-time importance estimate
-        "confidence":     0.0..1.0,    # how sure the writer was
-        "supersedes":     int | absent  # record index this one corrects
+        "schema_version":       3,
+        "source":               "user" | "assistant" | "system" | "tool",
+        "salience":             0.0..1.0,   # write-time importance estimate
+        "confidence":           0.0..1.0,   # how sure the writer was
+        "supersedes":           int,        # record index this corrects (or absent)
+        "epistemic_class":      str,        # how the content is known
+        "exposure":             str,        # who may see it (protected-zone primitive)
+        "poq":                  dict,       # Proof-of-Quality block (or absent)
+        "truncated":            True,       # response cut off at max_tokens (or absent)
+        "modalities_activated": [str, ...], # modalities that produced this (or absent)
+        "senses_activated":     [str, ...]   # how this turn felt (or absent)
     },
     # ...rest of the content (text, filename, etc.)
 }
 ```
 
-`schema_version` is `1` for old records (no `_meta` present) and `2` for v1.1 records.
+`schema_version` is `1` for legacy records (no `_meta` present), `2` for
+records written before the v3 fields existed, and `3` for current records.
+`read_meta` upgrades older records in memory with sensible defaults; it never
+rewrites them on disk. Several fields are emitted only when they carry
+information — `supersedes`, `poq`, `truncated`, `modalities_activated`, and
+`senses_activated` are absent rather than written as a null/empty value, so
+a record that doesn't need them produces the same canonical JSON earlier
+versions would have, and its content hash is unchanged on rebuild.
+
+**`modalities_activated`** records which modality detectors (`signals.py`)
+fired with non-trivial activation when the record's content was scored by
+PoQ — in effect, *which capabilities produced this record*. It is written on
+response records (the agent scores every response), defaults to `[]` on read
+for records that lack it, and is stored sorted so the same set hashes
+identically. The names come straight from `MODALITY_REGISTRY`, making them a
+de facto stable identifier — renaming a modality later doesn't rewrite old
+records, which keep the old name. Consumed by retrieval (modality anchoring,
+content-aware salience).
+
+**`senses_activated`** parallels `modalities_activated` but records which
+*sense* detectors fired — the felt-quality channel rather than the
+kind-of-work channel. Where modalities answer "what produced this," senses
+answer "how did this feel" (`uncertainty`, `insight_markers`,
+`cognitive_weather`, `emotional_contour`). Same storage discipline (sorted,
+emitted only when non-empty, defaults to `[]` on read). Deliberately **not**
+a retrieval input: matching feeling-to-feeling would surface memories by
+mood, closer to rumination than recall. `injection_scan` lives in
+`SENSE_REGISTRY` but is filtered from this field — it's a security detector,
+not a felt quality.
 
 **Sources** (the load-bearing distinction):
 
@@ -140,7 +194,7 @@ The point is to never collapse "the user said X" with "I inferred X." When the p
 | `system_prompt` | 0.55 |
 | `observation`, `response` | 0.40 |
 
-Reflections and revisions are written with high salience because they represent the agent's own consolidated judgment about what mattered. Observations and responses sit at conversational baseline. These are *defaults* — a specific record can override at write time (e.g. a clearly-significant user statement could be tagged with higher salience by future code).
+Reflections and revisions are written with high salience because they represent the agent's own consolidated judgment about what mattered. Observations and responses sit at conversational baseline. These are *defaults* — a specific record can override at write time, and one does: a **response** record's salience is set by `protected_zones.salience_for_commit` from its PoQ result rather than taking the flat 0.40. A response PoQ judged low-quality (`light_log`) is demoted below baseline; a response that is substantive artifact (high `artifact_content` activation — code, structured data) is boosted up to `ARTIFACT_SALIENCE_MAX` (0.70). Demotion wins over boost. This is why the agent can retrieve code it produced several turns ago instead of letting it decay at conversational baseline. The boost still sits below reflections and revisions, so the agent's consolidated judgments outrank even a substantive response.
 
 **Per-kind half-lives** (in days, used by retrieval recency scoring):
 
@@ -156,13 +210,13 @@ Reflections and revisions are written with high salience because they represent 
 The recency contribution to a hit's score is `0.5 ** (age_days / half_life_for_type)`. This replaces v1's uniform linear decay with a model that respects the kind of information: identity records don't decay, conversational records do.
 
 **Public functions:**
-- `read_meta(record)` — extract metadata from any record. v1 records (no `_meta`) get type-based defaults synthesized in memory; v2 records get their stored values, with safe fallbacks for any individually-missing fields. The result is a `RecordMeta` dataclass with an `is_default` flag indicating whether values were synthesized.
-- `build_meta(rec_type, source=, salience=, confidence=, supersedes=)` — build a `_meta` dict for a new record. Fills any unspecified field with type-appropriate defaults. Used by `agent.py` and the streaming path in `webapp.py` on every chain append.
+- `read_meta(record)` — extract metadata from any record. Legacy records (no `_meta`) get type-based defaults synthesized in memory; current records get their stored values, with safe fallbacks for any individually-missing fields. The result is a `RecordMeta` dataclass with an `is_default` flag indicating whether values were synthesized.
+- `build_meta(rec_type, source=, salience=, confidence=, supersedes=, epistemic_class=, exposure=, poq=, truncated=, modalities_activated=)` — build a `_meta` dict for a new record. Fills any unspecified field with type-appropriate defaults, and omits the optional fields (`supersedes`, `poq`, `truncated`, `modalities_activated`) when they carry no information. Used by `agent.py` and the streaming path in `webapp.py` on every chain append.
 - `half_life_days(rec_type)` — per-type half-life lookup, used by retrieval.
 
-**The non-destructive migration rule:** `read_meta` synthesizes defaults *in memory* for v1 records. It never rewrites a record on disk. This is the point of append-only — even the schema's history is preserved. A v1 chain reads cleanly through v1.1 code, and any new appends carry the v1.1 `_meta` block.
+**The non-destructive migration rule:** `read_meta` synthesizes defaults *in memory* for legacy records. It never rewrites a record on disk. This is the point of append-only — even the schema's history is preserved. A chain written before the `_meta` block existed reads cleanly, and any new appends carry the current `_meta` block.
 
-**When you'd touch this file:** to tune salience defaults, adjust half-lives, add a new source enum value, or extend the `_meta` schema with new fields. Adding fields is safe — `read_meta`'s fallback handles missing fields by giving them defaults, so v1.1 records remain readable under future schemas.
+**When you'd touch this file:** to tune salience defaults, adjust half-lives, add a new source enum value, or extend the `_meta` schema with new fields. Adding fields is safe — `read_meta`'s fallback handles missing fields by giving them defaults, so current records remain readable under future schemas.
 
 ---
 
@@ -175,19 +229,20 @@ The recency contribution to a hit's score is `0.5 ** (age_days / half_life_for_t
 
 **Key components:**
 
-`EmbeddingIndex` is the vector store. It maintains a parallel SQLite database mapping each chain record to a vector embedding. Methods:
-- `index_record(rec)` — embed and store one record.
+`EmbeddingIndex` is the vector store. It maintains a parallel SQLite database mapping each chain record to **one or more chunk vectors** (a long record is split into chunks before embedding — see "Chunked embedding store" below). Methods:
+- `index_record(rec)` — chunk a record's text and embed/store one vector per chunk. Idempotent: re-indexing a record replaces its chunks rather than duplicating them.
 - `index_chain(chain)` — embed every record not yet indexed (catch-up after restart).
-- `search(query_text, k)` — return top-k records by cosine similarity.
+- `search(query_text, k)` — return top-k **records** by cosine similarity, collapsing each record's chunk hits to a single per-record score (max over its chunks). The return contract is one `(record_idx, similarity)` pair per record, exactly as before chunking — the chunking is invisible to callers.
 
 `Retriever` is the query interface. It combines vector search with structural access patterns, per-record salience, per-kind recency decay, and revision-aware demotion. Methods:
-- `hybrid(query, k, type_filter, recency_weight, salience_weights)` — semantic search with the v1.1 score formula. The optional kwargs are kept for backward compatibility but reinterpreted; salience now comes from the record's `_meta` block, not a global override.
+- `hybrid(query, k, type_filter, recency_weight, salience_weights, query_modalities)` — semantic search with the score formula below. The optional kwargs are kept for backward compatibility but reinterpreted; salience now comes from the record's `_meta` block, not a global override. `query_modalities` opts the call into modality anchoring (below).
 - `ancestry(record_hash, depth)` — walk reference graph backward from a record.
 - `recent(n, type_filter)` — pure temporal query, no embedding.
-- `build_context(query, k_semantic, n_recent)` — the workhorse. Blends semantic + recent, dedupes, auto-pulls in revisions whose targets appear in the result set, and returns chronologically ordered records. This is what the agent loop calls every turn.
+- `build_context(query, k_semantic, n_recent, anchor_modalities)` — the workhorse. Blends semantic + recent, dedupes, auto-pulls in revisions whose targets appear in the result set, and returns chronologically ordered records. This is what the agent loop calls every turn. By default it detects the query's domain modalities and anchors on them; pass `anchor_modalities=False` to disable.
+- `query_modalities(query)` — analyze a query for the domain modalities it implies (the `DOMAIN_MODALITIES` whitelist that fire above the analyzer's floor). Empty set when the query implies no domain mode.
 - `drift_against(anchor_query, recent_query)` — compare semantic neighborhood of two queries to detect drift over time.
 
-**The score formula** (v1.1):
+**The score formula:**
 
 ```
 base    = W_SEMANTIC * cosine_similarity         # default 0.55
@@ -197,11 +252,34 @@ base    = W_SEMANTIC * cosine_similarity         # default 0.55
 score   = base − SUPERSEDED_PENALTY              # default 0.30
                  if a later revision supersedes this record
                  else 0
+                − RISK_PENALTY                    # if PoQ flagged risk
 ```
 
 Where `recency_for_type = 0.5 ** (age_days / half_life_days_for_type)` with half-lives from `metadata.py`.
 
-The weights are exposed as class constants on `Retriever` (`W_SEMANTIC`, `W_SALIENCE`, `W_RECENCY`, `SUPERSEDED_PENALTY`) so they're tunable in one place. Each `RetrievalHit` carries a `components` dict showing the contribution of each term — useful for debugging or for the agent surfacing "why this record" downstream.
+**Modality anchoring (the fourth term, opt-in).** When `hybrid` is given a non-empty `query_modalities` set — the domain modes the current query implies, e.g. `artifact_content` when the user pasted code — a fourth term is added and the weights shift to make room without disturbing the others' balance:
+
+```
+base    = W_SEMANTIC_MODAL * cosine_similarity   # 0.45
+        + W_SALIENCE_MODAL * record.salience     # 0.25
+        + W_RECENCY_MODAL  * recency_for_type    # 0.15
+        + W_MODALITY       * modality_overlap    # 0.15
+```
+
+`modality_overlap(query_mods, record_mods)` compares the query's domain modes to the record's stored `modalities_activated` (filtered to `DOMAIN_MODALITIES`): a record produced in the query's mode scores 1.0 (boost), a genuine mismatch scores 0.0 (mild cut), and a record with no domain modality scores the neutral `MODALITY_NEUTRAL` (0.5) — so older records and observations are treated as "unknown," not "mismatched." Only **domain** modalities (what kind of work a record is — currently just `artifact_content`) participate; **quality** modalities (`integrity_field`, `coherence`) are excluded, so a query that looks injection-y can't preferentially surface past injection-flagged records. Anchoring is strictly opt-in: a call with no `query_modalities` uses the default three-term weights, byte-identical to before, so existing callers are unaffected. Note the anchor fires on code *present in the query text* (pasted code), not coding intent expressed in prose — a prose follow-up like "make that function handle empty input" carries no artifact and so doesn't anchor; a future `coding_intent` modality could close that gap if needed.
+
+The weights are exposed as class constants on `Retriever` (`W_SEMANTIC`, `W_SALIENCE`, `W_RECENCY`, the `*_MODAL` variants, `W_MODALITY`, `SUPERSEDED_PENALTY`) so they're tunable in one place. Each `RetrievalHit` carries a `components` dict showing the contribution of each term (including `modality_overlap`, `modality_weight_factor`, `modality_saturation`, `modality_damp`, and `modality_contribution` when anchoring is active) — useful for debugging or for the agent surfacing "why this record" downstream.
+
+**Sprouted (runtime) modalities.** The domain set is not fixed. `sprouted_modalities.py` holds a registry of *data-driven* modalities — a name plus a few case-insensitive regex patterns plus an activation rule — loaded from `sprouted_modalities.json` in the data directory. A `Retriever` constructed with a `SproutRegistry` merges its domain-flagged entries into the live domain set (`Retriever.domain_modalities()` = baked-in + sprouted), runs their detectors at query-time analysis, and weights them in retrieval exactly like baked-in modalities. This lets the agent add to its own retrieval vocabulary at runtime with no source-code change and no restart — the data-driven counterpart to the `apply_proposal` path, which remains for modalities that need real detector logic. **Note on the safety boundary:** the codebase's stated rule was that the agent never modifies its own running behavior without a human in the loop, enforced by the manual `apply_proposal` step. Auto-sprouting deliberately relaxes that for the narrow case of pattern-based modalities; this was an explicit, owner-made decision, not an oversight. The regex surface is bounded *at validation time* (no `regex` module / thread-safe timeout is available): patterns must compile, nested-quantifier (catastrophic-backtracking) shapes are rejected, and pattern length/count and match-input length are capped — so a sprouted pattern can do bounded work at worst, never hang. (The auto-*generation* of sprout specs from recurring output — Cambium's side — is described next; this layer is the registry + retrieval integration that a sprout lands in.)
+
+**Auto-generation and graduation (Cambium → agent).** Cambium's `_check_recurring_output_mode` trigger reads `response` records, clusters them by shared vocabulary, and when a cluster clears the **diversity gate** — at least `OUTPUT_MODE_MIN_TRIGGERS` (5) distinct responses, spanning at least `OUTPUT_MODE_MIN_SPREAD_MS` (2h), interleaved with non-matching responses — emits a `modality` proposal carrying a ready-to-stage `sprout_spec`. Patterns are derived deterministically (regex-escaped `\bword\b` over the shared vocabulary; no LLM), and a document-frequency ceiling (`OUTPUT_MODE_DOC_FREQ_CEILING`) drops ubiquitous filler words so generic chatter can't mint a mode. The agent's commit path (`_stage_and_graduate_sprouts`) stages each new sprout into the registry as **tentative** (half weight, never directly active) and writes a `sprout_status` audit record with provenance. Each later scan that re-detects the mode is a confirmation; once the live recurrence count reaches `OUTPUT_MODE_GRADUATION_CONFIRMATIONS` the modality graduates to active (full weight) with a second audit record. Two independent safety layers: the gate stops a bad sprout from being created, and tentative-by-default stops a created-but-wrong sprout from mattering much until confirmed. The chain's `proposal` / `proposal_recurrence` / `sprout_status` records are the source of truth; `sprouted_modalities.json` is the derived activation cache.
+
+**Two damping mechanisms guard the feedback loop** that runtime sprouting otherwise invites (the agent reshaping which of its own memories surface, which shapes its next output, which keeps the modality firing):
+
+- **Per-turn cap (`PER_TURN_MODALITY_CAP`, default 7).** `query_modalities` ranks the domain modalities a query fires by detection activation and keeps only the strongest N (all above the 0.2 floor), so a query that matches many modes doesn't blur the anchor across all of them. Exposed in `run.py`.
+- **Anti-echo saturation damper.** `hybrid` is a two-pass computation: pass one scores every candidate *without* the modality term and measures what fraction of the top `MODALITY_SATURATION_TOP_N` candidates already carry the query's mode; if that saturation exceeds `MODALITY_SATURATION_THRESHOLD` (0.6), the modality term is damped by `1 − (saturation − threshold)` in pass two. So when the relevant context is already saturated with the query's mode, boosting "more of the same" is scaled down or off. Measuring saturation on the pre-boost scores is deliberate — measuring it after the boost would be circular.
+
+A **tentative** sprouted modality (cooling-off, before it has graduated) contributes at a reduced `weight_factor` (0.5), so a not-yet-confirmed sprout nudges retrieval gently rather than at full strength. The `/modalities` REPL command lists baked-in and sprouted modalities, their status, domain flag, effective weight, and any patterns skipped at load.
 
 **Revision-aware retrieval:**
 
@@ -212,9 +290,102 @@ When a record has been corrected by a later revision, two things happen at retri
 
 The original is never dropped — that would erase the conflict, and the conflict itself is informative ("you used to think X; you now think Y"). It's just demoted relative to the corrective record.
 
-**`HashingEmbedder`** is a fallback dependency-free embedder for tests and offline use (bag-of-trigrams). In real use, `run.py` replaces it with a sentence-transformer.
+**Embedders.** Two ship in `retrieval.py`, and `run.py` picks between them at
+startup via `make_tiered_embedder()` (see the run.py section below):
+- **`HashingEmbedder`** — dependency-free bag-of-trigrams. Deterministic, no
+  model, no network. Used by the test suite and as the offline fallback. It
+  is lexical, not semantic: differently-worded but meaning-equivalent text
+  does not score as similar.
+- **`OllamaEmbedder`** — calls a local Ollama server's embeddings endpoint
+  (default model `nomic-embed-text`). Real semantic embeddings; the model
+  runs in Ollama's process, so no PyTorch enters the agent. Its only Python
+  dependency, `requests`, is imported lazily so it stays optional. The
+  constructor does one probe embed against the server, so it fails fast and
+  clearly if Ollama is down or the model isn't pulled — which is what lets
+  the tiered resolver fall back cleanly.
 
-**When you'd touch this file:** when you want different retrieval behavior. Change `W_*` constants to rebalance the score components. Add a method for time-window queries. Replace `EmbeddingIndex` with FAISS or pgvector while keeping the `Retriever` interface stable.
+`EmbeddingIndex` records vectors at a fixed dimension. If the resolved
+embedder's dimension doesn't match an existing store (because the embedder
+changed between runs), the index refuses to open and tells you to delete the
+store so it can be rebuilt from the chain. `OLLAMA_EMBED_DIMS` is a small
+table of known model dimensions so the resolver can size the index without an
+extra probe. The same identity check also catches same-dimension changes —
+a different embedder coordinate space, or a different chunking scheme — by
+comparing a stored embedder-identity tag against the active one.
+
+**Chunked embedding store.** A record is not necessarily held as a single
+vector. The embedder caps input (the Ollama path 500s on input that
+overflows the model's token window rather than truncating), so a record
+longer than the cap would be unreachable past its opening if embedded whole
+— the back half of a long document, the body of a big code paste, or a long
+reflection would never enter any vector. Instead, a record is split into
+chunks at index time and each chunk is embedded into its own row, all sharing
+the record's index as a group anchor.
+
+- **Chunking — `chunk_text(text, target)`.** A module-level function that
+  splits text on natural boundaries in priority order: paragraph breaks
+  first; sentence breaks for a paragraph that alone exceeds the target; a
+  hard slice for a single unbroken run (minified code, base64, a giant CSV
+  line) so no chunk can exceed the embedder's request cap. Short text
+  returns a single chunk, so an ordinary turn embeds to exactly one vector.
+  `CHUNK_TARGET_CHARS` (default 3500)
+  sits comfortably under the Ollama token window; `file` records prepend the
+  `[file name kind]` header to every chunk so middle fragments stay
+  self-describing.
+
+- **Group-collapse — in `EmbeddingIndex.search`.** Per-chunk vectors create
+  an obvious hazard: a long record would have *more vectors in the store* and
+  so more chances to be retrieved — the "more raffle tickets" problem. The
+  fix is to search over chunks (you want the most relevant *fragment*) but
+  collapse the chunk hits down to one similarity per record before returning
+  — the **maximum** over that record's chunks. Max, not mean: a long record
+  with one strongly relevant section should rank on that section's strength,
+  not be diluted by unrelated text elsewhere in it. `search` over-fetches a
+  pool of chunk neighbors (so the k-th best record isn't missed when
+  higher-ranked records each contribute several chunks), collapses to
+  records, and returns the top-k. The return type is unchanged — one
+  `(record_idx, similarity)` pair per record — so `hybrid`, `build_context`,
+  `drift_against`, and every scoring term (salience, recency, supersession,
+  PoQ-risk) are untouched. **The chunking is invisible above the `search`
+  boundary.**
+
+- **Completeness is free.** A retrieved record is rendered *whole* by the
+  agent from the chain, not reassembled from chunks — the chain was never
+  split, only the derived embedding store was. So when a record is selected,
+  the model sees all of it; there is no fragment-stitching step and no risk
+  of presenting half an answer.
+
+- **Index-only; substrate untouched.** The append-only signed chain still
+  stores exactly one record per turn and per file. Chunking lives entirely
+  in the derived embedding store, which is rebuilt from the chain whenever
+  deleted. `chain.py`, signing, Merkle batching, `/length`, and `/verify` are
+  all unaffected. The chunking scheme is folded into the embedder-identity
+  tag (`CHUNK_SCHEME_VERSION` + `CHUNK_TARGET_CHARS`), so changing chunk
+  boundaries forces a clean store rebuild rather than silently mixing
+  differently-chunked vectors.
+
+The schema reflects this: the `embeddings` table is keyed on an autoincrement
+`embed_id` with `record_idx`, `chunk_index`, and `chunk_count` columns and an
+index on `record_idx` for fast per-record lookups. Re-indexing a record
+deletes its existing chunk rows first, so `index_record` is idempotent under
+the multi-row layout.
+
+> **Known follow-up.** Chunking makes long records *findable* again
+> but does not touch `Agent._truncate_to_budget`, which still drops whole
+> lowest-salience records under context-budget pressure. A long record is now
+> both more retrievable and a bigger truncation target, so making truncation
+> chunk-aware (keep a record's most relevant chunks rather than drop it) is a
+> natural next step — deliberately separate because that step *does* render
+> fragments, reintroducing the "answer split across the cut" risk that
+> whole-record rendering avoids.
+
+**When you'd touch this file:** when you want different retrieval behavior.
+Change `W_*` constants to rebalance the score components. Change
+`CHUNK_TARGET_CHARS` to resize chunks (and bump `CHUNK_SCHEME_VERSION` if you
+alter `chunk_text`'s boundary logic). Add a method for time-window queries.
+Add an embedder (e.g. a sentence-transformers wrapper). Replace
+`EmbeddingIndex` with FAISS or pgvector while keeping the `Retriever`
+interface stable.
 
 ---
 
@@ -240,7 +411,7 @@ The original is never dropped — that would erase the conflict, and the conflic
   6. Return an `AgentTurn` containing all three.
 - `reflect(max_records=200)` — reflect on every record since the last reflection (or since genesis, if there hasn't been one). Asks the LLM "what stands out, what patterns, what's worth revisiting" and writes the result as a `reflection` record (`source=assistant, confidence=0.7` — reflections are inferential, not factual). The window sizes itself dynamically: each reflection covers exactly the slice the previous one didn't, so there are no gaps and no overlaps. `max_records` is a safety cap for the unusual case where auto-reflection has been disabled and a long stretch of history has accumulated; if the lookback would exceed it, only the most recent `max_records` are reflected on and the resulting record is flagged `capped: True`. Reflections become retrievable memory and have high default salience. Returns `None` if there are fewer than 4 substantive records since the last reflection (i.e. nothing meaningful new to reflect on).
 - `revise(target_index, correction_text)` — append a `revision` record correcting a prior record (`source=assistant, supersedes=target_index`). The original is never modified. Both the legacy `revises_index`/`revises_hash` fields (for backward compatibility with `view_chain.py` and the web UI) and the canonical `_meta.supersedes` pointer are written.
-- `_truncate_to_budget(records, fixed_overhead_chars)` — when retrieved context would exceed `context_char_budget`, drop lowest-salience records first. As of v1.1, ranking uses **per-record** salience read from each record's `_meta` block (with type-based defaults for v1 records via `read_meta`). Returns kept records (chronologically ordered) and a count of dropped records, which the prompt formatter surfaces as a note to the model.
+- `_truncate_to_budget(records, fixed_overhead_chars)` — when retrieved context would exceed `context_char_budget`, drop lowest-salience records first. Ranking uses **per-record** salience read from each record's `_meta` block (with type-based defaults for legacy records via `read_meta`). Returns kept records (chronologically ordered) and a count of dropped records, which the prompt formatter surfaces as a note to the model.
 
 `_format_prompt` is the method that builds the actual prompt string. **This is where memory context, time, source tagging, and revisions all come together.** Behavioral instructions live in the system prompt (separate channel); this method handles memory and grounding.
 
@@ -267,28 +438,32 @@ Helper functions `_humanize_delta` and `_format_absolute_time` handle time forma
 
 **Responsibility:** provide a consistent callable interface to any LLM provider, with retries, error handling, system prompt support, and sensible defaults.
 
-**Knows about:** Anthropic, OpenAI, Google, and Ollama SDKs. Retry logic. Authentication.
+**Knows about:** Anthropic, OpenAI, Google, and Ollama SDKs (OpenRouter and DeepSeek reuse the OpenAI SDK). Retry logic. Authentication.
 **Does not know about:** the chain, the agent, retrieval, prompts, metadata.
 
 **Key components:**
 
-Four builder functions, all returning a callable with shape
+Six builder functions, all returning a callable with shape
 `(prompt, system=None, attachments=None) -> str`. Each callable also
 exposes `.stream(prompt, system=None, attachments=None)` — a generator
 yielding text chunks, used by the web UI for streaming responses.
 - `make_claude_client(model, max_tokens, temperature, timeout_s)` — Anthropic Claude. Default: `claude-opus-4-7`.
 - `make_openai_client(model, ...)` — OpenAI. Default: `gpt-5.5`.
+- `make_openrouter_client(model, ...)` — OpenRouter (aggregator). Default: `anthropic/claude-opus-4.7`. Reuses the OpenAI SDK against OpenRouter's base URL.
+- `make_deepseek_client(model, ...)` — DeepSeek. Default: `deepseek-v4-pro`. Reuses the OpenAI SDK against DeepSeek's base URL. The V4 models toggle thinking mode via a request parameter rather than a separate model name; this client runs the default (non-thinking) mode and, if a `reasoning_content` trace is returned, uses only the final answer.
 - `make_gemini_client(model, ...)` — Google Gemini. Default: `gemini-3.1-pro`.
 - `make_ollama_client(model, base_url, ...)` — local Ollama. Default: `llama3.1:8b`.
 
 Each builder:
-- Imports its SDK lazily so you only need the libraries for the provider you use.
+- Imports its SDK lazily so you only need the libraries for the provider you use. (OpenRouter and DeepSeek import the same `openai` package as the OpenAI client — they expose OpenAI-compatible APIs, so no extra dependency.)
 - Checks the relevant API key at startup, fails fast if missing.
 - Returns a callable that takes a prompt string (and optionally a system prompt) and returns response text.
-- Routes the system prompt to the provider's correct API field (Anthropic's `system` parameter, OpenAI's system message role, Gemini's `system_instruction`, Ollama's `system` field).
+- Routes the system prompt to the provider's correct API field (Anthropic's `system` parameter, OpenAI's system message role, Gemini's `system_instruction`, Ollama's `system` field; OpenRouter and DeepSeek use the OpenAI system-message role).
 - Retries on transient errors (rate limits, timeouts, server errors) with exponential backoff. Does NOT retry on client errors (bad request, invalid model).
 
 `_retry_with_backoff` is the shared retry helper.
+
+**Truncation detection.** After every call (and stream), a client records why generation stopped on `llm.last_finish_reason`. The module-level helper `was_truncated(llm)` normalizes this across providers — OpenAI / OpenRouter / DeepSeek report `finish_reason == "length"`, Anthropic reports `stop_reason == "max_tokens"` — and returns `True` only on a confirmed max_tokens cut-off. A provider that doesn't report a reason (Gemini, Ollama, or a custom callable) reads as "complete", so the signal is never a false positive. `agent.turn()` calls `was_truncated()` and surfaces the result on `AgentTurn.truncated`; the REPL and web UI use it to show a "response was cut off — type continue" marker.
 
 **When you'd touch this file:** when you want to add a new provider, change default model versions as new ones release, adjust retry behavior, or expose more provider-specific options (tool use, structured output, multimodal beyond images and PDFs). Each builder is independent — changing one doesn't affect the others.
 
@@ -328,7 +503,7 @@ For each file: bytes are stored under `<DATA_DIR>/blobs/<sha256>` (content-addre
 
 **Responsibility:** provide a browser-based chat interface as an alternative to the REPL. Same agent stack, same chain, same configuration — just a different I/O layer.
 
-**Knows about:** FastAPI, Server-Sent Events, the same agent/chain/retriever that `run.py` uses (imported directly from `run.py` to share configuration). As of v1.1, also imports `metadata.build_meta` so the streaming-path inline appends carry the same `_meta` block as `agent.turn()` does.
+**Knows about:** FastAPI, Server-Sent Events, the same agent/chain/retriever that `run.py` uses (imported directly from `run.py` to share configuration). It also imports `metadata.build_meta` so the streaming-path inline appends carry the same `_meta` block as `agent.turn()` does.
 **Does not know about:** anything `run.py` doesn't already know about. It's strictly an interface layer.
 
 **Key components:**
@@ -336,13 +511,13 @@ For each file: bytes are stored under `<DATA_DIR>/blobs/<sha256>` (content-addre
 `webapp.py` is a FastAPI server that:
 - Boots the same Agent / Chain / Retriever stack as `run.py`, reusing `DATA_DIR`, `SYSTEM_PROMPT`, `FOUNDING_COMMITMENTS`, etc. directly.
 - Exposes endpoints for chain inspection (`/api/chain/status`, `/api/chain/recent`, `/api/chain/verify`), file upload (`/api/upload`), slash commands (`/api/command`), and chat turns (`/api/turn`, `/api/turn/stream`).
-- Streams responses via Server-Sent Events when the LLM client supports it (all four built-in providers do, via `llm.stream()`).
+- Streams responses via Server-Sent Events when the LLM client supports it (all six built-in providers do, via `llm.stream()`).
 - Serves blob bytes by sha256 (`/blobs/<sha>`) so ingested images render inline in chat. Cross-checks the chain to refuse arbitrary file reads.
 - Holds a single-session lock — only one browser tab is "active" at a time, protecting the chain's single-writer guarantee. All requests that touch the chain serialize through an asyncio lock regardless of session.
 
 `static/index.html` is a single-file frontend (vanilla JS, no build step). A typing indicator shows during the latency before tokens arrive; drag-and-drop ingestion works anywhere on the page; a sidebar surfaces recent reflections and revisions. The frontend reads `content.text`, `content.filename`, `content.kind`, `content.revises_index`, and other top-level content fields exactly as in v1 — the new `_meta` block sits next to them and is ignored by the UI. No changes needed.
 
-**The streaming endpoint** at `/api/turn/stream` deliberately inlines its chain writes (rather than calling `agent.turn()`) so it can split the LLM call into a thread. As of v1.1 these inline writes use `metadata.build_meta()` to attach the same `_meta` block that `agent.turn()` produces — there's no path through the app that produces a v1 record. If you ever extend this endpoint with new chain writes, do the same.
+**The streaming endpoint** at `/api/turn/stream` deliberately inlines its chain writes (rather than calling `agent.turn()`) so it can split the LLM call into a thread. These inline writes use `metadata.build_meta()` to attach the same `_meta` block that `agent.turn()` produces — there's no path through the app that produces a record without one. If you ever extend this endpoint with new chain writes, do the same.
 
 **What this layer does NOT add to the chain:**
 
@@ -366,11 +541,12 @@ Top-of-file configuration block:
 - `FOUNDING_COMMITMENTS` — committed at genesis, immutable thereafter. Define the agent's values.
 - `SYSTEM_PROMPT` — sent to the LLM on every turn. Defines the agent's active behavior. Mutable; each version is logged to chain.
 - `SEMANTIC_K` / `RECENT_N` — retrieval knobs.
-- `EMBED_DIM` — must match the embedding model.
-- `AUTO_REFLECT_EVERY` — how often the agent automatically reflects (in turns). Set to 0 to disable. Each reflection automatically covers every record since the previous reflection — there's no separate window setting in v1.1; the scope sizes itself to actual activity.
+- `OLLAMA_EMBED_MODEL` / `OLLAMA_BASE_URL` — which Ollama embedding model to use, and where to reach the server. Used by the tiered embedder resolver.
+- `HASHING_EMBED_DIM` — dimension of the fallback `HashingEmbedder`. There is no longer an `EMBED_DIM` constant: the active embedding dimension is whatever the resolved embedder reports.
+- `AUTO_REFLECT_EVERY` — how often the agent automatically reflects (in turns). Set to 0 to disable. Each reflection automatically covers every record since the previous reflection — there's no separate window setting; the scope sizes itself to actual activity.
 
 Functions:
-- `make_sentence_embedder(model_name)` — wraps `sentence-transformers` for real semantic embeddings.
+- `make_tiered_embedder()` — resolves the embedder with a fallback chain: `OllamaEmbedder` if a local Ollama server is reachable, otherwise `HashingEmbedder`. Returns an `(embedder, dim, name)` triple. Never raises — the worst case is the fallback.
 - `build_llm()` — returns the configured LLM client based on `LLM_PROVIDER`.
 - `run()` — the REPL. Loads everything, commits genesis if needed, checks for drift between configured and sealed founding commitments and warns if they differ, logs system prompt if changed, loops on input, dispatches commands or turns, auto-reflects on cadence.
 
@@ -450,15 +626,20 @@ Every turn writes two records: one for what you said (tagged `source=user`), one
 | If you want to change... | Edit this file |
 |--------------------------|----------------|
 | The LLM provider or model | `run.py` — `LLM_PROVIDER`, or `llm_clients.py` defaults |
+| Maximum response length | `run.py` — `LLM_MAX_TOKENS` (default 4096). Fed to every provider client by `build_llm()`. A response that hits this ceiling is reported as truncated. |
 | The agent's personality / tone | `run.py` — `SYSTEM_PROMPT` (auto-logged on change) |
 | How often the agent reflects | `run.py` — `AUTO_REFLECT_EVERY` |
 | How much context the agent sees | `run.py` — `SEMANTIC_K` and `RECENT_N` |
-| Maximum prompt size before truncation | `agent.py` — `Agent` constructor `context_char_budget` (default 80,000) |
+| Maximum prompt size before truncation | `run.py` — `CONTEXT_BUDGET_CHARS` (default 80,000). Fed to the `Agent` constructor's `context_char_budget` by both `run.py` and `webapp.py`. |
 | Default salience by record type | `metadata.py` — `DEFAULT_SALIENCE_BY_TYPE` |
 | Per-kind decay half-lives | `metadata.py` — `DEFAULT_HALF_LIFE_DAYS_BY_TYPE` |
 | Source tag enum | `metadata.py` — `SOURCE_*` constants |
-| Score-formula weights (semantic / salience / recency) | `retrieval.py` — `Retriever.W_SEMANTIC`, `W_SALIENCE`, `W_RECENCY` |
+| Score-formula weights (semantic / salience / recency / modality) | `retrieval.py` — `Retriever.W_SEMANTIC`, `W_SALIENCE`, `W_RECENCY`, `W_MODALITY` (and `*_MODAL` variants) |
+| Which modalities anchor retrieval | `retrieval.py` — `DOMAIN_MODALITIES` (baked-in) + domain-flagged entries in `sprouted_modalities.json` |
+| Per-turn modality cap / anti-echo threshold | `run.py` — `PER_TURN_MODALITY_CAP`; `retrieval.py` — `MODALITY_SATURATION_THRESHOLD`, `MODALITY_SATURATION_TOP_N` |
+| Sprouted-modality registry file | `run.py` — `SPROUTED_MODALITIES_FILE` (default `<data_dir>/sprouted_modalities.json`) |
 | How aggressively superseded records are demoted | `retrieval.py` — `Retriever.SUPERSEDED_PENALTY` |
+| Embedding chunk size (and chunk-scheme version) | `retrieval.py` — `CHUNK_TARGET_CHARS`, `CHUNK_SCHEME_VERSION` |
 | How records are dropped under budget pressure | `agent.py` — `_truncate_to_budget` (now driven by per-record salience) |
 | How retrieval works generally | `retrieval.py` — `Retriever` methods |
 | Where data is stored | `run.py` — `DATA_DIR` |
@@ -484,35 +665,4 @@ Every turn writes two records: one for what you said (tagged `source=user`), one
 
 **Memory is active, not passive.** Standard RAG retrieves records and stops there. This system also reflects (writes its own summaries of what mattered), revises (corrects prior records without erasing them), and weights retrieval by salience (the agent's own reflections surface preferentially). The result is closer to how human memory actually works — consolidating, revising, letting unimportant things fade — implemented as additional record types on the same append-only chain rather than as new mechanisms outside it.
 
-**(v1.1 addition.) Records are evidence; beliefs are derived.** Every record carries an explicit `source` tag — user, assistant, system, or tool — so the LLM can see at a glance where a claim originated. "The user said this" and "I inferred this in a reflection two months ago" are different epistemic objects, and treating them as equivalent is the failure mode that makes long-running agents drift. Source tagging plus per-kind decay plus revision-aware retrieval together make this honest: the agent's past inferences fade faster than user statements, get demoted when corrected, and never masquerade as ground truth.
-
----
-
-## What changed in v1.1
-
-v1.1 is a "Tier 1 sharpening" of v1's architecture, not a redesign. v1 already implemented append-only memory with cryptographic verification, reflection, revision, and salience-weighted retrieval. v1.1 makes the metadata that drives those mechanisms explicit and per-record rather than hardcoded and per-type.
-
-### New file
-
-`metadata.py` — defines the `_meta` block schema, source enum, salience defaults, half-life table, and the `read_meta` fallback reader for v1 records.
-
-### Changed files
-
-| File | Change |
-|------|--------|
-| `agent.py` | Every `chain.append` writes a `_meta` block via `build_meta`. Truncation switched from `_RETENTION_PRIORITY` (now removed) to per-record salience. Prompt rendering strips `_meta`, surfaces `source` and `SUPERSEDED` as visible tags. `reflect()` now sizes its window dynamically (every record since the previous reflection, with a `max_records` safety cap) — no more fixed lookback. |
-| `retrieval.py` | New score formula: `W_SEMANTIC*sim + W_SALIENCE*salience + W_RECENCY*recency − supersession_penalty`. Per-kind half-life recency. Per-record salience read from `_meta`. `build_context` auto-pulls revisions for superseded targets. `RetrievalHit.components` exposes the breakdown. |
-| `run.py` | `REFLECT_WINDOW` constant removed (the dynamic reflection in `agent.py` no longer needs it). Both `reflect()` call sites (manual `/reflect` and auto-reflect) drop the `window=` keyword arg. |
-| `timechain_web/webapp.py` | Streaming endpoint's inline chain writes now use `build_meta` so streamed turns produce v1.1 records, not v1 records. `REFLECT_WINDOW` import dropped; all three `reflect()` call sites updated to the no-arg form. |
-| `test_timechain.py` | Four call sites that passed `window=10` or `window=20` to `reflect()` updated to the no-arg form. No coverage change — the tests didn't assert on window-specific behavior. |
-
-### Unchanged files
-
-`chain.py`, `file_ingest.py`, `llm_clients.py`, `view_chain.py`, `run_tests.py`, `timechain_web/static/index.html` — none of these needed changes. The cryptographic core, the LLM clients, the file ingestion pipeline, the inspector, and the frontend all read or write the same fields they always did. New `_meta` content sits beside them harmlessly. New reflection records carry an additional `covers_indices` field which `view_chain.py` displays correctly via its generic content renderer; old reflections (with the legacy `window_size` field) keep working too.
-
-### Migration
-
-Drop in the new files, leave the existing chain alone. v1 records on disk read cleanly through `read_meta`'s fallback path: missing fields get type-appropriate defaults synthesized in memory at retrieval time. The records themselves are never rewritten. New appends carry the v1.1 `_meta` block. The two coexist on the same chain indefinitely; `/verify` continues to pass.
-
-If you want to confirm the migration: run `pytest test_timechain.py -v` (the v1 test suite passes unchanged on v1.1) and then `python view_chain.py --record N` on a freshly-written record — you'll see `_meta` inside `content`. On older records, you'll see no `_meta`, but everything still works.
-
+**Records are evidence; beliefs are derived.** Every record carries an explicit `source` tag — user, assistant, system, or tool — so the LLM can see at a glance where a claim originated. "The user said this" and "I inferred this in a reflection two months ago" are different epistemic objects, and treating them as equivalent is the failure mode that makes long-running agents drift. Source tagging plus per-kind decay plus revision-aware retrieval together make this honest: the agent's past inferences fade faster than user statements, get demoted when corrected, and never masquerade as ground truth.

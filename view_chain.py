@@ -55,7 +55,17 @@ def fmt_content(content) -> str:
                 if "revises_index" in content:
                     return f"corrects #{content['revises_index']}: {t[:50]}{'...' if len(t) > 50 else ''}"
                 return t if len(t) <= 70 else t[:67] + "..."
+            if "proposal_kind" in content:
+                # Cambium proposal record (v1.2)
+                kind = content.get("proposal_kind", "?")
+                status = content.get("status", "open")
+                title = content.get("title", "")
+                return f"proposal [{kind}] ({status}): {title[:45]}"
             if "commitments" in content:
+                cov = content.get("covenant")
+                if isinstance(cov, list):
+                    return (f"genesis: {len(content['commitments'])} commitments, "
+                            f"{len(cov)} covenant value(s)")
                 return f"genesis: {len(content['commitments'])} commitments"
         return json.dumps(content, ensure_ascii=False)[:70]
     except Exception:
@@ -108,24 +118,19 @@ def print_record_detail(chain: Chain, idx: int) -> None:
 
 
 def print_batches(chain: Chain) -> None:
-    cur = chain._conn.cursor()
-    cur.execute(
-        "SELECT batch_id, first_idx, last_idx, root_hash, created_at, anchor_status "
-        "FROM merkle_batches ORDER BY batch_id"
-    )
-    rows = cur.fetchall()
-    if not rows:
+    batches = chain.list_batches()
+    if not batches:
         print("no Merkle batches sealed yet (use /seal in run.py to create one)")
         return
     print(f"\n{'batch':>5}  {'records':>15}  {'created':19}  {'status':9}  root")
     print("-" * 100)
-    for batch_id, first, last, root, created, status in rows:
+    for b in batches:
         print(
-            f"{batch_id:>5}  "
-            f"{first}-{last:<10}  "
-            f"{fmt_time(created):19}  "
-            f"{(status or '?'):9}  "
-            f"{short(root, 16)}"
+            f"{b['batch_id']:>5}  "
+            f"{b['first_idx']}-{b['last_idx']:<10}  "
+            f"{fmt_time(b['created_at']):19}  "
+            f"{(b['anchor_status'] or '?'):9}  "
+            f"{short(b['root_hash'], 16)}"
         )
 
 

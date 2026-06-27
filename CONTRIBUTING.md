@@ -5,11 +5,9 @@ Thanks for considering a contribution. This is a prototype, so the bar for
 the integrity guarantees of the chain" is high. Most of the rules below are
 aimed at that distinction.
 
-This document is current as of **v1.1**. See `README.md` and `ARCHITECTURE.md`
-for the v1 → v1.1 changes; if you're working from a v1 mental model, the
-key new file is `metadata.py` and the key relocated concept is salience
-(now per-record, with type-based defaults living in `metadata.py` rather
-than as a constant on `Retriever`).
+This document tracks the current codebase (v1.2.1). For the release-by-release
+history — what each version added and why — see `CHANGELOG.md`. If you're
+working from an older mental model of the project, start there.
 
 ## Before you start
 
@@ -53,8 +51,9 @@ pytest test_timechain.py -v
 If you can't install pytest in your environment, `python run_tests.py` is a
 standalone fallback. Both should pass on a clean checkout.
 
-The v1 test suite passes unchanged on v1.1; if you're upgrading an
-existing fork to v1.1 and tests fail, that's a regression, not expected
+The v1 and v1.1 test suites pass unchanged on v1.11; if you're upgrading an
+existing fork to v1.11 and a previously-passing test fails, that's a
+regression, not expected
 behavior.
 
 ## What kinds of contributions are welcome
@@ -111,6 +110,19 @@ by every read of the chain. Two rules:
   there.** A v1 record didn't have a salience score; if your code needs
   one, give it the type-default and flag `is_default=True` on the
   resulting `RecordMeta`. Don't pretend the field existed.
+
+**The analysis modules (`signals.py`, `poq.py`, `cambium.py`).** These are
+pure-logic modules added in v1.2 — no I/O, no chain dependency. Two rules:
+
+- **Detectors must stay deterministic and dependency-free.** `signals.py`
+  is run on every turn and its results feed `poq.py`. A detector that
+  calls the network, depends on an ML model, or returns nondeterministic
+  output breaks both the offline test suite and reproducibility. Lexicon
+  and regex only.
+- **Cambium proposes; it never applies.** `cambium.py` may emit `proposal`
+  records suggesting new structure. It must never edit code, change
+  behavior, or auto-apply a suggestion. The split — model proposes, a
+  human or a privileged process decides — is deliberate; keep it.
 
 **Adding a record type.** Not hard, but has ripple effects. You'll need to:
 
@@ -208,11 +220,18 @@ Conventions:
 - If you add a new fixture, also teach `run_tests.py`'s `build_fixtures`
   about it, otherwise the standalone runner will skip your tests.
 - Keep tests deterministic. The `HashingEmbedder` (trigram-bag) is used in
-  tests precisely because it has no model dependency. Note that it is
-  sensitive to `PYTHONHASHSEED` — `test_search_returns_results` is mildly
-  flaky across hash seeds. If you write a new retrieval test that depends
-  on relative ranking, prefer asserting "expected record is in top-k" over
-  "expected record is at index 0."
+  tests precisely because it has no model or network dependency. Note that
+  it hashes trigrams with the builtin `hash()`, which is salted by
+  `PYTHONHASHSEED` — so the exact ranking of near-tied results is not stable
+  across interpreter runs. (v1.1 had a known flake here in
+  `test_search_returns_results`; v1.11 fixed it by querying with a
+  substantive phrase the embedder can represent stably rather than a single
+  word.) If you write a new retrieval test, query with enough text to embed
+  meaningfully, and prefer asserting "expected record is in top-k" over
+  "expected record is at index 0" whenever scores could be close.
+- The v1.11 `TestEmbedderFallback` group assumes no Ollama server is running
+  (true in CI and sandboxes). If you add embedder tests, don't make them
+  depend on a reachable Ollama server — the suite must pass offline.
 - For cryptographic tests, the bar is "this catches the specific tampering
   vector I claim it catches." See `TestTamperDetection` for the pattern:
   tamper, then assert `verify()` returns False with a message that names

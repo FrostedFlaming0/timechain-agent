@@ -5,14 +5,26 @@ scikit-learn>=1.3
 
 # LLM provider (pick one or more)
 anthropic>=0.40
-# openai>=1.50
+# openai>=1.50       # also covers OpenRouter and DeepSeek (OpenAI-compatible)
 # google-genai>=0.3
-# requests>=2.31  # for Ollama
+# requests>=2.31  # for the Ollama LLM provider
 
 # Embeddings
-sentence-transformers>=2.2
+#
+# v1.11 has no required embedding dependency. The embedder is resolved at
+# startup with a tiered fallback (see make_tiered_embedder in run.py):
+#   - If a local Ollama server is reachable, OllamaEmbedder is used. It
+#     needs `requests` (uncomment below) and an embedding model pulled
+#     locally: `ollama pull nomic-embed-text`. Install Ollama itself from
+#     https://ollama.com/download.
+#   - Otherwise the dependency-free HashingEmbedder is used automatically.
+#     No install, no model, lexical-only retrieval.
+#
+# `requests` is recommended — it is what both the Ollama embedder and the
+# Ollama LLM provider use. Uncomment it if you intend to use Ollama at all.
+# requests>=2.31
 
-# Optional — file ingestion
+# Optional - file ingestion
 pypdf>=4.0
 python-docx>=1.0
 openpyxl>=3.1
@@ -20,11 +32,11 @@ python-pptx>=0.6
 Pillow>=10.0
 chardet>=5.0
 
-# Optional — web UI (timechain_web/webapp.py)
+# Optional - web UI (timechain_web/webapp.py)
 # fastapi>=0.115
 # uvicorn>=0.30
 # sse-starlette>=2.0
 # python-multipart>=0.0.9
 
-# Optional — testing
+# Optional - testing
 pytest>=7.0

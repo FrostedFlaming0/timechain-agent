@@ -1,0 +1,127 @@
+# pyproject.toml — minimal package metadata.
+#
+# Why this exists: without it, anyone wanting to use timechain as a
+# library has to manipulate sys.path or copy files. With it:
+#   - `pip install -e .` makes a working editable install
+#   - the test runner can run from anywhere
+#   - tooling (pytest, mypy, linters) picks up project metadata
+#     automatically
+#
+# The package is a flat layout — top-level .py modules rather than a
+# `src/timechain/` tree — because the project's call sites use
+# `from chain import ...` rather than `from timechain.chain import ...`,
+# and changing the imports would touch every file. The flat layout is
+# explicitly supported by setuptools' `py-modules` declaration below.
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "timechain-agent"
+version = "1.2.1"
+description = "Persistent-memory AI agent on a signed, hash-chained, append-only memory substrate"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+    { name = "James Kearins" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Development Status :: 4 - Beta",
+]
+# Core runtime dependencies. Optional dependencies are declared below
+# under [project.optional-dependencies] so a minimal install stays
+# small.
+dependencies = [
+    "cryptography>=41.0",
+    "numpy>=1.24",
+    "scikit-learn>=1.3",
+]
+
+[project.optional-dependencies]
+# Provider clients — install whichever you intend to use.
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.50"]    # also covers OpenRouter and DeepSeek
+gemini = ["google-genai>=0.3"]
+ollama = ["requests>=2.31"]
+
+# File ingestion (PDFs, Word, Excel, PowerPoint, images, text encoding
+# detection).
+ingest = [
+    "pypdf>=4.0",
+    "python-docx>=1.0",
+    "openpyxl>=3.1",
+    "python-pptx>=0.6",
+    "Pillow>=10.0",
+    "chardet>=5.0",
+]
+
+# Web UI (timechain_web/webapp.py).
+web = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "sse-starlette>=2.0",
+    "python-multipart>=0.0.9",
+]
+
+# Test suite. Without pytest the custom run_tests.py works as a
+# fallback, but pytest is required for the parametrized tests to run.
+test = ["pytest>=7.0"]
+
+# Convenience aggregate: everything.
+all = [
+    "timechain-agent[anthropic,openai,gemini,ollama,ingest,web,test]",
+]
+
+[project.scripts]
+# REPL entry point. Installs as `timechain-agent` on the PATH after
+# `pip install`. The underlying script's __main__ block dispatches.
+timechain-agent = "run:run"
+
+[project.urls]
+Source = "https://github.com/frostedflaming0/timechain-agent"
+
+# Flat module layout — list every top-level .py module that should be
+# importable after install. The webapp lives under timechain_web/ and
+# is included as a package below.
+[tool.setuptools]
+py-modules = [
+    "agent",
+    "apply_proposal",
+    "cambium",
+    "chain",
+    "diagnose_index",
+    "file_ingest",
+    "llm_clients",
+    "metadata",
+    "poq",
+    "protected_zones",
+    "retrieval",
+    "run",
+    "signals",
+    "view_chain",
+]
+packages = ["timechain_web"]
+
+[tool.setuptools.package-data]
+timechain_web = ["static/*.html", "static/*.css", "static/*.js"]
+
+[tool.pytest.ini_options]
+# Make pytest find the test file without requiring `pytest test_timechain.py`.
+testpaths = ["."]
+python_files = ["test_*.py"]
+# Quiet the deprecation noise from third-party libs that's unrelated to
+# this project's code.
+filterwarnings = [
+    "ignore::DeprecationWarning:google.*",
+    "ignore::DeprecationWarning:pkg_resources.*",
+]
